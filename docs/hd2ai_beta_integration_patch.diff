@@ -1,0 +1,81 @@
+--- services/lmpilot/src/agentProvider.ts
++++ services/lmpilot/src/agentProvider.ts
+@@ -0,0 +1,78 @@
++import type { ChatRequest } from './types';
++
++export interface ToolTraceEvent {
++  step: number;
++  tool_name: string;
++  status: 'started' | 'completed' | 'failed';
++  duration_ms?: number;
++}
++
++export interface AgentChatProviderOptions {
++  signal: AbortSignal;
++  onStatus?: (status: string) => void;
++  onTrace?: (trace: ToolTraceEvent) => void;
++}
++
++export class AGCoreAgentProvider {
++  async streamAgent(
++    request: ChatRequest,
++    options: AgentChatProviderOptions,
++    onDelta: (text: string) => void
++  ): Promise<void> {
++    const lastUserMsg = request.messages.filter(m => m.role === 'user').at(-1)?.content || '';
++    
++    // Get CSRF from session
++    const sessionRes = await fetch('/auth/session', { credentials: 'same-origin', cache: 'no-store', signal: options.signal });
++    const session = await sessionRes.json();
++    
++    const response = await fetch('/admin/hd2ai/api/v1/agent/runs', {
++      credentials: 'same-origin',
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++        Accept: 'text/event-stream',
++        ...(session?.csrf ? { 'X-CSRF-Token': session.csrf } : {}),
++      },
++      body: JSON.stringify({
++        agent_id: 'general-agent',
++        message: lastUserMsg,
++        stream: true,
++      }),
++      signal: options.signal,
++    });
++
++    if (!response.ok) {
++      throw new Error(`에이전트 요청 실패 (${response.status})`);
++    }
++
++    const reader = response.body?.getReader();
++    if (!reader) throw new Error('스트림을 읽을 수 없습니다.');
++
++    const decoder = new TextDecoder();
++    let pending = '';
++    while (true) {
++      const { value, done } = await reader.read();
++      if (done) break;
++      pending += decoder.decode(value, { stream: true });
++      const lines = pending.split(/\r?\n/);
++      pending = lines.pop() ?? '';
++      
++      for (const line of lines) {
++        if (!line.startsWith('data:')) continue;
++        const jsonStr = line.slice(5).trim();
++        if (!jsonStr) continue;
++        const event = JSON.parse(jsonStr);
++        
++        if (event.event === 'answer.delta') {
++          onDelta(event.delta || '');
++        } else if (event.event === 'tool.started') {
++          options.onTrace?.({ step: event.step, tool_name: event.tool_name, status: 'started' });
++        } else if (event.event === 'tool.completed') {
++          options.onTrace?.({ step: event.step, tool_name: event.tool_name, status: 'completed', duration_ms: event.duration_ms });
++        } else if (event.event === 'run.failed') {
++          throw new Error(event.message || '에이전트 실행에 실패했습니다.');
++        }
++      }
++    }
++  }
++}

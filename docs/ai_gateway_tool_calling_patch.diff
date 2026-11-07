@@ -1,0 +1,31 @@
+--- services/ai-gateway/engine.py
++++ services/ai-gateway/engine.py
+@@ -47,9 +47,13 @@
+-    if not isinstance(data,dict) or set(data)-{'model','messages','temperature','max_tokens','stream','response_format','chat_template_kwargs'}:raise EngineError('invalid_request','요청 형식을 확인하세요.',422)
++    allowed_keys = {'model','messages','temperature','max_tokens','stream','response_format','chat_template_kwargs','tools','tool_choice'}
++    if not isinstance(data,dict) or set(data)-allowed_keys:raise EngineError('invalid_request','요청 형식을 확인하세요.',422)
+     ms=data.get('messages')
+-    if not isinstance(ms,list) or not 1<=len(ms)<=300 or any(not isinstance(m,dict) or set(m)!={'role','content'} or m['role'] not in ('system','user','assistant') or not isinstance(m['content'],str) for m in ms):raise EngineError('invalid_messages','대화 형식을 확인하세요.',422)
++    def valid_msg(m):
++        if not isinstance(m, dict): return False
++        r = m.get('role')
++        if r not in ('system','user','assistant','tool'): return False
++        return True
++    if not isinstance(ms,list) or not 1<=len(ms)<=300 or any(not valid_msg(m) for m in ms):raise EngineError('invalid_messages','대화 형식을 확인하세요.',422)
+     cfg=p['routes'][route]
+     if not cfg['enabled']:raise EngineError('route_disabled','이 AI 서비스는 일시 중지 상태입니다.')
+@@ -62,6 +66,8 @@
+         body={'model':model,'messages':ms,'stream':stream,'temperature':temp,'max_tokens':min(maximum,cfg['max_output_tokens'])}
++        if 'tools' in data: body['tools'] = data['tools']
++        if 'tool_choice' in data: body['tool_choice'] = data['tool_choice']
+         for key in ('response_format','chat_template_kwargs'):
+             if key in data:body[key]=data[key]
+         if model=='nvidia/nemotron-3.5-super-vl-120b-a12b':body['chat_template_kwargs']={'enable_thinking':False}
+@@ -139,6 +145,8 @@
+                                         choice=obj.get('choices',[{}])[0] if obj.get('choices') else {};delta=choice.get('delta',{});content=delta.get('content','');finish=choice.get('finish_reason') or finish
++                                        tool_calls=delta.get('tool_calls')
++                                        if tool_calls: await emit({'choices':[{'delta':{'tool_calls':tool_calls}}]})
+                                     else:
+@@ -155,5 +163,6 @@
+-                        if not isinstance(text,str) or not text.strip():raise EngineError('empty_response','연결은 성공했지만 최종 답변이 비어 있습니다. 추론 설정과 출력 한도를 확인하세요.',502)
++                        if finish != 'tool_calls' and (not isinstance(text,str) or not text.strip()):raise EngineError('empty_response','연결은 성공했지만 최종 답변이 비어 있습니다. 추론 설정과 출력 한도를 확인하세요.',502)
