@@ -41,7 +41,12 @@ class AgentRunner:
     def get_session(self, run_id: str) -> Optional[AgentRunSession]:
         return self.sessions.get(run_id)
 
-    async def create_run(self, req: AgentRunRequest, service_id: str = "hd2ai-admin") -> AgentRunSession:
+    async def create_run(
+        self,
+        req: AgentRunRequest,
+        service_id: str = "hd2ai-admin",
+        custom_client: Optional[Any] = None,
+    ) -> AgentRunSession:
         run_id = f"run-{uuid.uuid4().hex[:16]}"
         opts = req.options
         
@@ -54,6 +59,7 @@ class AgentRunner:
             max_tool_calls=opts.max_tool_calls if opts and opts.max_tool_calls else settings.MAX_TOOL_CALLS,
             stream=req.stream,
             status="queued",
+            custom_client=custom_client,
         )
         session = AgentRunSession(initial_state)
         self.sessions[run_id] = session

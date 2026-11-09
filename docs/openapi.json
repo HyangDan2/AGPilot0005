@@ -209,6 +209,106 @@
           }
         }
       }
+    },
+    "/api/v1/demo/connect": {
+      "post": {
+        "tags": [
+          "Demo Console"
+        ],
+        "summary": "Test Connection",
+        "description": "Verifies connection to either direct model provider or AI Gateway.",
+        "operationId": "test_connection_api_v1_demo_connect_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DemoConnectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/demo/run": {
+      "post": {
+        "tags": [
+          "Demo Console"
+        ],
+        "summary": "Run Demo",
+        "description": "Executes either standard Chat or LangGraph Agent with real-time SSE stream.",
+        "operationId": "run_demo_api_v1_demo_run_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DemoRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/demo/tools": {
+      "get": {
+        "tags": [
+          "Demo Console"
+        ],
+        "summary": "List Demo Tools",
+        "description": "Lists registered tools for the demo console.",
+        "operationId": "list_demo_tools_api_v1_demo_tools_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -407,6 +507,133 @@
           "created_at"
         ],
         "title": "AgentRunResponse"
+      },
+      "DemoConnectRequest": {
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "gateway"
+            ],
+            "title": "Mode",
+            "default": "direct"
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          }
+        },
+        "type": "object",
+        "title": "DemoConnectRequest"
+      },
+      "DemoRunRequest": {
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "agent"
+            ],
+            "title": "Mode",
+            "default": "agent"
+          },
+          "model_mode": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "gateway"
+            ],
+            "title": "Model Mode",
+            "default": "direct"
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "stream": {
+            "type": "boolean",
+            "title": "Stream",
+            "default": true
+          },
+          "options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRunOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "title": "DemoRunRequest"
       },
       "HTTPValidationError": {
         "properties": {

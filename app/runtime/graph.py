@@ -18,8 +18,9 @@ async def model_node(state: AgentState, on_delta=None) -> Dict[str, Any]:
     # 2. Get tool definitions for this service
     tools = registry.get_definitions(service=state.service_id)
     
-    # 3. Call AI Gateway Adapter
-    content, tool_calls, finish_reason = await gateway_client.execute(
+    # 3. Call Client (custom_client if provided, else default gateway_client)
+    client = state.custom_client or gateway_client
+    content, tool_calls, finish_reason = await client.execute(
         messages=pruned_msgs,
         tools=tools if state.tool_call_count < state.max_tool_calls else None,
         tool_choice="auto" if state.tool_call_count < state.max_tool_calls else "none",

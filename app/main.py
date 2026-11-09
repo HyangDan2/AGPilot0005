@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.api.agent import router as agent_router
+from app.api.demo import router as demo_router
 from app.api.health import router as health_router
 from app.config import settings
 
@@ -39,6 +40,16 @@ async def security_and_limit_middleware(request: Request, call_next):
 # Include API Routers under /api/v1
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
+app.include_router(demo_router, prefix="/api/v1")
+
+# Mount built demo console frontend if dist directory exists
+import os
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+
+demo_dist = Path(__file__).resolve().parent.parent / "demo" / "dist"
+if demo_dist.exists():
+    app.mount("/demo", StaticFiles(directory=str(demo_dist), html=True), name="demo")
 
 if __name__ == "__main__":
     import uvicorn

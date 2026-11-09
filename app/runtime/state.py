@@ -29,3 +29,8 @@ class AgentState(BaseModel):
     
     # Stream flag
     stream: bool = False
+    
+    # Custom client for Direct Demo Adapter
+    custom_client: Optional[Any] = None
+
+    model_config = {"arbitrary_types_allowed": True}
