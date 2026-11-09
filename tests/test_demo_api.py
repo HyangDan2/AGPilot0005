@@ -102,6 +102,21 @@ async def test_demo_run_chat_mode():
 @pytest.mark.asyncio
 async def test_demo_frontend_serving():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Root redirect to /demo/
+        r0 = await client.get("/", follow_redirects=False)
+        assert r0.status_code == 307
+        assert r0.headers["location"] == "/demo/"
+
+        # 2. /demo redirect to /demo/
+        r1 = await client.get("/demo", follow_redirects=False)
+        assert r1.status_code == 307
+        assert r1.headers["location"] == "/demo/"
+
+        # 3. Direct /demo/
         r = await client.get("/demo/")
         assert r.status_code == 200
         assert "AGPilot0005 — Standalone Agent Demo Console" in r.text
+
+        # 4. Favicon
+        r_fav = await client.get("/favicon.ico")
+        assert r_fav.status_code == 200

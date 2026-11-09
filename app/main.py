@@ -45,10 +45,29 @@ app.include_router(demo_router, prefix="/api/v1")
 # Mount built demo console frontend if dist directory exists
 import os
 from pathlib import Path
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 demo_dist = Path(__file__).resolve().parent.parent / "demo" / "dist"
 if demo_dist.exists():
+    @app.get("/", include_in_schema=False)
+    async def root_redirect():
+        return RedirectResponse(url="/demo/")
+
+    @app.get("/demo", include_in_schema=False)
+    async def demo_slash_redirect():
+        return RedirectResponse(url="/demo/")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        fav = demo_dist / "favicon.ico"
+        if fav.exists():
+            return FileResponse(str(fav))
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+
+    if (demo_dist / "assets").exists():
+        app.mount("/assets", StaticFiles(directory=str(demo_dist / "assets")), name="assets")
+
     app.mount("/demo", StaticFiles(directory=str(demo_dist), html=True), name="demo")
 
 if __name__ == "__main__":
