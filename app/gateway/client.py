@@ -133,7 +133,10 @@ class AIGatewayClient:
                     chunk = delta["content"]
                     full_content += chunk
                     if on_content_delta and callable(on_content_delta):
-                        await on_content_delta(chunk)
+                        if asyncio.iscoroutinefunction(on_content_delta):
+                            await on_content_delta(chunk)
+                        else:
+                            on_content_delta(chunk)
 
                 if "tool_calls" in delta and delta["tool_calls"]:
                     accumulator.feed_delta(delta["tool_calls"])
