@@ -51,8 +51,11 @@ from fastapi.staticfiles import StaticFiles
 demo_dist = Path(__file__).resolve().parent.parent / "demo" / "dist"
 if demo_dist.exists():
     @app.get("/", include_in_schema=False)
-    async def root_redirect():
-        return RedirectResponse(url="/demo/")
+    async def root_index():
+        index_file = demo_dist / "index.html"
+        if index_file.exists():
+            return FileResponse(str(index_file))
+        return RedirectResponse(url="demo/")
 
     @app.get("/demo", include_in_schema=False)
     async def demo_slash_redirect():
