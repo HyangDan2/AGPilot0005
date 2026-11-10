@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from app.schemas.gateway import ToolDefinition, ToolFunctionDefinition
 from app.tools.builtin.system import echo, get_datetime
 from app.tools.builtin.math import calculate
-from app.tools.builtin.document import get_outline, read_section
+from app.tools.builtin.document import get_outline, read_section, search, read_chunk, get_figure_info
 
 class ToolRegistration(BaseModel):
     name: str
@@ -154,6 +154,55 @@ class ToolRegistry:
                 "required": ["doc_id", "section_id"],
             },
             handler=read_section,
+            is_read_only=True,
+        )
+
+        # 6. document.search
+        self.register(
+            name="document.search",
+            description="문서 내 텍스트를 키워드 및 의미 기반으로 검색하여 연관 청크와 페이지 위치를 조회합니다.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string", "description": "문서 식별자"},
+                    "query": {"type": "string", "description": "검색할 키워드 또는 질의문"},
+                    "limit": {"type": "integer", "description": "최대 반환 결과 개수 (기본 5)", "default": 5},
+                },
+                "required": ["doc_id", "query"],
+            },
+            handler=search,
+            is_read_only=True,
+        )
+
+        # 7. document.read_chunk
+        self.register(
+            name="document.read_chunk",
+            description="문서 내 특정 텍스트 청크의 본문, 토큰 수 및 원본 위치를 조회합니다.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string", "description": "문서 식별자"},
+                    "chunk_id": {"type": "string", "description": "조회할 청크 식별자"},
+                },
+                "required": ["doc_id", "chunk_id"],
+            },
+            handler=read_chunk,
+            is_read_only=True,
+        )
+
+        # 8. document.get_figure_info
+        self.register(
+            name="document.get_figure_info",
+            description="문서 내 그림, 차트, 슬라이드 렌더링 시각 정보의 캡션과 다운로드 URL을 조회합니다.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string", "description": "문서 식별자"},
+                    "figure_id": {"type": "string", "description": "조회할 그림/차트 식별자"},
+                },
+                "required": ["doc_id", "figure_id"],
+            },
+            handler=get_figure_info,
             is_read_only=True,
         )
 

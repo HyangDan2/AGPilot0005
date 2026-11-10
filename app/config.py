@@ -23,4 +23,9 @@ class Settings(BaseModel):
     # Service Auth Tokens (Callers allowed to invoke AGCore)
     SERVICE_TOKENS: str = os.environ.get("AGCORE_SERVICE_TOKENS", "")
 
+    # AGPilot0006 (Document Intelligence) Service Integration
+    AGTOOLS_URL: str = os.environ.get("AGCORE_AGTOOLS_URL", "http://127.0.0.1:8006/api/v1")
+    AGTOOLS_TOKEN: str = os.environ.get("AGCORE_AGTOOLS_TOKEN", "hd2-doc-secret-token-key-2026")
+    AGTOOLS_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_AGTOOLS_TIMEOUT_SECONDS", "10.0"))
+
 settings = Settings()
