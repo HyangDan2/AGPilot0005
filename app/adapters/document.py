@@ -314,7 +314,7 @@ class AGToolsHttpAdapter(DocumentAdapter):
 
 
 class CompositeDocumentAdapter(DocumentAdapter):
-    """Resilient composite adapter: Queries live AGTools first, transparently falling back to Mock."""
+    """Resilient composite adapter: Queries live AGTools first; falls back to Mock only when ALLOW_MOCK_FALLBACK is enabled."""
     def __init__(self, http_adapter: Optional[AGToolsHttpAdapter] = None, mock_adapter: Optional[MockDocumentAdapter] = None):
         self.http = http_adapter or AGToolsHttpAdapter()
         self.mock = mock_adapter or MockDocumentAdapter()
@@ -324,8 +324,12 @@ class CompositeDocumentAdapter(DocumentAdapter):
             res = await self.http.get_outline(doc_id)
             if not res.get("error"):
                 return res
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return res
         except Exception as e:
-            logger.warning("AGTools HTTP outline error, falling back to mock: %s", e)
+            logger.warning("AGTools HTTP outline error: %s", e)
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return {"error": True, "code": "connection_failed", "message": f"AGTools 연결 실패: {e}"}
         return await self.mock.get_outline(doc_id)
 
     async def read_section(self, doc_id: str, section_id: str) -> Dict[str, Any]:
@@ -333,8 +337,12 @@ class CompositeDocumentAdapter(DocumentAdapter):
             res = await self.http.read_section(doc_id, section_id)
             if not res.get("error"):
                 return res
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return res
         except Exception as e:
-            logger.warning("AGTools HTTP read_section error, falling back to mock: %s", e)
+            logger.warning("AGTools HTTP read_section error: %s", e)
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return {"error": True, "code": "connection_failed", "message": f"AGTools 연결 실패: {e}"}
         return await self.mock.read_section(doc_id, section_id)
 
     async def search(self, doc_id: str, query: str, limit: int = 5) -> Dict[str, Any]:
@@ -342,8 +350,12 @@ class CompositeDocumentAdapter(DocumentAdapter):
             res = await self.http.search(doc_id, query, limit)
             if not res.get("error"):
                 return res
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return res
         except Exception as e:
-            logger.warning("AGTools HTTP search error, falling back to mock: %s", e)
+            logger.warning("AGTools HTTP search error: %s", e)
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return {"error": True, "code": "connection_failed", "message": f"AGTools 연결 실패: {e}"}
         return await self.mock.search(doc_id, query, limit)
 
     async def read_chunk(self, doc_id: str, chunk_id: str) -> Dict[str, Any]:
@@ -351,8 +363,12 @@ class CompositeDocumentAdapter(DocumentAdapter):
             res = await self.http.read_chunk(doc_id, chunk_id)
             if not res.get("error"):
                 return res
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return res
         except Exception as e:
-            logger.warning("AGTools HTTP read_chunk error, falling back to mock: %s", e)
+            logger.warning("AGTools HTTP read_chunk error: %s", e)
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return {"error": True, "code": "connection_failed", "message": f"AGTools 연결 실패: {e}"}
         return await self.mock.read_chunk(doc_id, chunk_id)
 
     async def get_figure_info(self, doc_id: str, figure_id: str) -> Dict[str, Any]:
@@ -360,8 +376,12 @@ class CompositeDocumentAdapter(DocumentAdapter):
             res = await self.http.get_figure_info(doc_id, figure_id)
             if not res.get("error"):
                 return res
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return res
         except Exception as e:
-            logger.warning("AGTools HTTP get_figure_info error, falling back to mock: %s", e)
+            logger.warning("AGTools HTTP get_figure_info error: %s", e)
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return {"error": True, "code": "connection_failed", "message": f"AGTools 연결 실패: {e}"}
         return await self.mock.get_figure_info(doc_id, figure_id)
 
 

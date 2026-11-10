@@ -23,6 +23,10 @@ class Settings(BaseModel):
     # Service Auth Tokens (Callers allowed to invoke AGCore)
     SERVICE_TOKENS: str = os.environ.get("AGCORE_SERVICE_TOKENS", "")
 
+    # Environment & Mock Policy
+    ENVIRONMENT: str = os.environ.get("AGCORE_ENV", "development")
+    ALLOW_MOCK_FALLBACK: bool = os.environ.get("AGCORE_ALLOW_MOCK_FALLBACK", "true").lower() in ("true", "1", "yes")
+
     # AGPilot0006 (Document Intelligence) Service Integration
     AGTOOLS_URL: str = os.environ.get("AGCORE_AGTOOLS_URL", "http://127.0.0.1:8006/api/v1")
     AGTOOLS_TOKEN: str = os.environ.get("AGCORE_AGTOOLS_TOKEN", "hd2-doc-secret-token-key-2026")

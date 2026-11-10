@@ -74,3 +74,16 @@ async def test_agtools_http_adapter_mocked_success():
         assert res["doc_id"] == "doc-live-1"
         assert res["status"] == "ready"
         assert len(res["outline"]) == 1
+
+@pytest.mark.asyncio
+async def test_composite_adapter_fail_closed_when_mock_fallback_disabled():
+    adapter = AGToolsHttpAdapter(base_url="http://127.0.0.1:59999/api/v1", token="test-token", timeout=1.0)
+    mock = MockDocumentAdapter()
+    composite = CompositeDocumentAdapter(http_adapter=adapter, mock_adapter=mock)
+
+    with patch("app.adapters.document.settings.ALLOW_MOCK_FALLBACK", False):
+        res = await composite.get_outline("hd2lab-guide")
+        assert res.get("error") is True
+        assert res.get("code") == "connection_failed"
+        assert "AGTools 연결 실패" in res.get("message")
+

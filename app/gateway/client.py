@@ -80,8 +80,10 @@ class AIGatewayClient:
                     return await self._stream_request(client, url, req_body, on_content_delta)
                 else:
                     return await self._unary_request(client, url, req_body)
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, httpx.HTTPError, OSError):
-            # Fallback to simulated execution if gateway is unreachable or unconfigured in local dev/test environment
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, httpx.HTTPError, OSError) as e:
+            if not self.mock_mode and not settings.ALLOW_MOCK_FALLBACK:
+                raise
+            # Fallback to simulated execution if mock mode or explicitly allowed in local dev/test environment
             return await self._mock_completion(messages, tools, on_content_delta)
 
     async def _unary_request(
