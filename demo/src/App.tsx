@@ -175,7 +175,7 @@ export default function App() {
       {/* Header */}
       <header className="console-header">
         <div className="brand-wrapper">
-          <img src="/assets/LOGO.png" alt="HD2Lab" className="brand-logo" />
+          <img src="./assets/LOGO.png" alt="HD2Lab" className="brand-logo" />
           <span className="brand-title">AGPilot0005 — Agent Demo Console</span>
           <span className="brand-badge">v1.1 MVP</span>
         </div>

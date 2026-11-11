@@ -49,8 +49,12 @@ export interface AgentRunCallbacks {
   onRunCancelled?: (data: any) => void;
 }
 
+const API_BASE = typeof window !== 'undefined' && window.location.pathname.startsWith('/admin/agcore')
+  ? '/admin/agcore/api/v1/demo'
+  : '/api/v1/demo';
+
 export async function testConnection(config: ModelConnectionConfig): Promise<ConnectionStatusResult> {
-  const res = await fetch('/api/v1/demo/connect', {
+  const res = await fetch(`${API_BASE}/connect`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -73,7 +77,7 @@ export async function testConnection(config: ModelConnectionConfig): Promise<Con
 }
 
 export async function fetchTools(): Promise<ToolDefinitionItem[]> {
-  const res = await fetch('/api/v1/demo/tools');
+  const res = await fetch(`${API_BASE}/tools`);
   if (!res.ok) return [];
   const data = await res.json();
   return data.tools || [];
@@ -86,7 +90,7 @@ export async function streamRun(
   callbacks: AgentRunCallbacks,
   signal?: AbortSignal
 ): Promise<void> {
-  const res = await fetch('/api/v1/demo/run', {
+  const res = await fetch(`${API_BASE}/run`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
