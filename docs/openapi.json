@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "HD2Lab Agent Core Platform (AGCore)",
-    "description": "범용 Agentic AI Runtime 백엔드 서비스",
-    "version": "1.0.0-mvp"
+    "description": "범용 Agentic AI Runtime 및 Tool Execution 백엔드 서비스",
+    "version": "1.1.0"
   },
   "paths": {
     "/api/v1/health": {

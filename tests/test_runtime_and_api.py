@@ -94,3 +94,24 @@ async def test_rest_api_agent_run_and_status():
         status_data = r2.json()
         assert status_data["run_id"] == run_id
         assert status_data["status"] in ("completed", "running")
+
+@pytest.mark.asyncio
+async def test_swagger_and_favicon_endpoints():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # Default direct docs
+        r_docs = await client.get("/docs")
+        assert r_docs.status_code == 200
+        assert "HD2Lab Agent Core Platform (AGCore)" in r_docs.text
+        assert "openapi.json" in r_docs.text
+
+        # Reverse proxy prefix docs
+        r_proxy_docs = await client.get("/docs", headers={"x-original-uri": "/admin/agcore/docs"})
+        assert r_proxy_docs.status_code == 200
+        assert "/admin/agcore/openapi.json" in r_proxy_docs.text
+
+        # Favicons
+        r_ico = await client.get("/favicon.ico")
+        assert r_ico.status_code in (200, 404)
+        r_svg = await client.get("/favicon.svg")
+        assert r_svg.status_code == 200
+        assert "svg" in r_svg.headers.get("content-type", "")
