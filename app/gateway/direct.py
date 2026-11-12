@@ -46,6 +46,11 @@ def validate_base_url(url: str, allow_localhost: bool = False) -> str:
 
     return url
 
+def _to_wire_name(name: str) -> str:
+    """Convert dot-separated internal tool names (e.g. system.echo) to OpenAI-compliant names (system_echo)."""
+    return name.replace(".", "_")
+
+
 class DirectLLMClient:
     """Direct client connecting to user-provided OpenAI-compatible model endpoints (e.g. NVIDIA API)."""
     def __init__(
@@ -135,7 +140,10 @@ class DirectLLMClient:
             return await gateway_client._mock_completion(messages, tools, on_content_delta)
 
         url = f"{self.base_url}/chat/completions"
-        
+        wire_to_internal: Dict[str, str] = {}
+        if tools:
+            wire_to_internal = {_to_wire_name(t.function.name): t.function.name for t in tools}
+
         # Serialize messages
         formatted_msgs = []
         for m in messages:
@@ -143,11 +151,17 @@ class DirectLLMClient:
             if m.content is not None:
                 msg_dict["content"] = m.content
             if m.tool_calls:
-                msg_dict["tool_calls"] = [tc.model_dump(exclude_none=True) for tc in m.tool_calls]
+                serialized_tcs = []
+                for tc in m.tool_calls:
+                    tc_dict = tc.model_dump(exclude_none=True)
+                    if "function" in tc_dict and "name" in tc_dict["function"]:
+                        tc_dict["function"]["name"] = _to_wire_name(tc_dict["function"]["name"])
+                    serialized_tcs.append(tc_dict)
+                msg_dict["tool_calls"] = serialized_tcs
             if m.tool_call_id:
                 msg_dict["tool_call_id"] = m.tool_call_id
             if m.name:
-                msg_dict["name"] = m.name
+                msg_dict["name"] = _to_wire_name(m.name)
             formatted_msgs.append(msg_dict)
 
         req_body: Dict[str, Any] = {
@@ -157,18 +171,24 @@ class DirectLLMClient:
             "stream": stream,
         }
         if tools:
-            req_body["tools"] = [t.model_dump(exclude_none=True) for t in tools]
+            wire_tools = []
+            for t in tools:
+                t_dict = t.model_dump(exclude_none=True)
+                if "function" in t_dict and "name" in t_dict["function"]:
+                    t_dict["function"]["name"] = _to_wire_name(t_dict["function"]["name"])
+                wire_tools.append(t_dict)
+            req_body["tools"] = wire_tools
             if tool_choice:
                 req_body["tool_choice"] = tool_choice
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(settings.RUN_TIMEOUT_SECONDS, connect=10)) as client:
             if stream:
-                return await self._stream_request(client, url, req_body, on_content_delta)
+                return await self._stream_request(client, url, req_body, on_content_delta, wire_to_internal)
             else:
-                return await self._unary_request(client, url, req_body)
+                return await self._unary_request(client, url, req_body, wire_to_internal)
 
     async def _unary_request(
-        self, client: httpx.AsyncClient, url: str, body: Dict[str, Any]
+        self, client: httpx.AsyncClient, url: str, body: Dict[str, Any], wire_to_internal: Optional[Dict[str, str]] = None
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         r = await client.post(url, json=body, headers=self._get_headers())
         if r.status_code != 200:
@@ -188,11 +208,19 @@ class DirectLLMClient:
         tool_calls = []
         if "tool_calls" in msg and msg["tool_calls"]:
             for tc in msg["tool_calls"]:
-                tool_calls.append(ToolCall(**tc))
+                parsed_tc = ToolCall(**tc)
+                if wire_to_internal and parsed_tc.function.name in wire_to_internal:
+                    parsed_tc.function.name = wire_to_internal[parsed_tc.function.name]
+                tool_calls.append(parsed_tc)
         return content, tool_calls, finish_reason
 
     async def _stream_request(
-        self, client: httpx.AsyncClient, url: str, body: Dict[str, Any], on_content_delta: Optional[Any]
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        body: Dict[str, Any],
+        on_content_delta: Optional[Any],
+        wire_to_internal: Optional[Dict[str, str]] = None,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         accumulator = ToolCallAccumulator()
         full_content = ""
@@ -233,6 +261,10 @@ class DirectLLMClient:
                     finish_reason = choice["finish_reason"]
 
         tool_calls = accumulator.get_tool_calls()
+        if wire_to_internal:
+            for tc in tool_calls:
+                if tc.function.name in wire_to_internal:
+                    tc.function.name = wire_to_internal[tc.function.name]
         if tool_calls and (not finish_reason or finish_reason == "stop"):
             finish_reason = "tool_calls"
         return full_content if full_content else None, tool_calls, finish_reason
