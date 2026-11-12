@@ -49,14 +49,34 @@ export interface AgentRunCallbacks {
   onRunCancelled?: (data: any) => void;
 }
 
-const API_BASE = typeof window !== 'undefined' && window.location.pathname.startsWith('/admin/agcore')
+const IS_ADMIN_PROXY = typeof window !== 'undefined' && window.location.pathname.startsWith('/admin/agcore');
+
+const API_BASE = IS_ADMIN_PROXY
   ? '/admin/agcore/api/v1/demo'
   : '/api/v1/demo';
 
+async function getAdminAuthHeaders(signal?: AbortSignal): Promise<Record<string, string>> {
+  if (!IS_ADMIN_PROXY) return {};
+  try {
+    const res = await fetch('/auth/session', {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal,
+    });
+    if (!res.ok) return {};
+    const session = (await res.json()) as { authenticated?: boolean; csrf?: string };
+    return session.csrf ? { 'X-CSRF-Token': session.csrf } : {};
+  } catch {
+    return {};
+  }
+}
+
 export async function testConnection(config: ModelConnectionConfig): Promise<ConnectionStatusResult> {
+  const authHeaders = await getAdminAuthHeaders();
   const res = await fetch(`${API_BASE}/connect`, {
+    credentials: 'same-origin',
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders },
     body: JSON.stringify({
       mode: config.mode,
       base_url: config.baseUrl,
@@ -90,11 +110,14 @@ export async function streamRun(
   callbacks: AgentRunCallbacks,
   signal?: AbortSignal
 ): Promise<void> {
+  const authHeaders = await getAdminAuthHeaders(signal);
   const res = await fetch(`${API_BASE}/run`, {
+    credentials: 'same-origin',
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
+      ...authHeaders,
     },
     body: JSON.stringify({
       mode,
