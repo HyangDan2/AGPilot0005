@@ -168,7 +168,7 @@ async def test_analysis_sets_output_and_timeout_budgets(tmp_path, monkeypatch):
     manager = module.DocumentAnalysisManager(module.AnalysisStore(str(tmp_path)))
     created = await manager.create("alice", "hd2ai-admin", "전체 분석", ["doc_test"])
     await manager.tasks[created["job_id"]]
-    assert [option["max_tokens"] for option in model.options] == [1024, 2048]
+    assert [option["max_tokens"] for option in model.options] == [4096, 2048]
     assert all(option["timeout_seconds"] == module.settings.ANALYSIS_MODEL_TIMEOUT_SECONDS for option in model.options)
     assert all(option["reasoning_effort"] == "off" for option in model.options)
     assert all(messages[0].role == "user" and "분석 지침:" in messages[0].content for messages in model.messages)
@@ -191,7 +191,7 @@ async def test_oversized_note_is_retried_from_original_chunk(tmp_path, monkeypat
     await manager.tasks[created["job_id"]]
     completed = manager.store.read(created["job_id"])
     assert completed["status"] == "completed"
-    assert [option["max_tokens"] for option in model.options] == [1024, 512, 2048]
+    assert [option["max_tokens"] for option in model.options] == [4096, 2048, 2048]
     assert "원문:" in model.messages[1][0].content
 
 
@@ -212,4 +212,23 @@ async def test_output_limit_expands_only_analysis_call_budget(tmp_path, monkeypa
     created = await manager.create("alice", "hd2ai-public", "전체 분석", ["doc_test"])
     await manager.tasks[created["job_id"]]
     assert manager.store.read(created["job_id"])["status"] == "completed"
-    assert [option["max_tokens"] for option in model.options] == [1024, 2048, 2048]
+    assert [option["max_tokens"] for option in model.options] == [4096, 8192, 2048]
+
+
+@pytest.mark.asyncio
+async def test_output_truncated_expands_budget_and_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "document_adapter", FakeDocuments(1))
+    class TruncatedOnce(FakeModel):
+        async def execute(self, messages, **kwargs):
+            self.messages.append(messages)
+            self.options.append(kwargs)
+            if len(self.options) == 1:
+                return "부분 출력", [], "length"
+            return "완전한 근거", [], "stop"
+    model = TruncatedOnce()
+    monkeypatch.setattr(module, "gateway_client", model)
+    manager = module.DocumentAnalysisManager(module.AnalysisStore(str(tmp_path)))
+    created = await manager.create("alice", "hd2ai-admin", "전체 분석", ["doc_test"])
+    await manager.tasks[created["job_id"]]
+    assert manager.store.read(created["job_id"])["status"] == "completed"
+    assert [option["max_tokens"] for option in model.options] == [4096, 8192, 2048]

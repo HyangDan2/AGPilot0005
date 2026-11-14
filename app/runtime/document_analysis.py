@@ -176,7 +176,7 @@ class DocumentAnalysisManager:
         job: dict[str, Any],
         system: str,
         user: str,
-        max_tokens: int = 1024,
+        max_tokens: int = 4096,
         reasoning_effort_override: str | None = None,
     ) -> str:
         prompt = f"분석 지침:\n{system}\n\n{user}"
@@ -205,7 +205,10 @@ class DocumentAnalysisManager:
                 )
                 if calls:
                     raise ValueError("unexpected_model_tool_call")
-                if finish in ('length','max_tokens'):
+                if finish in ('length', 'max_tokens'):
+                    if attempt < 4 and max_tokens < 32768:
+                        max_tokens = min(32768, max_tokens * 2)
+                        continue
                     raise ValueError('model_output_truncated')
                 return _clean_answer(content)
             except httpx.HTTPStatusError as exc:
@@ -237,7 +240,7 @@ class DocumentAnalysisManager:
                 job,
                 system + " 반드시 500자 이내로 압축하고 출처 ID를 남기세요.",
                 user,
-                max_tokens=512,
+                max_tokens=2048,
                 reasoning_effort_override="off",
             )
         if len(note.encode("utf-8")) > 3500:
