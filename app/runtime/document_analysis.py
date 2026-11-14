@@ -171,17 +171,26 @@ class DocumentAnalysisManager:
             return
         self.tasks[job_id] = asyncio.create_task(self._run(job_id))
 
-    async def _model(self, job: dict[str, Any], system: str, user: str, max_tokens: int = 1024) -> str:
+    async def _model(
+        self,
+        job: dict[str, Any],
+        system: str,
+        user: str,
+        max_tokens: int = 1024,
+        reasoning_effort_override: str | None = None,
+    ) -> str:
         prompt = f"분석 지침:\n{system}\n\n{user}"
         if len(prompt.encode("utf-8")) > 9000:
             raise ValueError("context_budget_exceeded")
+        effort = reasoning_effort_override if reasoning_effort_override is not None else job.get('reasoning_effort', 'off')
+        if effort != 'off':
+            max_tokens = max(max_tokens, 8192)
         for attempt in range(5):
             if job["model_calls"] >= settings.ANALYSIS_MAX_MODEL_CALLS:
                 raise ValueError("model_call_budget_exceeded")
             job["model_calls"] += 1
             self._save(job)
             try:
-                effort = job.get('reasoning_effort','off')
                 def thinking(chunk):
                     job['reasoning_text'] = (job.get('reasoning_text','') + chunk)[:200000]
                     if time.time() - job.get('_reasoning_saved',0) >= .5:
@@ -206,8 +215,8 @@ class DocumentAnalysisManager:
                         code = exc.response.json().get("code")
                     except (ValueError, AttributeError):
                         code = None
-                    if code == "output_limit" and attempt < 4 and max_tokens < 8192:
-                        max_tokens = min(8192, max_tokens * 2)
+                    if code == "output_limit" and attempt < 4 and max_tokens < 32768:
+                        max_tokens = min(32768, max_tokens * 2)
                         continue
                     raise ValueError("gateway_output_limit" if code == "output_limit" else "gateway_http_422") from exc
                 if status not in (429, 502, 503, 504) or attempt == 4:
@@ -222,9 +231,15 @@ class DocumentAnalysisManager:
         raise ValueError("model_retry_exhausted")
 
     async def _note(self, job: dict[str, Any], system: str, user: str) -> str:
-        note = await self._model(job, system, user)
+        note = await self._model(job, system, user, reasoning_effort_override="off")
         if len(note.encode("utf-8")) > 3500:
-            note = await self._model(job, system + " 반드시 500자 이내로 압축하고 출처 ID를 남기세요.", user, max_tokens=512)
+            note = await self._model(
+                job,
+                system + " 반드시 500자 이내로 압축하고 출처 ID를 남기세요.",
+                user,
+                max_tokens=512,
+                reasoning_effort_override="off",
+            )
         if len(note.encode("utf-8")) > 3500:
             raise ValueError("model_note_too_large")
         return note
