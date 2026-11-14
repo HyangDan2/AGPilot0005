@@ -1,0 +1,5 @@
+{
+  "max_tool_calls": 16,
+  "max_agent_steps": 20,
+  "run_timeout_seconds": 180.0
+}

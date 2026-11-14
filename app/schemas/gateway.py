@@ -35,3 +35,17 @@ class GatewayChatRequest(BaseModel):
     temperature: Optional[float] = 0.2
     max_tokens: Optional[int] = 4096
     stream: bool = False
+
+
+class ModelUsage(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class ModelReply(BaseModel):
+    content: Optional[str] = None
+    tool_calls: List[ToolCall] = Field(default_factory=list)
+    finish_reason: str = "stop"
+    context_truncated: bool = False
+    usage: Optional[ModelUsage] = None

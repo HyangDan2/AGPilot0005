@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { AgentRuntimeConfigPanel } from './components/AgentRuntimeConfigPanel';
 import { ModelConnectionPanel } from './components/ModelConnectionPanel';
 import { ChatModeToggle } from './components/ChatModeToggle';
 import { AgentExecutionViewer, type ExecutionEventItem } from './components/AgentExecutionViewer';
@@ -191,6 +192,9 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* AI Gateway Tool Calling & Agent Runtime Settings */}
+      <AgentRuntimeConfigPanel />
 
       {/* Model Connection Panel */}
       <ModelConnectionPanel

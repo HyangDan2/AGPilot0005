@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import httpx
 from app.config import settings
 from app.gateway.streaming import SSEStreamParser, ToolCallAccumulator
+from app.gateway.wire import to_wire_name as _to_wire_name
 from app.schemas.gateway import GatewayMessage, ToolCall, ToolDefinition
 
 class SSRFSecurityError(ValueError):
@@ -45,11 +46,6 @@ def validate_base_url(url: str, allow_localhost: bool = False) -> str:
             raise SSRFSecurityError("로컬 및 내부 도메인 접근은 허용되지 않습니다.")
 
     return url
-
-def _to_wire_name(name: str) -> str:
-    """Convert dot-separated internal tool names (e.g. system.echo) to OpenAI-compliant names (system_echo)."""
-    return name.replace(".", "_")
-
 
 class DirectLLMClient:
     """Direct client connecting to user-provided OpenAI-compatible model endpoints (e.g. NVIDIA API)."""
@@ -133,6 +129,8 @@ class DirectLLMClient:
         temperature: float = 0.2,
         stream: bool = False,
         on_content_delta: Optional[Any] = None,
+        reasoning_effort: Optional[str] = None,
+        on_reasoning_delta: Optional[Any] = None,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         """Executes completion directly against the target endpoint."""
         if self.mock_mode:

@@ -8,8 +8,10 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html
 from app.api.agent import router as agent_router
+from app.api.document_analysis import router as document_analysis_router
 from app.api.demo import router as demo_router
 from app.api.health import router as health_router
+from app.api.config import router as config_router
 from app.config import settings
 
 BASE_PATH = Path(__file__).resolve().parent.parent
@@ -74,7 +76,9 @@ async def custom_swagger_ui_html(request: Request):
 
 # Include API Routers under /api/v1
 app.include_router(health_router, prefix="/api/v1")
+app.include_router(config_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
+app.include_router(document_analysis_router, prefix="/api/v1")
 app.include_router(demo_router, prefix="/api/v1")
 
 # Mount built demo console frontend if dist directory exists

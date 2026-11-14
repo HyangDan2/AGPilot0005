@@ -212,3 +212,31 @@ export async function streamRun(
     reader.releaseLock();
   }
 }
+
+export interface AgentRuntimeConfigDto {
+  max_tool_calls: number;
+  max_agent_steps: number;
+  run_timeout_seconds: number;
+}
+
+export async function fetchAgentConfig(): Promise<AgentRuntimeConfigDto> {
+  const res = await fetch('/api/v1/config/agent');
+  if (!res.ok) throw new Error('설정 조회 실패');
+  return res.json();
+}
+
+export async function updateAgentConfig(patch: Partial<AgentRuntimeConfigDto>): Promise<AgentRuntimeConfigDto> {
+  const res = await fetch('/api/v1/config/agent', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error('설정 저장 실패');
+  return res.json();
+}
+
+export async function resetAgentConfig(): Promise<AgentRuntimeConfigDto> {
+  const res = await fetch('/api/v1/config/agent/reset', { method: 'POST' });
+  if (!res.ok) throw new Error('설정 초기화 실패');
+  return res.json();
+}

@@ -2,17 +2,27 @@
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 import httpx
 from app.config import settings
 from app.gateway.streaming import SSEStreamParser, ToolCallAccumulator
+from app.gateway.wire import ToolNameCodec
 from app.schemas.gateway import (
     GatewayChatRequest,
     GatewayMessage,
     ToolCall,
     ToolDefinition,
+    ModelReply,
 )
+
+class GatewayStreamError(RuntimeError):
+    """Stable gateway code only; never include a provider body or credentials."""
+    def __init__(self, code):
+        self.code = code if isinstance(code, str) and re.fullmatch(r'[a-z0-9_]{1,60}', code) else 'stream_failed'
+        super().__init__('gateway_' + self.code)
+
 
 class AIGatewayClient:
     def __init__(
@@ -51,6 +61,13 @@ class AIGatewayClient:
         temperature: float = 0.2,
         stream: bool = False,
         on_content_delta: Optional[Any] = None,
+        on_reasoning_delta: Optional[Any] = None,
+        timeout_seconds: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+        task_instructions: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        _structured: bool = False,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         """
         Executes a completion through AI Gateway.
@@ -58,39 +75,57 @@ class AIGatewayClient:
             Tuple[Optional[str], List[ToolCall], finish_reason]
         """
         if self.mock_mode:
-            return await self._mock_completion(messages, tools, on_content_delta)
+            result = await self._mock_completion(messages, tools, on_content_delta)
+            return ModelReply(content=result[0], tool_calls=result[1], finish_reason=result[2]) if _structured else result
 
         url = f"{self.base_url}/internal/{self.route}/chat/completions"
         transport = self._get_transport()
 
+        codec = ToolNameCodec(tools)
         req_body = {
             "model": self.route,
-            "messages": [m.model_dump(exclude_none=True) for m in messages],
+            "messages": codec.messages(messages),
             "stream": stream,
             "temperature": temperature,
         }
+        if max_tokens is not None:
+            req_body["max_tokens"] = max_tokens
+        if reasoning_effort is not None:
+            req_body["reasoning_effort"] = reasoning_effort
+        if task_instructions is not None:
+            req_body["task_instructions"] = task_instructions
+        if response_format is not None:
+            req_body["response_format"] = response_format
         if tools:
-            req_body["tools"] = [t.model_dump(exclude_none=True) for t in tools]
+            req_body["tools"] = codec.tools(tools)
             if tool_choice:
                 req_body["tool_choice"] = tool_choice
 
         try:
-            async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(settings.RUN_TIMEOUT_SECONDS, connect=5)) as client:
+            async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(timeout_seconds or settings.RUN_TIMEOUT_SECONDS, connect=5)) as client:
                 if stream:
-                    return await self._stream_request(client, url, req_body, on_content_delta)
+                    return await self._stream_request(client, url, req_body, on_content_delta, codec, on_reasoning_delta, _structured)
                 else:
-                    return await self._unary_request(client, url, req_body)
+                    return await self._unary_request(client, url, req_body, codec, structured=_structured)
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, httpx.HTTPError, OSError) as e:
             if not self.mock_mode and not settings.ALLOW_MOCK_FALLBACK:
                 raise
             # Fallback to simulated execution if mock mode or explicitly allowed in local dev/test environment
-            return await self._mock_completion(messages, tools, on_content_delta)
+            result = await self._mock_completion(messages, tools, on_content_delta)
+            return ModelReply(content=result[0], tool_calls=result[1], finish_reason=result[2]) if _structured else result
+
+    async def complete(self, **kwargs) -> ModelReply:
+        """Typed nonstreaming port; legacy execute tuple contract stays compatible."""
+        stream = kwargs.pop('stream', False)
+        return await self.execute(**kwargs, stream=stream, _structured=True)
 
     async def _unary_request(
         self,
         client: httpx.AsyncClient,
         url: str,
         body: Dict[str, Any],
+        codec: ToolNameCodec,
+        structured: bool = False,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         r = await client.post(url, json=body, headers=self._get_headers())
         r.raise_for_status()
@@ -104,7 +139,11 @@ class AIGatewayClient:
         if "tool_calls" in msg and msg["tool_calls"]:
             for tc in msg["tool_calls"]:
                 tool_calls.append(ToolCall(**tc))
-        return content, tool_calls, finish_reason
+        decoded = codec.decode_calls(tool_calls)
+        if structured:
+            return ModelReply(content=content, tool_calls=decoded, finish_reason=finish_reason,
+                              context_truncated=bool(data.get("context_truncated")), usage=data.get("usage"))
+        return content, decoded, finish_reason
 
     async def _stream_request(
         self,
@@ -112,10 +151,15 @@ class AIGatewayClient:
         url: str,
         body: Dict[str, Any],
         on_content_delta: Optional[Any],
+        codec: ToolNameCodec,
+        on_reasoning_delta=None,
+        structured=False,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         accumulator = ToolCallAccumulator()
         full_content = ""
         finish_reason = "stop"
+        context_truncated = False
+        usage = None
 
         async with client.stream("POST", url, json=body, headers=self._get_headers()) as response:
             response.raise_for_status()
@@ -128,9 +172,18 @@ class AIGatewayClient:
                     break
                 if not payload:
                     continue
+                if payload.get('error'):
+                    raise GatewayStreamError(payload.get('code'))
+                context_truncated = context_truncated or bool(payload.get('context_truncated'))
+                usage = payload.get('usage') or usage
 
                 choice = payload.get("choices", [{}])[0] if payload.get("choices") else {}
                 delta = choice.get("delta", {})
+                reasoning = delta.get('reasoning_content') or delta.get('thinking')
+                if isinstance(reasoning, str) and reasoning and on_reasoning_delta:
+                    result = on_reasoning_delta(reasoning)
+                    if asyncio.iscoroutine(result):
+                        await result
                 if "content" in delta and delta["content"]:
                     chunk = delta["content"]
                     full_content += chunk
@@ -146,9 +199,12 @@ class AIGatewayClient:
                 if "finish_reason" in choice and choice["finish_reason"]:
                     finish_reason = choice["finish_reason"]
 
-        tool_calls = accumulator.get_tool_calls()
-        if tool_calls and not finish_reason or finish_reason == "stop":
+        tool_calls = codec.decode_calls(accumulator.get_tool_calls())
+        if tool_calls and (not finish_reason or finish_reason == "stop"):
             finish_reason = "tool_calls"
+        if structured:
+            return ModelReply(content=full_content or None, tool_calls=tool_calls, finish_reason=finish_reason,
+                              context_truncated=context_truncated, usage=usage)
         return full_content if full_content else None, tool_calls, finish_reason
 
     async def _mock_completion(

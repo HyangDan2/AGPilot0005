@@ -107,3 +107,27 @@ sudo systemctl status hd2lab-agcore.service
 # 서비스 재시작
 sudo systemctl restart hd2lab-agcore.service
 ```
+
+운영 Gateway 호출 토큰은 `AGCORE_GATEWAY_TOKEN` 환경변수 또는 systemd
+`LoadCredential=agcore_gateway_token:<root 전용 파일>`로 주입한다. 후자의 경우
+`CREDENTIALS_DIRECTORY/agcore_gateway_token`을 읽는다. Gateway Unix 소켓은
+`www-data` 그룹으로 보호되므로 AGCore 유닛에 `SupplementaryGroups=www-data`가
+필요하다. 운영에서는 `AGCORE_ALLOW_MOCK_FALLBACK=false`를 명시한다.
+
+## Admin natural language document tasks (2026-11-13)
+
+Admin `/api/v1/agent/runs` accepts optional bounded `history`, `session_id`, and owner-scoped `analysis_refs`. Requests with document context create a persistent Task and emit `run.deferred` with a job ID. Existing `/agent/analyses/{id}` get/resume/cancel endpoints also serve these tasks. Public/beta keep their existing execution paths.
+
+`app/runtime/tasks` contains the typed task/plan/budget/evidence state, consumer ports, JSON repository adapter, planner, writer, verifier, API evidence selector, orchestrator, and composition root. The model interprets intent; server policy validates scope and compiles executable phases. Model/source adapters are injected. Source hashes and document snapshots guard evidence reuse. Unsupported answers remain partial or needs_input; reading every chunk alone cannot complete a task.
+
+Settings reuse `AGCORE_ANALYSIS_MAX_CHUNKS`, `AGCORE_ANALYSIS_MAX_MODEL_CALLS`, and `AGCORE_ANALYSIS_MAX_SECONDS`; new settings are `AGCORE_TASK_MAX_DOCUMENT_CALLS` (5000), `AGCORE_TASK_MAX_REPLANS` (2), and `AGCORE_TASK_MAX_ANSWER_REPAIRS` (2 per answer group). Retries, planning and verification consume the same persistent budget. Resume preserves the original deadline.
+
+Gateway supports trusted internal admin task instructions plus typed finish/context/usage metadata. Browser system instructions remain untrusted. No direct provider access is added. Tests: `tests/test_task_orchestrator.py`; deployment and actual-model results are in Server-HQ `docs/HD2AI_ADMIN_PLANNER_DEPLOYMENT_20261113.md`.
+
+Document summaries/comparisons and multi-group general answers require `AnswerComposer` and a separate `CompositionVerifier` pass before completion (2026-11-14). Original evidence and per-group drafts stay intact; bounded synthesis nodes are checkpointed for resume. The completion signature binds the final draft to its plan and intermediate inputs. A failed synthesis cannot publish concatenated group answers as the final answer. API inventory extraction retains function-specific verified details. Regression tests: `tests/test_answer_composition.py`; incident/validation details: Server-HQ `docs/HD2AI_FINAL_SYNTHESIS_FIX_20261114.md`.
+
+### 베타 기준 사용자 응답·진행 표시 (2026-11-14)
+
+문서 Task의 계획과 대화 응답은 별개 객체이며 `ConversationResponder`가 사용자 문장만 생성·검증한다. 응답 종류는 계획에 따라 서버가 결정한다. `TaskProgress`는 본문 없는 실행 이벤트와 공급자가 제공한 reasoning 채널을 저장하고 `AnswerPresenter`는 검증된 키를 문서명/페이지로 표현한다. 기존 원문 인용 키·검증 서명은 유지한다.
+
+Agent `options.reasoning_effort`는 일반 루프/문서 Task/전체 분석에 전달한다. 공개 응답의 추가 필드는 `phase`, `events`, `reasoning_text`, `answer_kind`, `citations`다. 내부 계획·검증의 reasoning은 off이며 사용자 응답·최종 종합에 요청 수준을 적용한다. 관련 회귀: `tests/test_beta_baseline.py`. 서버 검증·복원 기록은 Server-HQ `docs/HD2AI_BETA_BASELINE_PATCH_20261114.md`를 참조한다.

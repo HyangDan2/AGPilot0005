@@ -123,3 +123,34 @@ async def test_demo_frontend_serving():
         # 4. Favicon
         r_fav = await client.get("/favicon.ico")
         assert r_fav.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_agent_dynamic_runtime_config_api():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Get current config
+        r = await client.get("/api/v1/config/agent")
+        assert r.status_code == 200
+        data = r.json()
+        assert "max_tool_calls" in data
+        assert "max_agent_steps" in data
+        assert "run_timeout_seconds" in data
+        assert data["max_tool_calls"] == 16
+        assert data["max_agent_steps"] == 20
+        assert data["run_timeout_seconds"] == 180.0
+
+        # 2. Patch config
+        r_patch = await client.patch("/api/v1/config/agent", json={"max_tool_calls": 24, "max_agent_steps": 30, "run_timeout_seconds": 240.0})
+        assert r_patch.status_code == 200
+        patched = r_patch.json()
+        assert patched["max_tool_calls"] == 24
+        assert patched["max_agent_steps"] == 30
+        assert patched["run_timeout_seconds"] == 240.0
+
+        # 3. Reset config
+        r_reset = await client.post("/api/v1/config/agent/reset")
+        assert r_reset.status_code == 200
+        reset_data = r_reset.json()
+        assert reset_data["max_tool_calls"] == 16
+        assert reset_data["max_agent_steps"] == 20
+        assert reset_data["run_timeout_seconds"] == 180.0

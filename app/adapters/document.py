@@ -5,12 +5,14 @@ Adheres to Single Responsibility Principle (SRP):
 - Tier 2 (AGCore Adapter): Protocol translation, token budget protection, and mock resilience fallback.
 """
 import logging
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 import httpx
 from pydantic import BaseModel
 from app.config import settings
 
 logger = logging.getLogger("agcore.adapters.document")
+document_owner_id: ContextVar[str] = ContextVar("document_owner_id", default="default_user")
 
 class DocumentSection(BaseModel):
     section_id: str
@@ -31,6 +33,9 @@ class DocumentAdapter:
         raise NotImplementedError
 
     async def read_chunk(self, doc_id: str, chunk_id: str) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    async def list_chunks(self, doc_id: str, cursor: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
         raise NotImplementedError
 
     async def get_figure_info(self, doc_id: str, figure_id: str) -> Dict[str, Any]:
@@ -195,6 +200,23 @@ class MockDocumentAdapter(DocumentAdapter):
             **doc["chunks"][chunk_id]
         }
 
+    async def list_chunks(self, doc_id: str, cursor: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
+        import hashlib
+        if doc_id not in self._docs:
+            return {"error": True, "code": "not_found"}
+        chunks = list(self._docs[doc_id]["chunks"].values())
+        snapshot = hashlib.sha256(doc_id.encode()).hexdigest()
+        offset = int(cursor.split(":", 1)[1]) if cursor else 0
+        if cursor and not cursor.startswith(snapshot + ":"):
+            return {"error": True, "code": "snapshot_changed"}
+        items = [{"chunk_id": c["chunk_id"], "section_id": c.get("parent_section_id"),
+                  "source": c["source"], "token_count": c["token_count"],
+                  "content_hash": hashlib.sha256(c["content"].encode()).hexdigest()}
+                 for c in chunks]
+        end = min(offset + limit, len(items))
+        return {"document_id": doc_id, "snapshot_id": snapshot, "total_chunks": len(items),
+                "chunks": items[offset:end], "next_cursor": f"{snapshot}:{end}" if end < len(items) else None}
+
     async def get_figure_info(self, doc_id: str, figure_id: str) -> Dict[str, Any]:
         if doc_id not in self._docs:
             return {"error": True, "message": f"Document '{doc_id}' not found."}
@@ -221,6 +243,8 @@ class AGToolsHttpAdapter(DocumentAdapter):
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        headers["X-Owner-Id"] = document_owner_id.get()
+        headers["X-Tenant-Id"] = settings.AGTOOLS_TENANT
         return headers
 
     async def get_outline(self, doc_id: str) -> Dict[str, Any]:
@@ -231,6 +255,7 @@ class AGToolsHttpAdapter(DocumentAdapter):
                 data = resp.json()
                 return {
                     "doc_id": doc_id,
+                    "document_name": data.get('document_name') or data.get('filename') or '첨부 문서',
                     "status": data.get("status"),
                     "outline": data.get("sections", []),
                 }
@@ -291,6 +316,17 @@ class AGToolsHttpAdapter(DocumentAdapter):
             if resp.status_code == 404:
                 return {"error": True, "code": "not_found", "message": f"Chunk '{chunk_id}' not found in document '{doc_id}'."}
             return {"error": True, "code": f"http_{resp.status_code}", "message": resp.text}
+
+    async def list_chunks(self, doc_id: str, cursor: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
+        url = f"{self.base_url}/documents/{doc_id}/chunks"
+        params = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(url, params=params, headers=self._headers())
+            if resp.status_code == 200:
+                return resp.json()
+            return {"error": True, "code": f"http_{resp.status_code}"}
 
     async def get_figure_info(self, doc_id: str, figure_id: str) -> Dict[str, Any]:
         url = f"{self.base_url}/documents/{doc_id}/figures/{figure_id}"
@@ -370,6 +406,17 @@ class CompositeDocumentAdapter(DocumentAdapter):
             if not settings.ALLOW_MOCK_FALLBACK:
                 return {"error": True, "code": "connection_failed", "message": f"AGTools 연결 실패: {e}"}
         return await self.mock.read_chunk(doc_id, chunk_id)
+
+    async def list_chunks(self, doc_id: str, cursor: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
+        try:
+            res = await self.http.list_chunks(doc_id, cursor, limit)
+            if not res.get("error") or not settings.ALLOW_MOCK_FALLBACK:
+                return res
+        except Exception as exc:
+            logger.warning("AGTools HTTP list_chunks error: %s", exc)
+            if not settings.ALLOW_MOCK_FALLBACK:
+                return {"error": True, "code": "connection_failed"}
+        return await self.mock.list_chunks(doc_id, cursor, limit)
 
     async def get_figure_info(self, doc_id: str, figure_id: str) -> Dict[str, Any]:
         try:

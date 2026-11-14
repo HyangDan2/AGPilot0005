@@ -33,6 +33,7 @@ class ToolDispatcher:
         step: int = 1,
         service: Optional[str] = None,
         timeout: Optional[float] = None,
+        allowed_document_ids: Optional[List[str]] = None,
     ) -> DispatchResult:
         func_name = call.function.name
         call_id = call.id
@@ -64,6 +65,12 @@ class ToolDispatcher:
             status="running",
         )
 
+        if func_name.startswith("document.") and allowed_document_ids is not None and args.get("doc_id") not in allowed_document_ids:
+            trace.status = "failed"
+            trace.error_code = "document_not_referenced"
+            trace.error_message = "Document is not in this run's authorized references."
+            return DispatchResult(call_id, func_name, json.dumps({"error": True, "code": trace.error_code}), trace, is_error=True)
+
         # 2. Check registration and ACL
         reg = self.registry.get_registration(func_name)
         handler = self.registry.get_handler(func_name)
@@ -92,6 +99,12 @@ class ToolDispatcher:
                     result = await loop.run_in_executor(None, lambda: handler(**args))
 
             duration_ms = int((time.monotonic() - start_time) * 1000)
+            if isinstance(result, dict) and result.get("error") is True:
+                trace.status = "failed"
+                trace.duration_ms = duration_ms
+                trace.error_code = str(result.get("code") or "document_error")
+                trace.error_message = str(result.get("message") or "Document tool failed")
+                return DispatchResult(call_id, func_name, json.dumps(result, ensure_ascii=False), trace, is_error=True)
             res_str = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
             
             # Check result size (cap max output)
@@ -128,10 +141,11 @@ class ToolDispatcher:
         step: int = 1,
         service: Optional[str] = None,
         timeout: Optional[float] = None,
+        allowed_document_ids: Optional[List[str]] = None,
     ) -> List[DispatchResult]:
         """Executes multiple tool calls concurrently if they are read-only."""
         tasks = [
-            self.execute_tool_call(call, step=step, service=service, timeout=timeout)
+            self.execute_tool_call(call, step=step, service=service, timeout=timeout, allowed_document_ids=allowed_document_ids)
             for call in calls
         ]
         return await asyncio.gather(*tasks)

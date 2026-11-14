@@ -5,8 +5,11 @@ from pydantic import BaseModel, Field
 
 EventType = Literal[
     "run.started",
+    "run.deferred",
     "step.started",
     "model.started",
+        "model.completed",
+        "reasoning.delta",
     "tool.started",
     "tool.completed",
     "step.completed",

@@ -8,6 +8,10 @@ class AgentState(BaseModel):
     run_id: str
     session_id: Optional[str] = None
     service_id: Optional[str] = None
+    owner_id: str = "default_user"
+    context_refs: List[str] = Field(default_factory=list)
+    document_titles: Dict[str,str] = Field(default_factory=dict)
+    citations: List[Dict[str,Any]] = Field(default_factory=list)
     
     # Message history
     messages: List[GatewayMessage] = Field(default_factory=list)
@@ -15,8 +19,8 @@ class AgentState(BaseModel):
     # Step & Budget counters
     step_count: int = 0
     tool_call_count: int = 0
-    max_steps: int = 10
-    max_tool_calls: int = 6
+    max_steps: int = 20
+    max_tool_calls: int = 16
     
     # State tracking
     status: Literal["queued", "running", "completed", "failed", "cancelled"] = "queued"
@@ -29,6 +33,7 @@ class AgentState(BaseModel):
     
     # Stream flag
     stream: bool = False
+    reasoning_effort: Optional[str] = None
     
     # Custom client for Direct Demo Adapter
     custom_client: Optional[Any] = None
