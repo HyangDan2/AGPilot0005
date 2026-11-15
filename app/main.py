@@ -2,6 +2,7 @@
 import os
 import time
 from pathlib import Path
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -13,8 +14,17 @@ from app.api.demo import router as demo_router
 from app.api.health import router as health_router
 from app.api.config import router as config_router
 from app.config import settings
+from app.core.runtime_config import sync_contracts_from_gateway
+from app.gateway.client import gateway_client
 
 BASE_PATH = Path(__file__).resolve().parent.parent
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await sync_contracts_from_gateway(gateway_client, [gateway_client.route, "hd2ai-admin", "hd2ai-public"])
+    yield
+
 
 app = FastAPI(
     title="HD2Lab Agent Core Platform (AGCore)",
@@ -22,6 +32,7 @@ app = FastAPI(
     description="범용 Agentic AI Runtime 및 Tool Execution 백엔드 서비스",
     docs_url=None,
     redoc_url=None,
+    lifespan=lifespan,
 )
 
 # CORS Middleware (Local dev & admin domain)

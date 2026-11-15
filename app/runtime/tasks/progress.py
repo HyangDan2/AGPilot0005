@@ -8,7 +8,27 @@ class TaskProgress:
         if kind == 'run' and status != 'running':
             self.close_phase(task)
         seq = task.events[-1]['seq'] + 1 if task.events else 1
-        safe = {k: v for k, v in data.items() if k in ('duration_ms', 'model_call', 'reasoning_effort', 'cached', 'page')}
+        safe = {
+            k: v
+            for k, v in data.items()
+            if k in (
+                'duration_ms',
+                'model_call',
+                'reasoning_effort',
+                'cached',
+                'page',
+                'request_id',
+                'finish_reason',
+                'max_tokens',
+                'usage_tokens',
+                'content_length',
+                'reasoning_length',
+                'json_length',
+                'output_budget',
+                'parse_ok',
+                'failure_reason',
+            )
+        }
         task.events.append({'seq': seq, 'id': item_id or f'event-{seq}', 'kind': kind, 'label': label,
                             'status': status, 'at': self.clock(), **safe})
         if len(task.events) > 1000:

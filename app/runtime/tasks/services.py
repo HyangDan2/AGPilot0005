@@ -15,14 +15,30 @@ def estimate(text):
     return max(len(text), len(text.encode('utf-8')) // 3)
 
 
-def parse_json(text):
+def parse_json(text, strict=False):
     value = (text or '').strip()
+    if not value:
+        raise ValueError('empty_final_text')
+    if strict:
+        if '```' in value or '<think>' in value or '</think>' in value:
+            raise ValueError('json_parse_error')
+        if not (value.startswith('{') and value.endswith('}')):
+            raise ValueError('json_parse_error')
+        try:
+            obj, end = json.JSONDecoder().raw_decode(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError('json_parse_error') from exc
+        if end != len(value) or not isinstance(obj, dict):
+            raise ValueError('json_parse_error')
+        return obj
     if '```' in value:
         m = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', value)
         if m:
             value = m.group(1).strip()
         else:
             value = re.sub(r'^```(?:json)?\s*|\s*```$', '', value)
+    if not value:
+        raise ValueError('empty_final_text')
     try:
         return json.loads(value)
     except json.JSONDecodeError:
@@ -48,15 +64,54 @@ class ModelInvoker:
         self.input_tokens = input_tokens
         self.progress = progress or TaskProgress(repository, clock)
 
-    async def typed(self, task, instructions, data, schema, max_tokens=4096, reasoning_effort='off'):
+    def _record_diagnostic(self, task, entry: dict):
+        if hasattr(task, 'diagnostics') and isinstance(task.diagnostics, list):
+            task.diagnostics.append(entry)
+            if len(task.diagnostics) > 200:
+                task.diagnostics = task.diagnostics[-200:]
+        reason = entry.get('failure_reason')
+        if reason and hasattr(task, 'last_failure_reason'):
+            task.last_failure_reason = reason
+
+    async def typed(
+        self,
+        task,
+        instructions,
+        data,
+        schema,
+        max_tokens=4096,
+        reasoning_effort='off',
+        strict_json=False,
+        request_id=None,
+    ):
         payload = dict(data)
         for attempt in range(2):
-            value = await self.json(task, instructions, payload, max_tokens=max_tokens, reasoning_effort=reasoning_effort)
+            value = await self.json(
+                task,
+                instructions,
+                payload,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                strict_json=strict_json,
+                request_id=request_id,
+            )
             try:
                 return schema.model_validate(value)
             except ValidationError as exc:
                 detail = '; '.join('.'.join(str(p) for p in e['loc']) + ': ' + e['type'] for e in exc.errors())
                 task.contract_errors.append(detail[:1500])
+                self._record_diagnostic(
+                    task,
+                    {
+                        'stage': 'schema_validation',
+                        'request_id': request_id,
+                        'schema': schema.__name__,
+                        'attempt': attempt + 1,
+                        'parse_ok': True,
+                        'failure_reason': 'schema_mismatch',
+                        'failed_rule': detail[:300],
+                    },
+                )
                 self.repository.save(task)
                 payload['response_validation_errors'] = detail
                 payload['required_response_schema'] = schema.model_json_schema()
@@ -76,23 +131,43 @@ class ModelInvoker:
                 if attempt == 1:
                     raise ValueError('model_contract_invalid') from exc
 
-    async def json(self, task, instructions, data, max_tokens=4096, reasoning_effort='off'):
+    async def budget_for(self, task):
+        from app.core.runtime_config import ensure_route_budget, get_runtime_config
+        budget = await ensure_route_budget(self.model, getattr(task, 'service_id', None))
+        has_contract = any(b.gateway_contract is not None for b in get_runtime_config().token_budgets.values())
+        return budget, has_contract
+
+    async def json(
+        self,
+        task,
+        instructions,
+        data,
+        max_tokens=4096,
+        reasoning_effort='off',
+        strict_json=False,
+        request_id=None,
+    ):
         body = json.dumps(data, ensure_ascii=False)
+        budget, has_contract = await self.budget_for(task)
+        effective_input_tokens = budget.input_budget_tokens if has_contract else self.input_tokens
+        effective_output_cap = budget.output_ceiling_tokens if has_contract else 32768
         # Reserve context for instructions, persona, output, and protocol overhead.
-        output_ceiling = min(8192, self.input_tokens - estimate(body) - estimate(instructions) - 1000)
+        output_ceiling = min(effective_output_cap, effective_input_tokens - estimate(body) - estimate(instructions) - 1000)
         if output_ceiling < 512:
             raise BudgetExceeded('context_budget_exceeded')
         max_tokens = min(max_tokens, output_ceiling)
         for attempt in range(5):
-            if estimate(body) + estimate(instructions) + max_tokens + 1000 > self.input_tokens:
+            if estimate(body) + estimate(instructions) + max_tokens + 1000 > effective_input_tokens:
                 raise BudgetExceeded('context_budget_exceeded')
             task.budget.reserve('model', self.clock())
             task.budget.estimated_input_tokens += estimate(body) + estimate(instructions)
             self.repository.save(task)
             call_id = 'model-' + str(task.budget.model_calls)
+            req_id = request_id or f'{task.job_id}:{call_id}'
             started = self.clock()
             self.progress.event(task, 'model', '모델 응답 처리', item_id=call_id,
-                                model_call=task.budget.model_calls, reasoning_effort=reasoning_effort)
+                                model_call=task.budget.model_calls, reasoning_effort=reasoning_effort,
+                                request_id=req_id, max_tokens=max_tokens)
             try:
                 remaining = task.budget.deadline - self.clock()
                 async with asyncio.timeout(min(310, remaining)):
@@ -103,19 +178,74 @@ class ModelInvoker:
                         response_format={'type': 'json_object'}, tool_choice='none',
                         max_tokens=max_tokens, reasoning_effort=reasoning_effort, timeout_seconds=min(310, remaining),
                         **({'stream': True, 'on_reasoning_delta': lambda chunk: self.progress.reasoning(task, chunk)} if thinking else {}))
+                usage_total = reply.usage.total_tokens if reply.usage else 0
                 if reply.usage:
                     task.budget.actual_tokens += reply.usage.total_tokens
+                content_len = len(reply.content or '')
+                reasoning_len = getattr(reply, 'reasoning_length', 0) or 0
+                stream_incomplete = bool(getattr(reply, 'stream_incomplete', False))
+                diag = {
+                    'stage': 'model_response',
+                    'request_id': req_id,
+                    'model_call': task.budget.model_calls,
+                    'attempt': attempt + 1,
+                    'finish_reason': reply.finish_reason,
+                    'max_tokens': max_tokens,
+                    'usage_tokens': usage_total,
+                    'content_length': content_len,
+                    'reasoning_length': reasoning_len,
+                    'stream_incomplete': stream_incomplete,
+                    'parse_ok': False,
+                    'failure_reason': None,
+                }
                 if reply.context_truncated:
+                    diag['failure_reason'] = 'model_context_truncated'
+                    self._record_diagnostic(task, diag)
                     raise ValueError('model_context_truncated')
+                if stream_incomplete or reply.finish_reason == 'stream_interrupted':
+                    diag['failure_reason'] = 'stream_interrupted'
+                    self._record_diagnostic(task, diag)
+                    raise ValueError('stream_interrupted')
                 if reply.finish_reason in ('length', 'max_tokens'):
+                    diag['failure_reason'] = 'output_token_limit'
+                    self._record_diagnostic(task, diag)
                     raise ValueError('model_output_truncated')
                 if reply.tool_calls:
+                    diag['failure_reason'] = 'unexpected_model_tool_call'
+                    self._record_diagnostic(task, diag)
                     raise ValueError('unexpected_model_tool_call')
-                result = parse_json(reply.content)
+                if not (reply.content or '').strip():
+                    diag['failure_reason'] = 'empty_final_text'
+                    self._record_diagnostic(task, diag)
+                    raise ValueError('empty_final_text')
+                try:
+                    result = parse_json(reply.content, strict=strict_json)
+                except (json.JSONDecodeError, ValueError) as parse_exc:
+                    reason = 'empty_final_text' if str(parse_exc) == 'empty_final_text' else 'json_parse_error'
+                    diag['failure_reason'] = reason
+                    self._record_diagnostic(task, diag)
+                    raise ValueError(reason) from parse_exc
+                diag['parse_ok'] = True
+                self._record_diagnostic(task, diag)
                 self.progress.event(task, 'model', '모델 응답 처리', status='done', item_id=call_id,
-                                    duration_ms=round((self.clock()-started)*1000), reasoning_effort=reasoning_effort)
+                                    duration_ms=round((self.clock()-started)*1000), reasoning_effort=reasoning_effort,
+                                    request_id=req_id, finish_reason=reply.finish_reason,
+                                    max_tokens=max_tokens, usage_tokens=usage_total,
+                                    content_length=content_len, reasoning_length=reasoning_len, parse_ok=True)
                 return result
             except GatewayStreamError as exc:
+                reason = 'output_token_limit' if exc.code == 'output_limit' else f'gateway_{exc.code}'
+                self._record_diagnostic(
+                    task,
+                    {
+                        'stage': 'gateway_stream',
+                        'request_id': req_id,
+                        'attempt': attempt + 1,
+                        'max_tokens': max_tokens,
+                        'parse_ok': False,
+                        'failure_reason': reason,
+                    },
+                )
                 if exc.code == 'output_limit' and max_tokens < output_ceiling:
                     max_tokens = min(output_ceiling, max_tokens * 2)
                 elif exc.code not in ('busy', 'upstream_timeout', 'upstream_unavailable') or attempt == 4:

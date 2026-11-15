@@ -7,23 +7,35 @@ def legacy_citations(job):
     if not answer:
         return answer, []
     entries = {e['doc_id'] + '/' + e['chunk_id']: e for e in job.get('entries', [])}
+    by_chunk = {}
+    for e in job.get('entries', []):
+        by_chunk.setdefault(e['chunk_id'], []).append(e)
     citations = []
     def replace(match):
         labels = {}
-        for key in re.findall(r'\[(doc_[A-Za-z0-9_-]+/(?:chk|sec)_[A-Za-z0-9_-]+)\]', match.group()):
-            e = entries.get(key)
+        last_doc = (job.get('document_ids') or [None])[0] if len(job.get('document_ids') or []) == 1 else None
+        for doc_part, chk_part in re.findall(r'(?:(doc_[A-Za-z0-9_-]+)/)?((?:chk|sec)_[A-Za-z0-9_-]+)(?:#\d+/\d+)?', match.group()):
+            doc_id = doc_part or last_doc
+            if doc_part:
+                last_doc = doc_part
+            e = entries.get(f'{doc_id}/{chk_part}') if doc_id else None
+            if not e and len(by_chunk.get(chk_part, [])) == 1:
+                e = by_chunk[chk_part][0]
             if not e:
                 continue
+            key = f"{e['doc_id']}/{e['chunk_id']}"
             title = job.get('document_titles', {}).get(e['doc_id'], '첨부 문서')
             page = (e.get('source') or {}).get('page')
             labels.setdefault(title, set()).add(page)
             if not any(c['key'] == key for c in citations):
                 citations.append({'key': key, 'doc_id': e['doc_id'], 'chunk_id': e['chunk_id'], 'title': title, 'page': page})
         if not labels:
-            return match.group()
+            return ''
         return '; '.join(title + (' · p. ' + ', '.join(map(str, sorted(p for p in pages if isinstance(p,int))))
                                    if any(isinstance(p,int) for p in pages) else '') for title,pages in labels.items())
-    return re.sub(r'(?:\[doc_[A-Za-z0-9_-]+/(?:chk|sec)_[A-Za-z0-9_-]+\](?:,\s*)?)+', replace, answer), citations
+    cleaned = re.sub(r'\[(?:(?:doc_[A-Za-z0-9_-]+/)?(?:chk|sec)_[A-Za-z0-9_-]+(?:#\d+/\d+)?(?:\s*,\s*)?)+\]', replace, answer)
+    cleaned = re.sub(r'\n*분석 범위:\s*\d+/\d+\s*청크\s*$', '', cleaned).strip()
+    return cleaned, citations
 
 
 def humanize_keys(text, citations):

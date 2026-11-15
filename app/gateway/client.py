@@ -24,6 +24,26 @@ class GatewayStreamError(RuntimeError):
         super().__init__('gateway_' + self.code)
 
 
+def _separate_think_tags(text: Optional[str]) -> Tuple[str, str]:
+    """Strip any <think>...</think> or unclosed <think>... blocks from content.
+    Returns (clean_content, extracted_reasoning).
+    """
+    if not text:
+        return "", ""
+    reasoning_parts: List[str] = []
+
+    def _collect(match: re.Match) -> str:
+        reasoning_parts.append(match.group(1))
+        return ""
+
+    cleaned = re.sub(r"<think>([\s\S]*?)</think>", _collect, text, flags=re.I)
+    unclosed = re.search(r"<think>([\s\S]*)$", cleaned, flags=re.I)
+    if unclosed:
+        reasoning_parts.append(unclosed.group(1))
+        cleaned = cleaned[:unclosed.start()]
+    return cleaned, "".join(reasoning_parts)
+
+
 class AIGatewayClient:
     def __init__(
         self,
@@ -106,7 +126,7 @@ class AIGatewayClient:
                 if stream:
                     return await self._stream_request(client, url, req_body, on_content_delta, codec, on_reasoning_delta, _structured)
                 else:
-                    return await self._unary_request(client, url, req_body, codec, structured=_structured)
+                    return await self._unary_request(client, url, req_body, codec, structured=_structured, on_reasoning_delta=on_reasoning_delta)
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, httpx.HTTPError, OSError) as e:
             if not self.mock_mode and not settings.ALLOW_MOCK_FALLBACK:
                 raise
@@ -126,14 +146,25 @@ class AIGatewayClient:
         body: Dict[str, Any],
         codec: ToolNameCodec,
         structured: bool = False,
+        on_reasoning_delta: Optional[Any] = None,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         r = await client.post(url, json=body, headers=self._get_headers())
         r.raise_for_status()
         data = r.json()
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
-        content = msg.get("content")
-        finish_reason = choice.get("finish_reason", "stop")
+        raw_content = msg.get("content") if isinstance(msg.get("content"), str) else None
+        clean_content, tag_reasoning = _separate_think_tags(raw_content)
+        reasoning_field = msg.get("reasoning_content") or msg.get("thinking") or ""
+        if not isinstance(reasoning_field, str):
+            reasoning_field = ""
+        full_reasoning = reasoning_field + tag_reasoning
+        if full_reasoning and on_reasoning_delta and callable(on_reasoning_delta):
+            res = on_reasoning_delta(full_reasoning)
+            if asyncio.iscoroutine(res):
+                await res
+        content = clean_content if clean_content.strip() else None
+        finish_reason = choice.get("finish_reason") or "stop"
         
         tool_calls = []
         if "tool_calls" in msg and msg["tool_calls"]:
@@ -141,8 +172,15 @@ class AIGatewayClient:
                 tool_calls.append(ToolCall(**tc))
         decoded = codec.decode_calls(tool_calls)
         if structured:
-            return ModelReply(content=content, tool_calls=decoded, finish_reason=finish_reason,
-                              context_truncated=bool(data.get("context_truncated")), usage=data.get("usage"))
+            return ModelReply(
+                content=content,
+                tool_calls=decoded,
+                finish_reason=finish_reason,
+                context_truncated=bool(data.get("context_truncated")),
+                usage=data.get("usage"),
+                reasoning_length=len(full_reasoning),
+                stream_incomplete=False,
+            )
         return content, decoded, finish_reason
 
     async def _stream_request(
@@ -160,6 +198,8 @@ class AIGatewayClient:
         finish_reason = "stop"
         context_truncated = False
         usage = None
+        reasoning_length = 0
+        saw_done = False
 
         async with client.stream("POST", url, json=body, headers=self._get_headers()) as response:
             response.raise_for_status()
@@ -169,6 +209,7 @@ class AIGatewayClient:
                     continue
                 evt_type, payload = parsed
                 if evt_type == "[DONE]":
+                    saw_done = True
                     break
                 if not payload:
                     continue
@@ -180,11 +221,13 @@ class AIGatewayClient:
                 choice = payload.get("choices", [{}])[0] if payload.get("choices") else {}
                 delta = choice.get("delta", {})
                 reasoning = delta.get('reasoning_content') or delta.get('thinking')
-                if isinstance(reasoning, str) and reasoning and on_reasoning_delta:
-                    result = on_reasoning_delta(reasoning)
-                    if asyncio.iscoroutine(result):
-                        await result
-                if "content" in delta and delta["content"]:
+                if isinstance(reasoning, str) and reasoning:
+                    reasoning_length += len(reasoning)
+                    if on_reasoning_delta:
+                        result = on_reasoning_delta(reasoning)
+                        if asyncio.iscoroutine(result):
+                            await result
+                if "content" in delta and isinstance(delta["content"], str) and delta["content"]:
                     chunk = delta["content"]
                     full_content += chunk
                     if on_content_delta and callable(on_content_delta):
@@ -199,13 +242,31 @@ class AIGatewayClient:
                 if "finish_reason" in choice and choice["finish_reason"]:
                     finish_reason = choice["finish_reason"]
 
+        clean_content, tag_reasoning = _separate_think_tags(full_content)
+        if tag_reasoning:
+            reasoning_length += len(tag_reasoning)
+            if on_reasoning_delta:
+                result = on_reasoning_delta(tag_reasoning)
+                if asyncio.iscoroutine(result):
+                    await result
+        final_text = clean_content if clean_content.strip() else None
+
         tool_calls = codec.decode_calls(accumulator.get_tool_calls())
-        if tool_calls and (not finish_reason or finish_reason == "stop"):
+        if not saw_done:
+            finish_reason = "stream_interrupted"
+        elif tool_calls and (not finish_reason or finish_reason == "stop"):
             finish_reason = "tool_calls"
         if structured:
-            return ModelReply(content=full_content or None, tool_calls=tool_calls, finish_reason=finish_reason,
-                              context_truncated=context_truncated, usage=usage)
-        return full_content if full_content else None, tool_calls, finish_reason
+            return ModelReply(
+                content=final_text,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+                context_truncated=context_truncated,
+                usage=usage,
+                reasoning_length=reasoning_length,
+                stream_incomplete=not saw_done,
+            )
+        return final_text, tool_calls, finish_reason
 
     async def _mock_completion(
         self,
@@ -267,5 +328,26 @@ class AIGatewayClient:
         if on_content_delta:
             await on_content_delta(greeting)
         return greeting, [], "stop"
+
+    async def get_route_limits(self, route: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Fetch active token limits for a route from AI Gateway."""
+        if self.mock_mode:
+            return None
+        target = (route or self.route or "").strip()
+        if not target:
+            return None
+        url = f"{self.base_url}/internal/{target}/limits"
+        transport = self._get_transport()
+        try:
+            async with httpx.AsyncClient(transport=transport, timeout=5.0) as client:
+                resp = await client.get(url, headers=self._get_headers())
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+                if isinstance(data, dict) and "context_tokens" in data and "max_output_tokens" in data:
+                    return data
+        except Exception:
+            return None
+        return None
 
 gateway_client = AIGatewayClient()

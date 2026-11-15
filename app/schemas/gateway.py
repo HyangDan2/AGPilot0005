@@ -49,3 +49,5 @@ class ModelReply(BaseModel):
     finish_reason: str = "stop"
     context_truncated: bool = False
     usage: Optional[ModelUsage] = None
+    reasoning_length: int = 0
+    stream_incomplete: bool = False

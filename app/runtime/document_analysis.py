@@ -178,36 +178,53 @@ class DocumentAnalysisManager:
         user: str,
         max_tokens: int = 4096,
         reasoning_effort_override: str | None = None,
+        stream_answer: bool = False,
     ) -> str:
+        from app.core.runtime_config import ensure_route_budget, get_runtime_config
+        budget = await ensure_route_budget(gateway_client, job.get("service_id"))
+        has_contract = any(b.gateway_contract is not None for b in get_runtime_config().token_budgets.values())
+        max_prompt_bytes = budget.batch_prompt_bytes if has_contract else 9000
+        output_ceiling = budget.output_ceiling_tokens if has_contract else 32768
+        reasoning_start = budget.reasoning_start_tokens if has_contract else 8192
+
         prompt = f"분석 지침:\n{system}\n\n{user}"
-        if len(prompt.encode("utf-8")) > 9000:
+        if len(prompt.encode("utf-8")) > max_prompt_bytes:
             raise ValueError("context_budget_exceeded")
         effort = reasoning_effort_override if reasoning_effort_override is not None else job.get('reasoning_effort', 'off')
         if effort != 'off':
-            max_tokens = max(max_tokens, 8192)
+            max_tokens = max(max_tokens, reasoning_start)
+        max_tokens = min(max_tokens, output_ceiling)
         for attempt in range(5):
             if job["model_calls"] >= settings.ANALYSIS_MAX_MODEL_CALLS:
                 raise ValueError("model_call_budget_exceeded")
             job["model_calls"] += 1
+            if stream_answer:
+                job["answer"] = ""
             self._save(job)
             try:
                 def thinking(chunk):
                     job['reasoning_text'] = (job.get('reasoning_text','') + chunk)[:200000]
                     if time.time() - job.get('_reasoning_saved',0) >= .5:
                         job['_reasoning_saved'] = time.time(); self._save(job)
+                def answer_delta(chunk):
+                    job['answer'] = (job.get('answer') or '') + chunk
+                    if time.time() - job.get('_answer_saved', 0) >= .2:
+                        job['_answer_saved'] = time.time(); self._save(job)
+                use_stream = effort != 'off' or stream_answer
                 content, calls, finish = await gateway_client.execute(
                     messages=[GatewayMessage(role="user", content=prompt)],
-                    tools=None, tool_choice="none", stream=effort!='off',
+                    tools=None, tool_choice="none", stream=use_stream,
                     timeout_seconds=settings.ANALYSIS_MODEL_TIMEOUT_SECONDS,
                     max_tokens=max_tokens,
                     reasoning_effort=effort,
                     **({'on_reasoning_delta':thinking} if effort!='off' else {}),
+                    **({'on_content_delta':answer_delta} if stream_answer else {}),
                 )
                 if calls:
                     raise ValueError("unexpected_model_tool_call")
                 if finish in ('length', 'max_tokens'):
-                    if attempt < 4 and max_tokens < 32768:
-                        max_tokens = min(32768, max_tokens * 2)
+                    if attempt < 4 and max_tokens < output_ceiling:
+                        max_tokens = min(output_ceiling, max_tokens * 2)
                         continue
                     raise ValueError('model_output_truncated')
                 return _clean_answer(content)
@@ -218,8 +235,8 @@ class DocumentAnalysisManager:
                         code = exc.response.json().get("code")
                     except (ValueError, AttributeError):
                         code = None
-                    if code == "output_limit" and attempt < 4 and max_tokens < 32768:
-                        max_tokens = min(32768, max_tokens * 2)
+                    if code == "output_limit" and attempt < 4 and max_tokens < output_ceiling:
+                        max_tokens = min(output_ceiling, max_tokens * 2)
                         continue
                     raise ValueError("gateway_output_limit" if code == "output_limit" else "gateway_http_422") from exc
                 if status not in (429, 502, 503, 504) or attempt == 4:
@@ -341,8 +358,8 @@ class DocumentAnalysisManager:
             nodes = reduced
         final_note = nodes[0]["text"] if nodes else ""
         return await self._model(job,
-            "전체 문서를 읽은 근거 노트에만 기반해 한국어로 답하세요. 확인되지 않은 사실은 명시하고 출처 청크 ID를 가능한 곳에 쓰세요. 도구 호출 문법을 쓰지 마세요.",
-            f"질문: {job['question']}\n\n근거 노트:\n{final_note}", max_tokens=2048)
+            "전체 문서를 읽은 근거 노트에만 기반해 한국어로 답하세요. 확인되지 않은 사실은 명시하고, 내부 청크 ID(chk_..., doc_...)나 도구 호출 문법은 출력하지 마세요.",
+            f"질문: {job['question']}\n\n근거 노트:\n{final_note}", max_tokens=2048, stream_answer=True)
 
     async def _run(self, job_id: str) -> None:
         job = self.store.read(job_id)

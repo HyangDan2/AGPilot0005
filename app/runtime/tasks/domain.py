@@ -3,7 +3,7 @@ import hashlib
 import json
 import re
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 
 class AccessContext(BaseModel):
@@ -78,6 +78,15 @@ class Verification(BaseModel):
     satisfied: bool
     missing_requirements: list[str]
     unsupported_claims: list[str]
+    _failure_reasons: list[str] = PrivateAttr(default_factory=list)
+
+    @property
+    def failure_reasons(self) -> list[str]:
+        return list(self._failure_reasons)
+
+    def with_reasons(self, reasons: list[str]) -> 'Verification':
+        self._failure_reasons = list(dict.fromkeys(reasons))
+        return self
 
 
 class UserReply(BaseModel):
@@ -91,6 +100,8 @@ class CompositionNode(BaseModel):
     draft: Draft | None = None
     verification: Verification | None = None
     attempts: int = 0
+    diagnostics: list[dict] = Field(default_factory=list)
+    last_failure_reason: str | None = None
 
 
 class Task(BaseModel):
@@ -124,6 +135,8 @@ class Task(BaseModel):
     answer_repairs: int = 0
     planning_errors: list[str] = Field(default_factory=list)
     contract_errors: list[str] = Field(default_factory=list)
+    diagnostics: list[dict] = Field(default_factory=list)
+    last_failure_reason: str | None = None
     request_parts: dict[str, dict] = Field(default_factory=dict)
     composition_nodes: dict[str, CompositionNode] = Field(default_factory=dict)
     final_draft: Draft | None = None
