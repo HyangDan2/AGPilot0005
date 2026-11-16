@@ -1,0 +1,15 @@
+{
+  "service_id": "agpilot0005",
+  "endpoints": [
+    {
+      "slug": "agcore",
+      "title": "AGCore (0005)",
+      "description": "Agent Runtime · 오케스트레이션 콘솔",
+      "href": "/admin/agcore/",
+      "category_slug": "ai",
+      "hub_publish": false,
+      "protect_prefix": true,
+      "sort_order": 100
+    }
+  ]
+}
