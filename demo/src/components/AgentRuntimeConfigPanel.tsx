@@ -103,7 +103,7 @@ export const AgentRuntimeConfigPanel: React.FC = () => {
             max={32}
             value={config.max_tool_calls}
             onChange={(e) => setConfig({ ...config, max_tool_calls: Number(e.target.value) })}
-            style={{ width: '100%', accentColor: '#8B6CE8' }}
+            style={{ width: '100%', accentColor: 'var(--accent)' }}
           />
           <small className="helper-text" style={{ marginTop: '2px' }}>기본값: 16회 (범위: 1~32회)</small>
         </div>
@@ -119,7 +119,7 @@ export const AgentRuntimeConfigPanel: React.FC = () => {
             max={40}
             value={config.max_agent_steps}
             onChange={(e) => setConfig({ ...config, max_agent_steps: Number(e.target.value) })}
-            style={{ width: '100%', accentColor: '#8B6CE8' }}
+            style={{ width: '100%', accentColor: 'var(--accent)' }}
           />
           <small className="helper-text" style={{ marginTop: '2px' }}>권장: 도구 수 + 4 이상 (기본값: 20단계)</small>
         </div>
@@ -136,7 +136,7 @@ export const AgentRuntimeConfigPanel: React.FC = () => {
             step={10}
             value={config.run_timeout_seconds}
             onChange={(e) => setConfig({ ...config, run_timeout_seconds: Number(e.target.value) })}
-            style={{ width: '100%', accentColor: '#8B6CE8' }}
+            style={{ width: '100%', accentColor: 'var(--accent)' }}
           />
           <small className="helper-text" style={{ marginTop: '2px' }}>기본값: 180초 (범위: 30~600초)</small>
         </div>

@@ -27,6 +27,40 @@
   --mono-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
+/* Navy & Lavender — the HD2Lab dark pair of Soft Iris Light. */
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0B1020;
+  --panel: #12192E;
+  --panel-soft: #1A2340;
+  --text: #EEF2FF;
+  --muted: #94A3C4;
+  --line: #253154;
+  --line-strong: #344472;
+  --line-focus: #A78BFA;
+  --accent: #A78BFA;
+  --accent-hover: #8B6CE8;
+  --accent-text: #C4B5FD;
+  --accent-soft: rgba(167, 139, 250, 0.14);
+  --card-bg: #12192E;
+  --card-sub-bg: #1A2340;
+  --card-border: #253154;
+  --card-hover: #344472;
+  --olive-text: #C4B5FD;
+  --olive-dot: #A78BFA;
+  --olive-border: #344472;
+  --danger: #F87171;
+  --danger-bg: rgba(248, 113, 113, 0.16);
+  --success: #4ADE80;
+  --success-bg: rgba(74, 222, 128, 0.14);
+  --on-accent: #0B1020;
+}
+
+/* Solid lavender fills take navy ink in dark mode so accent buttons stay legible. */
+[data-theme="dark"] .btn-primary {
+  color: var(--on-accent, #0B1020);
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -495,5 +529,67 @@ body {
   .card-title {
     flex-wrap: wrap;
     gap: 8px;
+  }
+}
+
+/* ── Floating Light/Dark toggle (fixed bottom-right, shared hd2-theme) ─────── */
+.theme-fab {
+  position: fixed;
+  right: max(20px, env(safe-area-inset-right, 0px));
+  bottom: max(20px, env(safe-area-inset-bottom, 0px));
+  z-index: 900;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 15px;
+  border-radius: 999px;
+  background: var(--card-bg);
+  color: var(--text);
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 10px 26px rgba(11, 16, 32, 0.16);
+  font-family: var(--font-family);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 0.18s ease, color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+[data-theme="dark"] .theme-fab {
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+}
+.theme-fab:hover {
+  border-color: var(--accent);
+  color: var(--accent-text);
+  transform: translateY(-1px);
+}
+.theme-fab:active {
+  transform: translateY(0);
+}
+.theme-fab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.theme-fab-icon {
+  display: inline-block;
+  font-size: 13px;
+  line-height: 1;
+}
+.theme-fab-label {
+  white-space: nowrap;
+}
+
+@media (max-width: 767px) {
+  .theme-fab {
+    right: max(14px, env(safe-area-inset-right, 0px));
+    bottom: max(14px, env(safe-area-inset-bottom, 0px));
+    padding: 9px 13px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .theme-fab {
+    transition: none;
   }
 }
