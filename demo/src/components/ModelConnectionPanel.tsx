@@ -269,7 +269,7 @@ export const ModelConnectionPanel: React.FC<Props> = ({
             padding: '8px 12px',
             borderRadius: '6px',
             backgroundColor: status.success ? 'var(--success-bg)' : 'var(--danger-bg)',
-            color: status.success ? 'var(--success)' : '#fca5a5',
+            color: status.success ? 'var(--success)' : 'var(--danger)',
             border: `1px solid ${status.success ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
             display: 'flex',
             alignItems: 'center',

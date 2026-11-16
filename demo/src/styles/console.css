@@ -1,25 +1,28 @@
 /* AGPilot0005 Standalone Agent Demo Console Styling (AGPilot0002 Branding) */
+/* HD2Lab Soft Iris (White & Violet) — source of truth: Server-HQ HD2Lab/hub-common.css */
 :root {
-  color-scheme: dark;
-  --bg: #101110;
-  --text: #f2f1eb;
-  --muted: #a2a59c;
-  --line: #30322d;
-  --line-strong: #45473f;
-  --line-focus: #535a45;
-  --accent: #ff824f;
-  --accent-hover: #ff9b73;
-  --card-bg: #1b1d19;
-  --card-sub-bg: #22251f;
-  --card-border: #33362d;
-  --card-hover: #777e66;
-  --olive-text: #b9c3a7;
-  --olive-dot: #cdd8b8;
-  --olive-border: #82916c;
-  --danger: #ef4444;
-  --danger-bg: rgba(239, 68, 68, 0.15);
-  --success: #22c55e;
-  --success-bg: rgba(34, 197, 94, 0.15);
+  color-scheme: light;
+  --bg: #FAFAFD;
+  --text: #1D192B;
+  --muted: #68627A;
+  --line: #E8E4F2;
+  --line-strong: #D4CCE8;
+  --line-focus: #B9A8EC;
+  --accent: #8B6CE8;
+  --accent-hover: #7655D9;
+  --accent-text: #6B4CD6;
+  --accent-soft: #F1ECFE;
+  --card-bg: #FFFFFF;
+  --card-sub-bg: #F4F1FC;
+  --card-border: #E8E4F2;
+  --card-hover: #C4B5FD;
+  --olive-text: #6B4CD6;
+  --olive-dot: #8B6CE8;
+  --olive-border: #C4B5FD;
+  --danger: #DC2626;
+  --danger-bg: #FEE2E2;
+  --success: #15803D;
+  --success-bg: #DCFCE7;
   --font-family: Arial, 'Noto Sans KR', -apple-system, sans-serif;
   --mono-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
@@ -172,7 +175,8 @@ body {
 /* Radios */
 .mode-selector {
   display: flex;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 10px 16px;
   align-items: center;
 }
 
@@ -477,5 +481,19 @@ body {
   }
   .composer-box {
     flex-direction: column;
+  }
+  .console-header {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .header-actions {
+    flex-wrap: wrap;
+  }
+  .brand-title {
+    font-size: 1.05rem;
+  }
+  .card-title {
+    flex-wrap: wrap;
+    gap: 8px;
   }
 }
