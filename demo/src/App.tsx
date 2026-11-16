@@ -5,6 +5,7 @@ import { ChatModeToggle } from './components/ChatModeToggle';
 import { AgentExecutionViewer, type ExecutionEventItem } from './components/AgentExecutionViewer';
 import { ResponsePanel } from './components/ResponsePanel';
 import { ToolsListModal } from './components/ToolsListModal';
+import { ThemeToggle } from './components/ThemeToggle';
 import {
   type ModelConnectionConfig,
   type ConnectionStatusResult,
@@ -233,6 +234,9 @@ export default function App() {
       {showToolsModal && (
         <ToolsListModal tools={tools} onClose={() => setShowToolsModal(false)} />
       )}
+
+      {/* Floating Light/Dark toggle (Navy & Lavender) */}
+      <ThemeToggle />
     </div>
   );
 }
