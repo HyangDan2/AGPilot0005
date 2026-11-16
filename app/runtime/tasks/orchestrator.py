@@ -170,12 +170,20 @@ class TaskOrchestrator:
         if task.plan.scope == 'all':
             task.selected_keys = all_keys
         elif not task.selected_keys:
-            found = set()
+            ranked_scores: dict[str, float] = {}
             for doc_id in task.document_ids:
                 for term in (task.plan.search_terms or [task.plan.objective])[:3]:
                     result = await self._document(task, 'search', doc_id, term, 5)
-                    found.update(doc_id + '/' + x['chunk_id'] for x in result.get('results', []) if x.get('chunk_id'))
-            task.selected_keys = [k for k in all_keys if k in found]
+                    for idx, x in enumerate(result.get('results', [])):
+                        cid = x.get('chunk_id')
+                        if not cid:
+                            continue
+                        key = doc_id + '/' + cid
+                        score = float(x.get('score') or 0.0) + (1.0 / (idx + 1))
+                        if key not in ranked_scores or score > ranked_scores[key]:
+                            ranked_scores[key] = score
+            top_keys = {k for k, _ in sorted(ranked_scores.items(), key=lambda item: item[1], reverse=True)[:8]}
+            task.selected_keys = [k for k in all_keys if k in top_keys]
             if not task.selected_keys:
                 # Search can miss phrasing. Escalate within the same task and ledger.
                 if task.replans >= self.max_replans:

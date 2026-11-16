@@ -8,6 +8,7 @@ from app.runtime.context import ContextManager
 from app.runtime.document_analysis import AnalysisStore, DocumentAnalysisManager
 from app.runtime.public_grounding import public_grounded_messages
 from app.runtime.state import AgentState
+from app.runtime.tasks.composition import AnswerComposer, CompositionVerifier, GROUNDING, VERIFY
 from app.runtime.tasks.domain import BudgetLedger, Draft, Plan, Section, Task
 from app.runtime.tasks.ports import JsonTaskRepository
 from app.runtime.tasks.services import AnswerVerifier, AnswerWriter, ModelInvoker, RequestPlanner
@@ -230,3 +231,55 @@ def test_context_manager_and_public_grounding_accept_dynamic_budgets():
     expanded = public_grounded_messages(state, max_body_chars=24000)
     assert "제외했습니다" in compact[0].content
     assert "제외했습니다" not in expanded[0].content
+
+
+@pytest.mark.asyncio
+async def test_lookup_uses_single_final_verify_and_capped_reasoning_and_grounding_allows_absence(tmp_path):
+    assert "부재나 한계를 명시한 문장은" in GROUNDING
+    assert "부재나 한계를 명시한 문장은" in VERIFY
+
+    repo = JsonTaskRepository(AnalysisStore(tmp_path / "lookup"), time.time)
+    now = time.time()
+    task = Task(
+        job_id="ana_" + "b" * 32,
+        owner_id="u1",
+        service_id="hd2ai-admin",
+        question="GAN 아티팩트 처리 방법은?",
+        document_ids=["doc_1"],
+        reasoning_effort="high",
+        created_at=now,
+        updated_at=now,
+        budget=BudgetLedger(deadline=now + 120),
+        plan=Plan(
+            intent="lookup",
+            scope="relevant",
+            objective="GAN 아티팩트 처리 방법 설명",
+            required_outputs=["핵심 기법"],
+            completion_criteria=["근거 기반 설명"],
+        ),
+    )
+    task.drafts = {
+        "g0": Draft(sections=[Section(heading="아티팩트 처리", body="sinc 필터와 U-Net SN 판별자 사용. 아블레이션 수치는 확인 불가.", refs=["doc_1/chk_1"])]),
+    }
+    repo.save(task)
+
+    efforts = []
+    verify_calls = []
+
+    class LookupModel:
+        async def complete(self, **kwargs):
+            body = json.loads(kwargs["messages"][0].content)
+            if "answer" in body:
+                verify_calls.append(body.get("verification_mode"))
+                return ModelReply(content=json.dumps({"satisfied": True, "missing_requirements": [], "unsupported_claims": []}), finish_reason="stop")
+            efforts.append(kwargs.get("reasoning_effort"))
+            return ModelReply(
+                content=json.dumps({"sections": [{"heading": "아티팩트 처리", "body": "sinc 필터와 U-Net SN 판별자 적용. 아블레이션 수치는 없음.", "refs": ["doc_1/chk_1"], "labels": []}]}),
+                finish_reason="stop",
+            )
+
+    invoker = ModelInvoker(LookupModel(), repo, time.time)
+    await AnswerComposer(invoker, repo).compose(task)
+    assert efforts == ["low"]
+    # Lookup uses single unified VERIFY call instead of bounded N+M+1 split calls
+    assert verify_calls == [None]
