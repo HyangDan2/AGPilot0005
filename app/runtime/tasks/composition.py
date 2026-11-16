@@ -176,21 +176,32 @@ class AnswerComposer:
     def _data(task, inputs, final):
         return composition_data(task, inputs, final)
 
+    def _input_budget(self, task=None):
+        if task is not None and hasattr(self.invoker, 'budget_for'):
+            from app.core.runtime_config import get_runtime_config, resolve_route_budget
+            cfg = get_runtime_config()
+            route = getattr(task, 'service_id', None)
+            has_contract = any(b.gateway_contract is not None for b in cfg.token_budgets.values())
+            if has_contract:
+                return resolve_route_budget(route).input_budget_tokens
+        return self.invoker.input_tokens
+
     def _fits(self, task, inputs, final):
         # Leave room for output, verification answer, persona, and repair feedback.
         body = json.dumps(self._data(task, inputs, final), ensure_ascii=False)
         # Final verification has its own bounded calls. Reserve generation output
         # and persona here, rather than a second copy of the complete answer.
         reserve = 1000 + 2048 if final else 6000
-        return estimate(body) + max(estimate(COMPOSE), estimate(VERIFY)) + reserve <= self.invoker.input_tokens
+        return estimate(body) + max(estimate(COMPOSE), estimate(VERIFY)) + reserve <= self._input_budget(task)
 
     def _output_budget(self, task, inputs, final):
+        eff_input = self._input_budget(task)
         if final:
             size = estimate(json.dumps(self._data(task, inputs, final), ensure_ascii=False))
-            return max(1000, self.invoker.input_tokens - size - estimate(VERIFY) - 1800)
+            return max(1000, eff_input - size - estimate(VERIFY) - 1800)
         # Two intermediate nodes plus the original plan must fit the next level.
         overhead = estimate(json.dumps(self._data(task, [], False), ensure_ascii=False))
-        return max(512, (self.invoker.input_tokens - overhead - max(estimate(COMPOSE), estimate(VERIFY)) - 4900) // 2)
+        return max(512, (eff_input - overhead - max(estimate(COMPOSE), estimate(VERIFY)) - 4900) // 2)
 
     def _leaves(self, task):
         return self._section_inputs([{'id': group, 'sections': [s.model_dump() for s in draft.sections]}
@@ -218,6 +229,8 @@ class AnswerComposer:
         return [leaf for leaves in topics.values() for leaf in leaves]
 
     async def compose(self, task):
+        if hasattr(self.invoker, 'budget_for'):
+            await self.invoker.budget_for(task)
         if (task.final_draft and task.final_verification and task.final_verification.satisfied and
                 not task.final_verification.missing_requirements and not task.final_verification.unsupported_claims and
                 task.final_signature == task.composition_signature()):
@@ -415,33 +428,38 @@ class CompositionVerifier:
                 missing_requirements=missing,
                 unsupported_claims=unsupported,
             ).with_reasons(reasons)
+        budget, has_contract = await self.invoker.budget_for(task) if hasattr(self.invoker, 'budget_for') else (None, False)
+        eff_input = budget.input_budget_tokens if has_contract and budget else self.invoker.input_tokens
+        verify_tokens = budget.verify_max_tokens if has_contract and budget else 1536
         payload = {**composition_data(task, inputs, final), 'answer': draft.model_dump()}
-        if final or estimate(json.dumps(payload, ensure_ascii=False)) + estimate(VERIFY) + 1600 > self.invoker.input_tokens:
-            result = await self._bounded(task, draft, inputs, final)
+        if final or estimate(json.dumps(payload, ensure_ascii=False)) + estimate(VERIFY) + 1600 > eff_input:
+            result = await self._bounded(task, draft, inputs, final, eff_input=eff_input, verify_tokens=verify_tokens)
         else:
             result = await self.invoker.typed(task, VERIFY,
-                payload, Verification, max_tokens=1536)
+                payload, Verification, max_tokens=verify_tokens)
         if result.missing_requirements or result.unsupported_claims:
             result.satisfied = False
             result.with_reasons(['content_verification_failed'])
         return result
 
-    async def _check(self, task, data, mode, policy):
+    async def _check(self, task, data, mode, policy, verify_tokens=1024):
         schema = GroundingVerification if mode == 'grounding' else RequirementsVerification
         result = await self.invoker.typed(task, CHECK_FORMAT + policy,
-            {**data, 'verification_mode': mode}, schema, max_tokens=1024)
+            {**data, 'verification_mode': mode}, schema, max_tokens=verify_tokens)
         result.missing_requirements = [mode + ': ' + x for x in result.missing_requirements]
         result.unsupported_claims = [mode + ': ' + x for x in result.unsupported_claims]
         return result
 
-    def _fits(self, data, policy):
-        return estimate(json.dumps(data, ensure_ascii=False)) + estimate(CHECK_FORMAT + policy) + 1800 <= self.invoker.input_tokens
+    def _fits(self, data, policy, eff_input=None):
+        limit = eff_input if eff_input is not None else self.invoker.input_tokens
+        return estimate(json.dumps(data, ensure_ascii=False)) + estimate(CHECK_FORMAT + policy) + 1800 <= limit
 
-    async def _bounded(self, task, draft, inputs, final):
+    async def _bounded(self, task, draft, inputs, final, eff_input=None, verify_tokens=1024):
         """Separate requirements, per-section grounding, and input coverage."""
+        check_tokens = min(verify_tokens, 2048) if eff_input is not None else 1024
         reports = []
         reports.append(await self._check(task,
-            {**composition_data(task, [], final), 'answer': draft.model_dump()}, 'requirements', REQUIREMENTS))
+            {**composition_data(task, [], final), 'answer': draft.model_dump()}, 'requirements', REQUIREMENTS, verify_tokens=check_tokens))
         for section in draft.sections:
             cited = set(section.refs)
             related = [{'id': item['id'], 'sections': [s for s in item['sections'] if cited.intersection(s['refs'])]}
@@ -453,24 +471,24 @@ class CompositionVerifier:
             raw = [{'id': key, 'sections': [{'heading': '원문', 'body': task.evidence[key].content,
                      'refs': [key], 'labels': []}]} for key in section.refs if key in task.evidence]
             original = {**composition_data(task, raw, False), 'answer': answer}
-            data = original if len(raw) == len(cited) and self._fits(original, GROUNDING) else {
+            data = original if len(raw) == len(cited) and self._fits(original, GROUNDING, eff_input) else {
                 **composition_data(task, related, False), 'answer': answer}
-            reports.append(await self._check(task, data, 'grounding', GROUNDING))
+            reports.append(await self._check(task, data, 'grounding', GROUNDING, verify_tokens=check_tokens))
         batch = []
         for item in inputs:
             candidate = batch + [item]
             data = {**composition_data(task, candidate, final), 'plan': task.plan.model_dump(),
                     'user_plan': task.plan.model_dump(), 'answer': draft.model_dump()}
-            if batch and not self._fits(data, COVERAGE):
+            if batch and not self._fits(data, COVERAGE, eff_input):
                 reports.append(await self._check(task,
                     {**composition_data(task, batch, final), 'plan': task.plan.model_dump(),
-                     'user_plan': task.plan.model_dump(), 'answer': draft.model_dump()}, 'coverage', COVERAGE))
+                     'user_plan': task.plan.model_dump(), 'answer': draft.model_dump()}, 'coverage', COVERAGE, verify_tokens=check_tokens))
                 batch = []
             batch.append(item)
         if batch:
             reports.append(await self._check(task,
                 {**composition_data(task, batch, final), 'plan': task.plan.model_dump(),
-                 'user_plan': task.plan.model_dump(), 'answer': draft.model_dump()}, 'coverage', COVERAGE))
+                 'user_plan': task.plan.model_dump(), 'answer': draft.model_dump()}, 'coverage', COVERAGE, verify_tokens=check_tokens))
         missing = list(dict.fromkeys(x for report in reports for x in report.missing_requirements))
         unsupported = list(dict.fromkeys(x for report in reports for x in report.unsupported_claims))
         return Verification(satisfied=all(r.satisfied for r in reports) and not missing and not unsupported,

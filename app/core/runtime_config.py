@@ -241,9 +241,20 @@ async def ensure_route_budget(client: Any, route: Optional[str] = None) -> Token
         getter = getattr(client, "get_route_limits", None)
         if callable(getter):
             limits = await getter(target)
-            if limits:
+            if isinstance(limits, dict) and "context_tokens" in limits and "max_output_tokens" in limits:
                 return sync_route_contract(target, limits).active
     return resolve_route_budget(target, default_route=getattr(client, "route", "hd2ai-admin"))
+
+
+async def get_effective_route_budget(client: Any, route: Optional[str] = None) -> tuple[TokenBudgetValues, bool]:
+    budget = await ensure_route_budget(client, route)
+    cfg = get_runtime_config()
+    target = route if route and route in cfg.token_budgets else (getattr(client, "route", None) or "hd2ai-admin")
+    entry = cfg.token_budgets.get(target)
+    has_contract = bool(entry and entry.gateway_contract is not None) or any(
+        b.gateway_contract is not None for b in cfg.token_budgets.values()
+    )
+    return budget, has_contract
 
 
 async def sync_contracts_from_gateway(client: Any, routes: Optional[list[str]] = None) -> None:

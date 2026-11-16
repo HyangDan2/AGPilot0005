@@ -44,13 +44,14 @@ class ContextManager:
         key = self.cache_key(tool_name, arguments)
         self._cache[key] = result
 
-    def prune_and_compress(self, messages: List[GatewayMessage]) -> Tuple[List[GatewayMessage], bool]:
+    def prune_and_compress(self, messages: List[GatewayMessage], budget_tokens: Optional[int] = None) -> Tuple[List[GatewayMessage], bool]:
         """
         Compresses older tool results if total messages exceed context budget.
         Maintains correspondence between tool_calls and tool results.
         """
+        effective_budget = budget_tokens if budget_tokens is not None else self.budget_tokens
         current_tokens = self.estimate_messages_tokens(messages)
-        if current_tokens <= self.budget_tokens:
+        if current_tokens <= effective_budget:
             return messages, False
 
         trimmed = False
@@ -76,7 +77,7 @@ class ContextManager:
             compressed_msgs.append(m)
 
         # If still exceeding budget, safely remove older non-essential conversation pairs
-        while self.estimate_messages_tokens(compressed_msgs) > self.budget_tokens and len(compressed_msgs) > 3:
+        while self.estimate_messages_tokens(compressed_msgs) > effective_budget and len(compressed_msgs) > 3:
             # Drop from index 1 (preserve system instruction at 0 if present)
             drop_idx = 1 if compressed_msgs[0].role == "system" else 0
             compressed_msgs.pop(drop_idx)

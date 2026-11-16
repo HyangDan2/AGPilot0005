@@ -89,14 +89,14 @@ def public_chunk_calls(state: AgentState) -> List[ToolCall]:
     return calls
 
 
-def public_grounded_messages(state: AgentState) -> List[GatewayMessage]:
+def public_grounded_messages(state: AgentState, max_body_chars: int = 12000) -> List[GatewayMessage]:
     question = next((m.content or '' for m in reversed(state.messages) if m.role == 'user'), '')
     chunks = [m.content or '' for m in state.messages if m.role == 'tool' and m.name == 'document.read_chunk']
     sections = [m.content or '' for m in state.messages if m.role == 'tool' and m.name == 'document.read_section']
     # Whole verified bodies first. Never present search snippets as full evidence.
     blocks, size, omitted = [], 0, 0
     for body in chunks + sections:
-        if size + len(body) > 12000:
+        if size + len(body) > max_body_chars:
             omitted += 1
             continue
         blocks.append(body);size += len(body)

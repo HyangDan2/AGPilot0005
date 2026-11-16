@@ -171,6 +171,31 @@ class DocumentAnalysisManager:
             return
         self.tasks[job_id] = asyncio.create_task(self._run(job_id))
 
+    async def _budget_limits(self, job: dict[str, Any]) -> dict[str, Any]:
+        from app.core.runtime_config import get_effective_route_budget
+        budget, has_contract = await get_effective_route_budget(gateway_client, job.get("service_id"))
+        max_prompt_bytes = budget.batch_prompt_bytes if has_contract else 9000
+        batch_input_bytes = max(5000, int(max_prompt_bytes * 0.72))
+        batch_soft_bytes = max(3800, int(max_prompt_bytes * 0.56))
+        reduce_group_bytes = max(5500, int(max_prompt_bytes * 0.78))
+        write_tokens = budget.write_max_tokens if has_contract else 4096
+        note_retry_tokens = budget.write_max_tokens if has_contract else 2048
+        compose_tokens = budget.compose_max_tokens if has_contract else 2048
+        note_max_bytes = max(3500, min(int(reduce_group_bytes * 0.78), max(3500, write_tokens * 2))) if has_contract else 3500
+        return {
+            "has_contract": has_contract,
+            "max_prompt_bytes": max_prompt_bytes,
+            "output_ceiling": budget.output_ceiling_tokens if has_contract else 32768,
+            "reasoning_start": budget.reasoning_start_tokens if has_contract else 8192,
+            "write_max_tokens": write_tokens,
+            "note_retry_tokens": note_retry_tokens,
+            "compose_max_tokens": compose_tokens,
+            "batch_input_bytes": batch_input_bytes if has_contract else 6500,
+            "batch_soft_bytes": batch_soft_bytes if has_contract else 5000,
+            "reduce_group_bytes": reduce_group_bytes if has_contract else 7000,
+            "note_max_bytes": note_max_bytes,
+        }
+
     async def _model(
         self,
         job: dict[str, Any],
@@ -180,12 +205,10 @@ class DocumentAnalysisManager:
         reasoning_effort_override: str | None = None,
         stream_answer: bool = False,
     ) -> str:
-        from app.core.runtime_config import ensure_route_budget, get_runtime_config
-        budget = await ensure_route_budget(gateway_client, job.get("service_id"))
-        has_contract = any(b.gateway_contract is not None for b in get_runtime_config().token_budgets.values())
-        max_prompt_bytes = budget.batch_prompt_bytes if has_contract else 9000
-        output_ceiling = budget.output_ceiling_tokens if has_contract else 32768
-        reasoning_start = budget.reasoning_start_tokens if has_contract else 8192
+        limits = await self._budget_limits(job)
+        max_prompt_bytes = limits["max_prompt_bytes"]
+        output_ceiling = limits["output_ceiling"]
+        reasoning_start = limits["reasoning_start"]
 
         prompt = f"분석 지침:\n{system}\n\n{user}"
         if len(prompt.encode("utf-8")) > max_prompt_bytes:
@@ -251,16 +274,22 @@ class DocumentAnalysisManager:
         raise ValueError("model_retry_exhausted")
 
     async def _note(self, job: dict[str, Any], system: str, user: str) -> str:
+        limits = await self._budget_limits(job)
+        note_max_bytes = limits["note_max_bytes"]
+        note_retry_tokens = limits["note_retry_tokens"]
         note = await self._model(job, system, user, reasoning_effort_override="off")
-        if len(note.encode("utf-8")) > 3500:
+        if len(note.encode("utf-8")) > note_max_bytes:
+            target_chars = max(500, int(note_max_bytes // 3.5))
+            # Compress the oversized note itself rather than re-sending the larger source input.
+            compress_source = note if (limits["has_contract"] and len(note.encode("utf-8")) <= limits["max_prompt_bytes"] - 1024) else user
             note = await self._model(
                 job,
-                system + " 반드시 500자 이내로 압축하고 출처 ID를 남기세요.",
-                user,
-                max_tokens=2048,
+                f"다음 분석 노트를 핵심 사실·수치·출처 ID만 보존해 {target_chars}자 이내로 압축하세요. 새 사실을 추가하지 마세요.",
+                compress_source,
+                max_tokens=note_retry_tokens,
                 reasoning_effort_override="off",
             )
-        if len(note.encode("utf-8")) > 3500:
+        if len(note.encode("utf-8")) > note_max_bytes:
             raise ValueError("model_note_too_large")
         return note
 
@@ -296,6 +325,9 @@ class DocumentAnalysisManager:
         self._save(job)
 
     async def _next_batch(self, job: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+        limits = await self._budget_limits(job)
+        batch_input_bytes = limits["batch_input_bytes"]
+        batch_soft_bytes = limits["batch_soft_bytes"]
         units: list[dict[str, Any]] = []
         contents: list[str] = []
         size = 0
@@ -318,16 +350,19 @@ class DocumentAnalysisManager:
                 label = f"{key}#{index + 1}/{len(parts)}"
                 block = f"[{label}]\n{part}"
                 width = len(block.encode("utf-8"))
-                if units and (size + width > 6500 or len(units) >= 3):
+                if units and (size + width > batch_input_bytes or len(units) >= 3):
                     return units, "\n\n".join(contents)
                 units.append({"key": key, "part": index, "parts": len(parts), "label": label})
                 contents.append(block)
                 size += width
-            if units and (size >= 5000 or len(units) >= 3):
+            if units and (size >= batch_soft_bytes or len(units) >= 3):
                 break
         return units, "\n\n".join(contents)
 
     async def _reduce(self, job: dict[str, Any]) -> str:
+        limits = await self._budget_limits(job)
+        reduce_group_bytes = limits["reduce_group_bytes"]
+        compose_max_tokens = limits["compose_max_tokens"]
         nodes = list(job["notes"])
         while len(nodes) > 1:
             reduced = []
@@ -337,9 +372,9 @@ class DocumentAnalysisManager:
                 body_size = 0
                 while start < len(nodes) and len(group) < 4:
                     width = len(nodes[start]["text"].encode("utf-8")) + 2
-                    if group and body_size + width > 7000:
+                    if group and body_size + width > reduce_group_bytes:
                         break
-                    if width > 7000:
+                    if width > reduce_group_bytes:
                         raise ValueError("model_note_too_large")
                     group.append(nodes[start])
                     body_size += width
@@ -350,7 +385,7 @@ class DocumentAnalysisManager:
                 refs = list(dict.fromkeys(ref for note in group for ref in note["refs"]))
                 body = "\n\n".join(note["text"] for note in group)
                 summary = await self._note(job,
-                    "여러 문서 근거 노트를 600자 이내로 충실히 병합하세요. 출처 ID와 불확실성을 보존하고 새 사실을 만들지 마세요.",
+                    "여러 문서 근거 노트를 핵심 사실과 출처 ID가 누락되지 않게 충실히 병합하세요. 불확실성을 보존하고 새 사실을 만들지 마세요.",
                     body)
                 reduced.append({"refs": refs, "text": summary})
             if len(reduced) == len(nodes):
@@ -359,7 +394,7 @@ class DocumentAnalysisManager:
         final_note = nodes[0]["text"] if nodes else ""
         return await self._model(job,
             "전체 문서를 읽은 근거 노트에만 기반해 한국어로 답하세요. 확인되지 않은 사실은 명시하고, 내부 청크 ID(chk_..., doc_...)나 도구 호출 문법은 출력하지 마세요.",
-            f"질문: {job['question']}\n\n근거 노트:\n{final_note}", max_tokens=2048, stream_answer=True)
+            f"질문: {job['question']}\n\n근거 노트:\n{final_note}", max_tokens=compose_max_tokens, stream_answer=True)
 
     async def _run(self, job_id: str) -> None:
         job = self.store.read(job_id)

@@ -44,10 +44,17 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
                     'step_count':state.step_count,'pending_tool_calls':calls,'status':'running'}
 
     # 1. Prune and budget check
-    pruned_msgs, trimmed = context_manager.prune_and_compress(state.messages)
+    from app.core.runtime_config import get_effective_route_budget
+    client = state.custom_client or gateway_client
+    route_budget, has_contract = await get_effective_route_budget(client, state.service_id)
+    pruned_msgs, trimmed = context_manager.prune_and_compress(
+        state.messages,
+        budget_tokens=route_budget.input_budget_tokens if has_contract else None,
+    )
     public_grounding = state.service_id == "hd2ai-public" and bool(state.context_refs)
     if public_grounding:
-        pruned_msgs = public_grounded_messages(state)
+        max_body_chars = min(48000, max(12000, route_budget.input_budget_tokens)) if has_contract else 12000
+        pruned_msgs = public_grounded_messages(state, max_body_chars=max_body_chars)
     
     # 2. Get tool definitions for this service
     tools = registry.get_definitions(service=state.service_id)
@@ -56,7 +63,6 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
         tools = [tool for tool in tools if tool.function.name == "document.get_outline"]
     
     # 3. Call Client (custom_client if provided, else default gateway_client)
-    client = state.custom_client or gateway_client
     content, tool_calls, finish_reason = await client.execute(
         messages=pruned_msgs,
         tools=tools if not public_grounding and state.tool_call_count < state.max_tool_calls else None,
