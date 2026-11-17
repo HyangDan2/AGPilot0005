@@ -533,6 +533,24 @@ body {
 }
 
 /* ── Floating Light/Dark toggle (fixed bottom-right, shared hd2-theme) ─────── */
+/* Theme toggle icon — one monochrome sun/moon SVG, the same mark Web-HQ draws. */
+/* The icon shows where the button takes you: light → moon, dark → sun. */
+.theme-ic {
+  display: none;
+  width: 19px;
+  height: 19px;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+}
+[data-theme="light"] .theme-ic[data-icon="moon"],
+[data-theme="dark"] .theme-ic[data-icon="sun"] {
+  display: block;
+}
+
+/* ── Floating icon-only Light/Dark toggle (44px circle, bottom-right) ──────── */
 .theme-fab {
   position: fixed;
   right: max(20px, env(safe-area-inset-right, 0px));
@@ -540,23 +558,23 @@ body {
   z-index: 900;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 15px;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
   border-radius: 999px;
   background: var(--card-bg);
   color: var(--text);
   border: 1px solid var(--line-strong);
   box-shadow: 0 10px 26px rgba(11, 16, 32, 0.16);
-  font-family: var(--font-family);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  line-height: 1;
   cursor: pointer;
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
   transition: border-color 0.18s ease, color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
   -webkit-tap-highlight-color: transparent;
 }
 [data-theme="dark"] .theme-fab {
+  background: rgba(18, 25, 46, 0.92);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
 }
 .theme-fab:hover {
@@ -571,20 +589,11 @@ body {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
-.theme-fab-icon {
-  display: inline-block;
-  font-size: 13px;
-  line-height: 1;
-}
-.theme-fab-label {
-  white-space: nowrap;
-}
 
 @media (max-width: 767px) {
   .theme-fab {
     right: max(14px, env(safe-area-inset-right, 0px));
     bottom: max(14px, env(safe-area-inset-bottom, 0px));
-    padding: 9px 13px;
   }
 }
 
