@@ -344,7 +344,8 @@ scope(all|relevant|none), required_outputs(필수 산출물 문자열 배열), s
 entity_type(api|general: API/함수의 전수 설명은 api, 그 외 general),
 completion_criteria(검증할 조건 문자열 배열), steps(작업명 배열), revision(1).
 steps는 read, search, write, verify, clarify 중 필요한 이름만 쓰세요.
-전수 추출/전체 요약/전체 비교는 all, 특정 주제 요약/추출/조회는 relevant, 대화/질문필요는 none을 사용하세요. 검색어는 함수명·주제어 등 실제 자료 키워드로 짧게 작성하세요.'''
+전수 추출/전체 요약/전체 비교는 all, 특정 주제 요약/추출/조회는 relevant, 대화/질문필요는 none을 사용하세요. 검색어는 함수명·주제어 등 실제 자료 키워드로 짧게 작성하세요.
+documents의 headings(목차)가 영문 등 질문과 다른 언어이면, search_terms에 질문 언어와 문서 원문 언어(영문 등) 키워드를 함께 넣으세요.'''
         instructions += '\n형식 예: {"objective":"문서 전체 요약","intent":"summary","scope":"all","entity_type":"general","required_outputs":["핵심 요약"],"search_terms":[],"completion_criteria":["주요 내용과 출처"],"revision":1}. 필드 이름과 enum 값은 이 계약만 사용하세요.'
         last = None
         budget, has_contract = await self.invoker.budget_for(task) if hasattr(self.invoker, 'budget_for') else (None, False)

@@ -199,7 +199,15 @@ class TaskOrchestrator:
                         ranked_scores[key] = ranked_scores.get(key, 0.0) + hits * 1.5
             limit_k = 12 if len(all_keys) > 12 else 8
             top_keys = {k for k, _ in sorted(ranked_scores.items(), key=lambda item: item[1], reverse=True)[:limit_k]}
-            task.selected_keys = [k for k in all_keys if k in top_keys]
+            # Include immediate successor chunk for top-ranked hits to avoid splitting a topic across chunk boundaries.
+            expanded_keys = set(top_keys)
+            max_expanded = limit_k + 4
+            for idx, k in enumerate(all_keys):
+                if k in top_keys and idx + 1 < len(all_keys):
+                    nxt = all_keys[idx + 1]
+                    if nxt.split('/', 1)[0] == k.split('/', 1)[0] and len(expanded_keys) < max_expanded:
+                        expanded_keys.add(nxt)
+            task.selected_keys = [k for k in all_keys if k in expanded_keys]
             if not task.selected_keys:
                 # Search can miss phrasing. Escalate within the same task and ledger.
                 if task.replans >= self.max_replans:

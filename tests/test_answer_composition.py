@@ -63,7 +63,7 @@ async def test_repeated_group_answers_become_one_verified_document_answer(tmp_pa
     result = await o.create('a', 'hd2ai-admin', '전체 문서를 요약해', ['doc_sdk'])
     await o.tasks[result['job_id']]
     task = repo.load(result['job_id'])
-    assert task.status == 'completed'
+    assert task.status == 'completed', (task.status, task.error_code, task.last_failure_reason, task.contract_errors)
     assert len(task.drafts) > 1 and len(task.verified_groups) == len(task.drafts)
     assert all('문서 핵심 내용 요약' in d.render() for d in task.drafts.values())
     assert task.answer.count('### 주요 기능') == 1
@@ -123,7 +123,7 @@ async def test_large_drafts_use_checkpointed_tree_without_losing_source_facts(tm
     result = await o.create('a', 'hd2ai-admin', '전체 요약', ['doc_sdk'])
     await o.tasks[result['job_id']]
     task = repo.load(result['job_id'])
-    assert task.status == 'completed'
+    assert task.status == 'completed', (task.status, task.error_code, task.last_failure_reason, task.contract_errors)
     assert len(task.composition_nodes) > 1
     assert all(f'Function{i}(' in task.answer for i in range(18))
     assert all(n.verification.satisfied for n in task.composition_nodes.values())
@@ -184,7 +184,7 @@ async def test_out_of_scope_verifier_failure_retries_verifier_not_answer(tmp_pat
     result = await o.create('a', 'hd2ai-admin', '핵심 요약', ['doc_sdk'])
     await o.tasks[result['job_id']]
     task = repo.load(result['job_id'])
-    assert task.status == 'completed'
+    assert task.status == 'completed', (task.status, task.error_code, task.last_failure_reason, task.contract_errors)
     assert any('missing_requirements' in e for e in task.contract_errors)
     assert model.compositions == len(task.composition_nodes)
 
@@ -240,7 +240,7 @@ async def test_empty_chunk_sections_skip_verifier_and_planner_auto_normalizes(tm
     res = await o.create('a', 'hd2ai-admin', 'Function0 근거 알려줘', ['doc_sdk'])
     await o.tasks[res['job_id']]
     task = repo.load(res['job_id'])
-    assert task.status == 'completed'
+    assert task.status == 'completed', (task.status, task.error_code, task.last_failure_reason, task.contract_errors)
     assert len(task.plan.search_terms) == 8
     assert model.verified_sources == [['doc_sdk/chk_0']]
     assert 'Function0' in task.answer
@@ -327,4 +327,34 @@ async def test_dynamic_topic_summary_and_chunk_verifier_filters_other_chapter_te
     verdict = await verifier.verify(task, draft, sources)
     assert verdict.satisfied is True
     assert verdict.missing_requirements == []
+
+
+@pytest.mark.asyncio
+async def test_final_composition_preserves_answer_when_absence_disclosed_without_hallucination(tmp_path):
+    class AbsenceDisclosedModel(SummaryModel):
+        async def complete(self, **kwargs):
+            instructions = kwargs['task_instructions']
+            data = json.loads(kwargs['messages'][0].content)
+            if instructions == COMPOSE:
+                self.compositions += 1
+                sections = [s for item in data['inputs'] for s in item['sections']]
+                refs = list(dict.fromkeys(r for s in sections for r in s['refs']))
+                return ModelReply(content=json.dumps({
+                    'sections': [{'heading': '주요 기능 및 풀 크기', 'body': '제공된 근거에는 학습 쌍 풀 크기 수치가 명시되어 있지 않아 별도 수치를 제시하지 않는다.', 'refs': refs, 'labels': []}]
+                }, ensure_ascii=False))
+            if (instructions == VERIFY or 'verification_mode' in data) and data.get('global_final'):
+                self.final_checks += 1
+                return ModelReply(content=json.dumps({
+                    'satisfied': False,
+                    'missing_requirements': ['학습 쌍 풀 크기 수치 명시'] if data.get('verification_mode') != 'grounding' else [],
+                    'unsupported_claims': [],
+                }, ensure_ascii=False))
+            return await super().complete(**kwargs)
+
+    repo, model, _, o = configured(tmp_path, AbsenceDisclosedModel())
+    result = await o.create('a', 'hd2ai-admin', '전체 문서를 요약해', ['doc_sdk'])
+    await o.tasks[result['job_id']]
+    task = repo.load(result['job_id'])
+    assert task.status == 'completed', (task.status, task.error_code, task.last_failure_reason, task.contract_errors)
+    assert task.answer and '명시되어 있지 않아' in task.answer
 

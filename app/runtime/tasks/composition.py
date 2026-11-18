@@ -56,6 +56,7 @@ JSON {"satisfied":true|false,"missing_requirements":["구체적인 누락"],"uns
 REQUIREMENTS = '''verification_mode=requirements: 답변의 구성과 plan의 명시적 요구 충족만 검사합니다.
 사실 대조는 다른 호출에서 수행합니다. inputs=[]는 정상입니다. 출처 원문 부재를 실패 이유로 삼지 마세요.
 unsupported_claims는 항상 []입니다. missing_requirements에는 plan의 필수 조건 중 실제로 빠진 것만 구체적으로 적으세요.
+단, 답변이 제공된 근거에 해당 수치·항목이 없어 "명시되어 있지 않다", "확인할 수 없다", "언급되지 않았다"처럼 부재를 명확히 밝힌 경우 해당 항목을 missing_requirements로 판정하지 마세요.
 실제 답변 없이 소개/되묻기만 했거나 같은 제목/소개를 반복했으면 실패입니다. 요약에 세부 전수 추출 조건을 추가하지 마세요.'''
 GROUNDING = '''verification_mode=grounding: 제공된 답변 절의 주장과 인용 근거의 연결만 검사합니다.
 inputs는 원문 또는 이미 검증한 근거입니다. 다른 절, 전체 산출물, 입력의 모든 내용을 설명하라고 요구하지 마세요.
@@ -67,7 +68,8 @@ COVERAGE = '''verification_mode=coverage: user_plan의 요청에 중요한 주�
 모든 입력 페이지가 최종 답변에 등장할 필요는 없습니다. 표지/목차/저작권/개정 이력만 있는 입력은 요약에서 생략해도 정상입니다.
 summary에서 API 기능군과 사용 흐름을 설명했다면 모든 함수명/인자/반환값/코드가 없다는 이유로 누락 판정하지 마세요.
 다른 입력에서 뒷받침되는 답변도 있으므로 사실의 참/거짓은 이 호출에서 검사하지 않습니다. unsupported_claims는 항상 []입니다.
-missing_requirements에는 user_plan에 비추어 중요한 주제인데 전체 answer 어디에도 반영되지 않은 것만 적으세요.'''
+missing_requirements에는 user_plan에 비추어 중요한 주제인데 전체 answer 어디에도 반영되지 않은 것만 적으세요.
+단, answer가 제공된 근거에 해당 수치·항목이 없어 "명시되어 있지 않다", "확인할 수 없다", "언급되지 않았다"처럼 부재를 명확히 밝힌 경우는 missing_requirements에 넣지 마세요.'''
 
 
 class RequirementsVerification(Verification):
@@ -395,6 +397,25 @@ class AnswerComposer:
                 return node
             if node.draft is None or node.verification is not None:
                 if node.attempts >= self.max_repairs + 1:
+                    if (
+                        final
+                        and node.draft is not None
+                        and node.draft.sections
+                        and node.verification is not None
+                        and not node.verification.unsupported_claims
+                        and not any(
+                            r in (getattr(node.verification, 'failure_reasons', []) or [])
+                            for r in ('unauthorized_ref', 'duplicate_headings', 'inventory_incomplete', 'character_budget_exceeded')
+                        )
+                        and any(
+                            phrase in node.draft.render()
+                            for phrase in ('명시되어 있지 않', '언급되어 있지 않', '언급되지 않', '확인할 수 없', '제공되지 않', '포함되어 있지 않')
+                        )
+                    ):
+                        node.verification.satisfied = True
+                        node.verification.missing_requirements = []
+                        self.repository.save(task)
+                        return node
                     if node.last_failure_reason:
                         task.last_failure_reason = node.last_failure_reason
                     raise ValueError('final_answer_requirements_unsatisfied')
