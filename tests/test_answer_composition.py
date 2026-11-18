@@ -39,7 +39,7 @@ class SummaryModel(Model):
             value = {'satisfied': not self.reject_final,
                      'missing_requirements': ['중요 내용 누락'] if self.reject_final and data.get('verification_mode') != 'grounding' else [],
                      'unsupported_claims': ['사실 근거 불충분'] if self.reject_final and data.get('verification_mode') == 'grounding' else []}
-        elif instructions.startswith('문서 작업의 산출물'):
+        elif instructions.startswith(('문서 작업의 산출물', '너는 문서 근거 추출기다.')):
             refs = list(dict.fromkeys(s['key'] for s in data['sources']))
             value = {'sections': [
                 {'heading': '문서 핵심 내용 요약', 'body': '이 문서는 카메라 SDK 매뉴얼의 일부이며 제공된 묶음을 설명합니다.', 'refs': refs, 'labels': []},
@@ -199,3 +199,132 @@ def test_source_citation_candidates_keep_text_and_stay_inside_allowed_evidence()
     SourceCitationResolver().resolve(task, draft, {'doc/a', 'doc/b'})
     assert draft.sections[0].refs == ['doc/a', 'doc/b']
     assert draft.sections[0].body == body
+
+
+@pytest.mark.asyncio
+async def test_empty_chunk_sections_skip_verifier_and_planner_auto_normalizes(tmp_path):
+    class ChunkSelectiveModel(Model):
+        def __init__(self):
+            super().__init__(intent='lookup', scope='relevant')
+            self.verified_sources = []
+
+        async def complete(self, **kwargs):
+            instructions = kwargs['task_instructions']
+            data = json.loads(kwargs['messages'][0].content)
+            if '자연어 문서 작업을 계획' in instructions:
+                return ModelReply(content=json.dumps({
+                    'objective': '특정 근거 조회',
+                    'intent': 'lookup',
+                    'scope': 'relevant',
+                    'required_outputs': [],
+                    'search_terms': [f'term{i}' for i in range(12)],
+                    'completion_criteria': [],
+                    'extra_field_ignored': True,
+                }))
+            if instructions.startswith('너는 문서 근거 추출기다.'):
+                keys = [s['key'] for s in data['sources']]
+                if any(k.endswith('chk_1') for k in keys):
+                    return ModelReply(content='{"sections":[]}')
+                return ModelReply(content=json.dumps({
+                    'sections': [{'heading': '핵심 근거', 'body': 'Function0(int value) returns TRUE.', 'refs': ['chk_0'], 'labels': []}]
+                }))
+            if '답변을 원문과 계획에 대조' in instructions:
+                self.verified_sources.append([s['key'] for s in data['sources']])
+                return ModelReply(content=json.dumps({'satisfied': True, 'missing_requirements': [], 'unsupported_claims': []}))
+            return await super().complete(**kwargs)
+
+    docs = Documents(2)
+    docs.search = lambda doc_id, query, limit=5: asyncio.sleep(0, result={'results': [{'chunk_id': 'chk_0'}, {'chunk_id': 'chk_1'}]})
+    repo, model, _, o = setup(tmp_path, ChunkSelectiveModel(), docs)
+    o._groups = lambda task: [[{'key': k, 'part': 1, 'content': task.evidence[k].content, 'source': task.evidence[k].source}] for k in task.selected_keys]
+    res = await o.create('a', 'hd2ai-admin', 'Function0 근거 알려줘', ['doc_sdk'])
+    await o.tasks[res['job_id']]
+    task = repo.load(res['job_id'])
+    assert task.status == 'completed'
+    assert len(task.plan.search_terms) == 8
+    assert model.verified_sources == [['doc_sdk/chk_0']]
+    assert 'Function0' in task.answer
+
+
+@pytest.mark.asyncio
+async def test_final_composition_streams_answer_incrementally_after_reasoning(tmp_path):
+    from app.runtime.document_analysis import AnalysisStore
+    from app.runtime.tasks.composition import _DraftStreamRenderer
+    from app.runtime.tasks.domain import Task, BudgetLedger, Plan
+    from app.runtime.tasks.ports import JsonTaskRepository
+    repo = JsonTaskRepository(AnalysisStore(str(tmp_path)), time.time)
+    task = Task(
+        job_id='ana_' + '9' * 32,
+        owner_id='a',
+        service_id='hd2ai-admin',
+        question='요약',
+        document_ids=['doc_sdk'],
+        created_at=0,
+        updated_at=0,
+        budget=BudgetLedger(deadline=9999999999),
+    )
+    task.apply_plan(Plan(objective='요약', intent='summary', scope='all', required_outputs=['요약'], completion_criteria=['근거']))
+    repo.save(task)
+
+    ticks = [0.0]
+    renderer = _DraftStreamRenderer(task, repo, lambda: ticks[0])
+    chunks = [
+        '{"sections":[{"heading":"문서 개',
+        '요","body":"첫 번째 줄\\n두 번',
+        '째 줄","refs":["doc_sdk/chk_0"],"labels":[]}]}',
+    ]
+    for i, c in enumerate(chunks, 1):
+        ticks[0] = float(i)
+        renderer.feed(c)
+    renderer.flush()
+    assert '### 문서 개요' in task.answer
+    assert '첫 번째 줄\n두 번째 줄' in task.answer
+    assert 'doc_sdk/chk_0' not in task.answer
+    assert repo.load(task.job_id).answer == task.answer
+
+
+@pytest.mark.asyncio
+async def test_dynamic_topic_summary_and_chunk_verifier_filters_other_chapter_terms(tmp_path):
+    from app.runtime.document_analysis import AnalysisStore
+    from app.runtime.tasks.domain import Task, BudgetLedger, Plan, Evidence
+    from app.runtime.tasks.ports import JsonTaskRepository
+    from app.runtime.tasks.services import AnswerVerifier, RequestPlanner
+
+    repo = JsonTaskRepository(AnalysisStore(str(tmp_path)), time.time)
+    task = Task(
+        job_id='ana_' + '8' * 32,
+        owner_id='a',
+        service_id='hd2ai-admin',
+        question='위의 내용에서 매매전략과 실행 방안에 대해 요약 후 보고',
+        document_ids=['doc_stock'],
+        created_at=0,
+        updated_at=0,
+        budget=BudgetLedger(deadline=9999999999),
+    )
+    task.apply_plan(Plan(
+        objective='매매전략과 실행 방안 요약',
+        intent='summary',
+        scope='relevant',
+        entity_type='general',
+        required_outputs=['매매전략 요약', '실행 방안 요약'],
+        search_terms=['매매전략', '실행', '분할 매수', '손절', '익절'],
+        completion_criteria=['근거 기반 요약'],
+    ))
+    repo.save(task)
+
+    class StrictChunkVerifierModel:
+        async def complete(self, **kwargs):
+            return ModelReply(content=json.dumps({
+                'satisfied': False,
+                'missing_requirements': ['손절', '익절', '분할 매수'],
+                'unsupported_claims': [],
+            }))
+
+    invoker = ModelInvoker(StrictChunkVerifierModel(), repo, time.time)
+    verifier = AnswerVerifier(invoker)
+    draft = Draft(sections=[Section(heading='서론 요약', body='급등주 시장의 기본 특징을 설명한다.', refs=['doc_stock/chk_0008'], labels=['서론 개념'])])
+    sources = [{'key': 'doc_stock/chk_0008', 'part': 1, 'content': '급등주 시장의 기본 특징과 변동성 소개.', 'source': {'page': 8}}]
+    verdict = await verifier.verify(task, draft, sources)
+    assert verdict.satisfied is True
+    assert verdict.missing_requirements == []
+

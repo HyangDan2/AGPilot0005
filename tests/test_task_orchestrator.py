@@ -32,7 +32,13 @@ class Model:
         self.requests = []
     async def complete(self, **kwargs):
         self.requests.append(kwargs)
-        instructions = kwargs['task_instructions']; data = json.loads(kwargs['messages'][0].content)
+        raw_msg = kwargs['messages'][0].content
+        if 'task_instructions' in kwargs and kwargs['task_instructions'] is not None:
+            instructions = kwargs['task_instructions']
+            data = json.loads(raw_msg)
+        else:
+            instructions, raw_json = raw_msg.split('\n\n[입력 데이터]\n', 1)
+            data = json.loads(raw_json)
         if '자연어 문서 작업을 계획' in instructions:
             value = {'objective':'SDK의 모든 함수 설명', 'intent':self.intent, 'scope':self.scope,
                      'required_outputs':['함수/인자/반환값/출처'], 'search_terms':['Function0'], 'completion_criteria':['모든 함수 포함']}
@@ -294,3 +300,32 @@ def test_api_completion_preserves_case_sensitive_source_symbols(tmp_path):
     with pytest.raises(ValueError,match='extraction_inventory_incomplete'):t.complete()
     t.drafts['group'].sections[0].heading='Function0'
     t.complete();assert t.status=='completed'
+
+
+@pytest.mark.asyncio
+async def test_beta_and_public_services_route_to_orchestrator_with_public_instruction_fallback(tmp_path):
+    import httpx
+    from app.main import app
+    from app.runtime.tasks.bootstrap import AnalysisServices
+    from app.runtime.document_analysis import analysis_manager
+    repo,model,docs,o=setup(tmp_path)
+    previous=getattr(app.state,'analysis_services',None)
+    app.state.analysis_services=AnalysisServices(analysis_manager,o,repo.store)
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app),base_url='http://test') as c:
+            for svc in ('hd2ai-beta', 'hd2ai-public'):
+                h={'X-HD2Lab-User':'a','X-HD2Lab-Service':svc}
+                r=await c.post('/api/v1/agent/runs',headers=h,json={'message':'요약','context_refs':['doc_sdk'],'stream':True})
+                assert 'event: run.deferred' in r.text
+                deferred=json.loads(r.text.split('event: run.deferred\ndata: ')[1].strip())
+                await o.tasks[deferred['job_id']]
+                status=await c.get('/api/v1/agent/analyses/'+deferred['job_id'],headers=h)
+                assert status.json()['status']=='completed'
+            # Public route must not send task_instructions and enforces 2-doc limit
+            pub_reqs=[req for req in model.requests if 'task_instructions' not in req]
+            assert len(pub_reqs)>0
+            with pytest.raises(ValueError,match='invalid_task_request'):
+                await o.create('a','hd2ai-public','요약',['d1','d2','d3'])
+    finally:
+        if previous is None:del app.state.analysis_services
+        else:app.state.analysis_services=previous

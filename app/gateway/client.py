@@ -86,6 +86,7 @@ class AIGatewayClient:
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         task_instructions: Optional[str] = None,
+        include_persona: Optional[bool] = None,
         response_format: Optional[Dict[str, Any]] = None,
         _structured: bool = False,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
@@ -114,6 +115,8 @@ class AIGatewayClient:
             req_body["reasoning_effort"] = reasoning_effort
         if task_instructions is not None:
             req_body["task_instructions"] = task_instructions
+        if include_persona is not None:
+            req_body["include_persona"] = include_persona
         if response_format is not None:
             req_body["response_format"] = response_format
         if tools:

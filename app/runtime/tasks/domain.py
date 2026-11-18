@@ -67,7 +67,7 @@ class Section(BaseModel):
 
 class Draft(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    sections: list[Section] = Field(min_length=1, max_length=40)
+    sections: list[Section] = Field(default_factory=list, max_length=40)
 
     def render(self):
         return '\n\n'.join('### ' + s.heading + '\n\n' + s.body + ('\n\n출처: ' + ', '.join('[' + r + ']' for r in s.refs) if s.refs else '') for s in self.sections)
@@ -156,9 +156,13 @@ class Task(BaseModel):
                 'reply': self.public_reply.model_dump() if self.public_reply else None}
         return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
+    def non_empty_drafts(self):
+        return {k: d for k, d in self.drafts.items() if d.sections}
+
     def requires_composition(self):
+        active = self.non_empty_drafts()
         return bool(self.plan and (self.plan.intent in ('summary', 'compare') or
-                    (len(self.drafts) > 1 and not (self.plan.intent == 'extract' and self.plan.entity_type == 'api'))))
+                    (len(active) > 1 and not (self.plan.intent == 'extract' and self.plan.entity_type == 'api'))))
 
     def composition_signature(self):
         data = {'plan': self.plan.model_dump() if self.plan else None,
@@ -174,7 +178,7 @@ class Task(BaseModel):
             raise ValueError('invalid_task_transition')
         if plan.scope != 'none' and not self.document_ids:
             raise ValueError('plan_requires_document')
-        if plan.intent in ('summary', 'extract', 'compare') and plan.scope != 'all':
+        if plan.intent == 'extract' and plan.entity_type == 'api' and plan.scope != 'all':
             raise ValueError('incomplete_document_plan')
         self.plan = plan
         self.status = 'running'
@@ -195,7 +199,7 @@ class Task(BaseModel):
             self.status = 'needs_input' if expected == 'clarification' else 'completed'
             self.error_code = None
             return
-        if set(self.verified_groups) != set(self.drafts) or not self.drafts:
+        if set(self.verified_groups) != set(self.drafts) or not self.drafts or not self.non_empty_drafts():
             raise ValueError('unverified_answer')
         if self.plan.scope != 'none':
             required = set(self.selected_keys)
@@ -205,7 +209,7 @@ class Task(BaseModel):
                 raise ValueError('coverage_incomplete')
         if self.requires_composition():
             v = self.final_verification
-            if (not self.final_draft or not v or not v.satisfied or v.missing_requirements or
+            if (not self.final_draft or not self.final_draft.sections or not v or not v.satisfied or v.missing_requirements or
                     v.unsupported_claims or self.final_signature != self.composition_signature()):
                 raise ValueError('final_answer_unverified')
             headings = [re.sub(r'\s+', '', s.heading).casefold() for s in self.final_draft.sections]
@@ -213,7 +217,7 @@ class Task(BaseModel):
                 raise ValueError('final_answer_repeated_headings')
             self.answer = self.final_draft.render()
         else:
-            self.answer = '\n\n'.join(d.render() for d in self.drafts.values())
+            self.answer = '\n\n'.join(d.render() for d in self.drafts.values() if d.sections)
         if any(name not in self.answer for name in self.inventory):
             self.answer = None
             raise ValueError('extraction_inventory_incomplete')

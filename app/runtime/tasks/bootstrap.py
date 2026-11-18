@@ -13,7 +13,7 @@ class AnalysisServices:
         self.legacy, self.orchestrator, self.store = legacy, orchestrator, store
 
     async def create(self, owner, service, message, refs, history=None, analysis_refs=None, session_id=None, reasoning_effort='off'):
-        if service != 'hd2ai-admin':
+        if service not in ('hd2ai-admin', 'hd2ai-beta', 'hd2ai-public'):
             return await self.legacy.create(owner, service, message, refs, reasoning_effort=reasoning_effort)
         refs = list(dict.fromkeys(refs))
         modern = []

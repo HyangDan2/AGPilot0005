@@ -22,7 +22,7 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
     owner = request.headers.get("X-HD2Lab-User") or "default_user"
     if any(m.get('role') not in ('user', 'assistant') or set(m) - {'role', 'content'} for m in req.history) or len(json.dumps(req.history, ensure_ascii=False).encode()) > 24000:
         raise HTTPException(422, 'invalid_task_history')
-    if service_id == 'hd2ai-admin' and (req.context_refs or req.analysis_refs):
+    if service_id in ('hd2ai-admin', 'hd2ai-beta', 'hd2ai-public') and (req.context_refs or req.analysis_refs):
         try:
             job = await services(request.app).create(owner, service_id, req.message, req.context_refs, req.history, req.analysis_refs,
                 session_id=req.session_id, reasoning_effort=(req.options.reasoning_effort if req.options else None) or 'off')

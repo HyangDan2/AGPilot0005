@@ -3,7 +3,7 @@ import asyncio
 import hashlib
 import re
 import uuid
-from .domain import AccessContext, Task, BudgetLedger, Evidence, BudgetExceeded
+from .domain import AccessContext, Task, BudgetLedger, Evidence, Draft, Verification, BudgetExceeded
 from .ports import ScopedDocuments
 from .services import estimate
 from .progress import TaskProgress
@@ -30,7 +30,8 @@ class TaskOrchestrator:
 
     async def create(self, owner, service, question, refs, history=None, analysis_refs=None, session_id=None, reasoning_effort='off'):
         refs = list(dict.fromkeys(refs))
-        if not question.strip() or len(question.encode()) > 1024 * 1024 or len(refs) > 10:
+        max_docs = 2 if service == 'hd2ai-public' else 10
+        if not question.strip() or len(question.encode()) > 1024 * 1024 or len(refs) > max_docs:
             raise ValueError('invalid_task_request')
         if any(not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', x) for x in refs):
             raise ValueError('invalid_document_reference')
@@ -50,7 +51,7 @@ class TaskOrchestrator:
             task.document_ids = list(dict.fromkeys(task.document_ids + previous.document_ids))
             task.evidence.update({k:v.model_copy(update={'snapshot_id':previous.snapshots.get(v.doc_id, '')})
                                   for k,v in previous.evidence.items()})
-        if len(task.document_ids) > 10:
+        if len(task.document_ids) > max_docs:
             raise ValueError('too_many_documents')
         self.repository.save(task)
         self._start(task.job_id)
@@ -171,8 +172,9 @@ class TaskOrchestrator:
             task.selected_keys = all_keys
         elif not task.selected_keys:
             ranked_scores: dict[str, float] = {}
+            search_queries = list(dict.fromkeys((task.plan.search_terms or []) + [task.plan.objective]))[:6]
             for doc_id in task.document_ids:
-                for term in (task.plan.search_terms or [task.plan.objective])[:3]:
+                for term in search_queries[:3 if not task.plan.search_terms else 6]:
                     result = await self._document(task, 'search', doc_id, term, 5)
                     for idx, x in enumerate(result.get('results', [])):
                         cid = x.get('chunk_id')
@@ -180,9 +182,23 @@ class TaskOrchestrator:
                             continue
                         key = doc_id + '/' + cid
                         score = float(x.get('score') or 0.0) + (1.0 / (idx + 1))
-                        if key not in ranked_scores or score > ranked_scores[key]:
-                            ranked_scores[key] = score
-            top_keys = {k for k, _ in sorted(ranked_scores.items(), key=lambda item: item[1], reverse=True)[:8]}
+                        ranked_scores[key] = ranked_scores.get(key, 0.0) + score
+            if task.evidence:
+                query_tokens = [
+                    t.casefold()
+                    for raw in (list(task.plan.search_terms) + list(task.plan.required_outputs) + [task.plan.objective])
+                    for t in re.findall(r'[0-9A-Za-z가-힣_]{2,}', raw)
+                ]
+                distinct_tokens = list(dict.fromkeys(query_tokens))
+                for key, ev in task.evidence.items():
+                    if key not in all_keys:
+                        continue
+                    text_lower = ev.content.casefold()
+                    hits = sum(1 for t in distinct_tokens if t in text_lower)
+                    if hits > 0:
+                        ranked_scores[key] = ranked_scores.get(key, 0.0) + hits * 1.5
+            limit_k = 12 if len(all_keys) > 12 else 8
+            top_keys = {k for k, _ in sorted(ranked_scores.items(), key=lambda item: item[1], reverse=True)[:limit_k]}
             task.selected_keys = [k for k in all_keys if k in top_keys]
             if not task.selected_keys:
                 # Search can miss phrasing. Escalate within the same task and ledger.
@@ -211,14 +227,25 @@ class TaskOrchestrator:
 
     def _groups(self, task):
         if task.plan.scope == 'none': return [[]]
+        part_chars, group_limit = 2800, 4300
+        try:
+            from app.core.runtime_config import get_runtime_config, resolve_route_budget
+            cfg = get_runtime_config()
+            if any(b.gateway_contract is not None for b in cfg.token_budgets.values()):
+                eff_in = resolve_route_budget(getattr(task, 'service_id', None)).input_budget_tokens
+                if eff_in >= 20000:
+                    part_chars = 5600
+                    group_limit = min(12000, max(4300, int(eff_in * 0.25)))
+        except Exception:
+            pass
         groups, group, size = [], [], 0
         # Source parts stay lossless; grouping is an execution policy, not summarization.
         for key in task.selected_keys:
             item = task.evidence[key]
-            parts = [item.content[i:i+2800] for i in range(0, len(item.content), 2800)] or ['']
+            parts = [item.content[i:i+part_chars] for i in range(0, len(item.content), part_chars)] or ['']
             for index, content in enumerate(parts):
                 width = estimate(content) + len(key) + 100
-                if group and size + width > 4300:
+                if group and size + width > group_limit:
                     groups.append(group); group, size = [], 0
                 group.append({'key': key, 'part': index + 1, 'content': content, 'source': item.source})
                 size += width
@@ -242,6 +269,13 @@ class TaskOrchestrator:
                     draft = await self.writer.write(task, sources, repair)
                     task.drafts[group_id] = draft
                     self.repository.save(task)
+                if not draft.sections:
+                    task.status = 'verifying'
+                    verification = Verification(satisfied=True, missing_requirements=[], unsupported_claims=[])
+                    task.verification_reports[group_id] = verification
+                    task.record_verification(group_id, verification)
+                    self.repository.save(task)
+                    break
                 task.status = 'verifying'
                 self.progress.phase(task, 'verify', '원문 근거 대조')
                 self.repository.save(task)
@@ -253,12 +287,28 @@ class TaskOrchestrator:
                     self.repository.save(task)
                     break
                 if attempt >= self.max_answer_repairs:
+                    if len(groups) > 1 and not verification.unsupported_claims and not any(s.get('focus') for s in sources):
+                        task.drafts[group_id] = Draft(sections=[])
+                        fallback_v = Verification(satisfied=True, missing_requirements=[], unsupported_claims=[])
+                        task.verification_reports[group_id] = fallback_v
+                        task.record_verification(group_id, fallback_v)
+                        self.repository.save(task)
+                        break
                     raise ValueError('answer_requirements_unsatisfied')
                 task.answer_repairs += 1
                 self.repository.save(task)
                 repair = verification.model_dump()
             else:
                 raise ValueError('answer_requirements_unsatisfied')
+        if not task.non_empty_drafts():
+            if task.plan.scope == 'relevant' and task.replans < self.max_replans:
+                task.replans += 1
+                task.plan = task.plan.model_copy(update={'scope': 'all', 'revision': task.plan.revision + 1})
+                self.repository.save(task)
+                await self._select(task)
+                await self._read(task)
+                return await self._answer(task)
+            raise ValueError('answer_requirements_unsatisfied')
         if task.requires_composition():
             if self.composer is None:
                 raise ValueError('final_answer_composer_unavailable')
@@ -285,7 +335,16 @@ class TaskOrchestrator:
                     if task.plan is None:
                         task.status = 'planning'
                         self.progress.phase(task, 'planning', '요청 의도 확인')
-                        metadata = [{'doc_id': d, 'headings': []} for d in task.document_ids]
+                        metadata = []
+                        for d in task.document_ids:
+                            cached_headings = []
+                            for ev in task.evidence.values():
+                                if ev.doc_id == d:
+                                    for m in re.findall(r'^(?:#+\s*|PART\s+\d+[^\n]*|Chapter\s+\d+[^\n]*)', ev.content, re.M):
+                                        h = m.lstrip('#').strip()[:120]
+                                        if h and h not in cached_headings and len(cached_headings) < 30:
+                                            cached_headings.append(h)
+                            metadata.append({'doc_id': d, 'headings': cached_headings})
                         await self.planner.plan(task, metadata)
                         self.repository.save(task)
                     if task.plan.scope == 'none':
