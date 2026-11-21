@@ -146,3 +146,7 @@ sudo systemctl restart hd2lab-agcore.service
 - [HD2AI integration (docs/HD2AI_INTEGRATION.md)](docs/HD2AI_INTEGRATION.md)
 - [Operations (docs/OPERATIONS.md)](docs/OPERATIONS.md) and [QA (docs/QA.md)](docs/QA.md)
 - [OpenAPI schema (docs/openapi.json)](docs/openapi.json)
+
+### Answer model attribution
+
+Completed run events, run status and document analysis status expose an optional `model_label`. It identifies the final answer model reported by Gateway, including failover. Planning and verification calls never override attribution. Unknown or mixed attribution is null.

@@ -65,6 +65,7 @@ class TaskOrchestrator:
                 'total_chunks': len(selected), 'model_calls': task.budget.model_calls,
                 'document_calls': task.budget.document_calls,
                 'answer': '이전 버전의 응답 오류입니다. 질문을 다시 보내 주세요.' if leaked else task.answer,
+                'model_label': task.model_label if task.status in ('completed', 'needs_input') and not leaked else None,
                 'answer_kind': 'invalid' if leaked else task.public_reply.kind if task.public_reply else 'answer',
                 'phase': task.phase, 'events': task.events, 'reasoning_text': task.reasoning_text,
                 'citations': self.presenter.citations(task), 'error_code': task.error_code,
@@ -274,7 +275,9 @@ class TaskOrchestrator:
                 draft = task.drafts.get(group_id) if attempt == 0 else None
                 if draft is None:
                     self.progress.phase(task, 'write', '근거 묶음 답변 작성')
+                    task._last_model_label = None
                     draft = await self.writer.write(task, sources, repair)
+                    task.draft_model_labels[group_id] = task._last_model_label
                     task.drafts[group_id] = draft
                     self.repository.save(task)
                 if not draft.sections:
@@ -321,6 +324,9 @@ class TaskOrchestrator:
             if self.composer is None:
                 raise ValueError('final_answer_composer_unavailable')
             await self.composer.compose(task)
+        if not task.requires_composition():
+            labels = {task.draft_model_labels.get(group_id) for group_id, draft in task.drafts.items() if draft.sections}
+            task.model_label = next(iter(labels)) if len(labels) == 1 else None
         task.status = 'verifying'
         task.complete()
         task.answer = self.presenter.render(task)

@@ -225,6 +225,7 @@ class AgentRunner:
             await session.emit("run.completed", {
                 'citations': state.citations, 'answer_kind': 'answer',
                 "answer": state.final_answer or "",
+                "model_label": state.model_label,
                 "total_steps": state.step_count,
                 "total_tool_calls": state.tool_call_count,
                 "duration_seconds": round(session.finished_at - start_time, 2),

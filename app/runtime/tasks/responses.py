@@ -14,6 +14,7 @@ class ConversationResponder:
     async def respond(self, task):
         repair = None
         last_valid_reply = None
+        last_valid_label = None
         for _ in range(3):
             body = await self.invoker.typed(task, '''사용자에게 직접 답하는 응답을 한국어로 작성하세요. JSON만 반환하세요.
 형식: {"content":"사용자에게 실제로 건네는 문장"}.
@@ -30,6 +31,7 @@ intent=clarify이면 실제 작업에 필요한 빠진 정보 한 가지만 구�
                 repair = {'problem': '내부 목표를 복사하지 말고 사용자에게 직접 답하세요.'}
                 continue
             last_valid_reply = reply
+            last_valid_label = task._last_model_label
             verdict = await self.invoker.typed(task, '''사용자 응답을 검증하세요. JSON만 반환하세요.
 형식: {"satisfied":true|false,"missing_requirements":[],"unsupported_claims":[]}.
 원래 사용자 발화에 직접 응답하는지 확인하세요. 내부 계획을 설명하거나 수행 지시문만 출력하면 false입니다.
@@ -39,11 +41,13 @@ clarify이면 필요한 누락 정보에 대한 실제 질문이어야 합니다
                  'answer': reply.model_dump()}, Verification, max_tokens=1024)
             if verdict.satisfied and not verdict.missing_requirements and not verdict.unsupported_claims:
                 task.public_reply, task.reply_verification = reply, verdict
+                task.model_label = last_valid_label
                 task.reply_signature = task.response_signature()
                 return
             repair = verdict.model_dump()
         if last_valid_reply is not None:
             task.public_reply = last_valid_reply
+            task.model_label = last_valid_label
             task.reply_verification = Verification(satisfied=True, missing_requirements=[], unsupported_claims=[])
             task.reply_signature = task.response_signature()
             return

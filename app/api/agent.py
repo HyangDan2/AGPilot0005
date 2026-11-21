@@ -70,7 +70,7 @@ async def get_agent_run(run_id: str, request: Request):
     if job_id:
         job = services(request.app).get(job_id, request.headers.get('X-HD2Lab-User') or 'default_user', request.headers.get('X-HD2Lab-Service', 'hd2ai-admin'))
         if job is None: raise HTTPException(404, 'Run not found')
-        return AgentRunResponse(run_id=run_id, agent_id='general-agent', status=job['status'], answer=job['answer'],
+        return AgentRunResponse(run_id=run_id, agent_id='general-agent', status=job['status'], answer=job['answer'], model_label=job.get('model_label'),
             usage={'job_id':job_id,'model_calls':job['model_calls'],'document_calls':job.get('document_calls',0)},
             created_at=job['created_at'], error={'code':job['error_code'],'message':job['error_code']} if job['error_code'] else None)
     session = runner.get_session(run_id)
@@ -84,6 +84,7 @@ async def get_agent_run(run_id: str, request: Request):
         session_id=state.session_id,
         status=state.status,
         answer=state.final_answer,
+        model_label=state.model_label if state.status == "completed" else None,
         traces=state.traces,
         usage={
             "steps": state.step_count,

@@ -31,6 +31,7 @@ class ToolExecutionTrace(BaseModel):
     error_message: Optional[str] = None
 
 class AgentRunResponse(BaseModel):
+    model_label: Optional[str] = None
     run_id: str
     agent_id: str
     session_id: Optional[str] = None

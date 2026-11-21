@@ -94,6 +94,7 @@ class ModelInvoker:
         allow_empty_sections=False,
         on_content_delta=None,
     ):
+        task._last_model_label = None
         payload = dict(data)
         target_schema = (_NonEmptyDraft if not allow_empty_sections else Draft) if schema is Draft else schema
         for attempt in range(2):
@@ -256,6 +257,7 @@ class ModelInvoker:
                     diag['failure_reason'] = reason
                     self._record_diagnostic(task, diag)
                     raise ValueError(reason) from parse_exc
+                task._last_model_label = getattr(reply, "model_label", None)
                 diag['parse_ok'] = True
                 self._record_diagnostic(task, diag)
                 self.progress.event(task, 'model', '모델 응답 처리', status='done', item_id=call_id,

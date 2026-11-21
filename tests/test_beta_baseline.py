@@ -44,13 +44,14 @@ async def test_typed_stream_keeps_reasoning_separate_and_context_metadata():
     async def handler(request):
         frames=[{'choices':[{'delta':{'reasoning_content':'짧은 검토 요약'}}]},
                 {'choices':[{'delta':{'content':'{"answer":"완료"}'},'finish_reason':'stop'}]},
-                {'context_truncated':False,'usage':{'total_tokens':12}}]
+                {'gateway_complete':True,'model_label':'fallback-model','context_truncated':False,'usage':{'total_tokens':12}}]
         return httpx.Response(200,text=''.join('data: '+json.dumps(f,ensure_ascii=False)+'\n\n' for f in frames)+'data: [DONE]\n\n')
     client=AIGatewayClient();client._get_transport=lambda:httpx.MockTransport(handler)
     thinking=[]
     reply=await client.complete(messages=[],stream=True,reasoning_effort='low',on_reasoning_delta=thinking.append)
     assert thinking==['짧은 검토 요약'] and reply.content=='{"answer":"완료"}'
     assert reply.usage.total_tokens==12 and not reply.context_truncated
+    assert reply.model_label == 'fallback-model'
 
 
 @pytest.mark.asyncio
@@ -120,3 +121,20 @@ async def test_gateway_sse_error_is_not_misreported_as_empty_answer(monkeypatch)
     with pytest.raises(GatewayStreamError) as error:
         await client.complete(messages=[],stream=True)
     assert error.value.code=='upstream_error' and 'PRIVATE_PROVIDER_BODY' not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_document_response_model_excludes_planning_and_verification(tmp_path):
+    class Models(Model):
+        async def complete(self, **kwargs):
+            reply = await super().complete(**kwargs)
+            instructions = kwargs.get('task_instructions', '')
+            label = 'answer-model' if '사용자에게 직접 답하는 응답' in instructions else 'other-model'
+            return reply.model_copy(update={'model_label': label})
+
+    repo, _, _, runner = setup(tmp_path, Models(intent='conversation', scope='none'))
+    job = await runner.create('owner', 'hd2ai-admin', '이전 대화에 답해 주세요.', ['doc_sdk'])
+    await runner.tasks[job['job_id']]
+    final = runner.get(job['job_id'], 'owner', 'hd2ai-admin')
+    assert final['status'] == 'completed' and final['model_label'] == 'answer-model'
+    assert repo.load(job['job_id']).model_label == 'answer-model'

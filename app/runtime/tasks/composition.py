@@ -353,6 +353,7 @@ class AnswerComposer:
             if self._fits(task, inputs, True):
                 node = await self._node(task, inputs, True)
                 task.final_draft = node.draft
+                task.model_label = node.model_label
                 task.final_verification = node.verification
                 task.final_signature = task.composition_signature()
                 self.repository.save(task)
@@ -451,6 +452,7 @@ class AnswerComposer:
                     else (task.reasoning_effort if final else 'off')
                 )
                 streamer = _DraftStreamRenderer(task, self.repository, self.invoker.clock) if final else None
+                task._last_model_label = None
                 node.draft = await self.invoker.typed(
                     task,
                     COMPOSE,
@@ -462,6 +464,7 @@ class AnswerComposer:
                     request_id=attempt_req_id,
                     on_content_delta=streamer.feed if streamer else None,
                 )
+                node.model_label = task._last_model_label
                 if streamer:
                     streamer.flush()
                 self.repository.save(task)

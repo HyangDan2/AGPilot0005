@@ -26,6 +26,7 @@ class AgentState(BaseModel):
     status: Literal["queued", "running", "completed", "failed", "cancelled"] = "queued"
     pending_tool_calls: List[ToolCall] = Field(default_factory=list)
     final_answer: Optional[str] = None
+    model_label: Optional[str] = None
     error: Optional[Dict[str, str]] = None
     
     # Traces & Events

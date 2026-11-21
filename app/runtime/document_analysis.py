@@ -124,6 +124,7 @@ class DocumentAnalysisManager:
             "processed_chunks": len(job["processed_chunk_ids"]),
             "total_chunks": len(job["entries"]),
             "model_calls": job["model_calls"],
+            "model_label": job.get("model_label") if job["status"] == "completed" else None,
             "answer": answer, 'citations': citations, "error_code": job["error_code"],
             'reasoning_text': job.get('reasoning_text', ''),
             "created_at": job["created_at"], "updated_at": job["updated_at"],
@@ -234,6 +235,12 @@ class DocumentAnalysisManager:
                     if time.time() - job.get('_answer_saved', 0) >= .2:
                         job['_answer_saved'] = time.time(); self._save(job)
                 use_stream = effort != 'off' or stream_answer
+                model_label = None
+
+                def capture_label(label):
+                    nonlocal model_label
+                    model_label = label
+
                 content, calls, finish = await gateway_client.execute(
                     messages=[GatewayMessage(role="user", content=prompt)],
                     tools=None, tool_choice="none", stream=use_stream,
@@ -241,7 +248,7 @@ class DocumentAnalysisManager:
                     max_tokens=max_tokens,
                     reasoning_effort=effort,
                     **({'on_reasoning_delta':thinking} if effort!='off' else {}),
-                    **({'on_content_delta':answer_delta} if stream_answer else {}),
+                    **({'on_content_delta':answer_delta, 'on_model_label':capture_label} if stream_answer else {}),
                 )
                 if calls:
                     raise ValueError("unexpected_model_tool_call")
@@ -250,7 +257,10 @@ class DocumentAnalysisManager:
                         max_tokens = min(output_ceiling, max_tokens * 2)
                         continue
                     raise ValueError('model_output_truncated')
-                return _clean_answer(content)
+                answer = _clean_answer(content)
+                if stream_answer:
+                    job["model_label"] = model_label
+                return answer
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 if status == 422:

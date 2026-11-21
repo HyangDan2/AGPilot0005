@@ -51,3 +51,4 @@ class ModelReply(BaseModel):
     usage: Optional[ModelUsage] = None
     reasoning_length: int = 0
     stream_incomplete: bool = False
+    model_label: Optional[str] = None

@@ -44,6 +44,12 @@ def _separate_think_tags(text: Optional[str]) -> Tuple[str, str]:
     return cleaned, "".join(reasoning_parts)
 
 
+def safe_model_label(value):
+    if isinstance(value, str) and '://' not in value and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}', value):
+        return value
+    return None
+
+
 class AIGatewayClient:
     def __init__(
         self,
@@ -89,6 +95,7 @@ class AIGatewayClient:
         include_persona: Optional[bool] = None,
         response_format: Optional[Dict[str, Any]] = None,
         _structured: bool = False,
+        on_model_label=None,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         """
         Executes a completion through AI Gateway.
@@ -127,9 +134,9 @@ class AIGatewayClient:
         try:
             async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(timeout_seconds or settings.RUN_TIMEOUT_SECONDS, connect=5)) as client:
                 if stream:
-                    return await self._stream_request(client, url, req_body, on_content_delta, codec, on_reasoning_delta, _structured)
+                    return await self._stream_request(client, url, req_body, on_content_delta, codec, on_reasoning_delta, _structured, on_model_label)
                 else:
-                    return await self._unary_request(client, url, req_body, codec, structured=_structured, on_reasoning_delta=on_reasoning_delta)
+                    return await self._unary_request(client, url, req_body, codec, structured=_structured, on_reasoning_delta=on_reasoning_delta, on_model_label=on_model_label)
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, httpx.HTTPError, OSError) as e:
             if not self.mock_mode and not settings.ALLOW_MOCK_FALLBACK:
                 raise
@@ -150,10 +157,14 @@ class AIGatewayClient:
         codec: ToolNameCodec,
         structured: bool = False,
         on_reasoning_delta: Optional[Any] = None,
+        on_model_label=None,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         r = await client.post(url, json=body, headers=self._get_headers())
         r.raise_for_status()
         data = r.json()
+        model_label = safe_model_label(data.get("model_label"))
+        if on_model_label:
+            on_model_label(model_label)
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
         raw_content = msg.get("content") if isinstance(msg.get("content"), str) else None
@@ -183,6 +194,7 @@ class AIGatewayClient:
                 usage=data.get("usage"),
                 reasoning_length=len(full_reasoning),
                 stream_incomplete=False,
+                model_label=model_label,
             )
         return content, decoded, finish_reason
 
@@ -195,6 +207,7 @@ class AIGatewayClient:
         codec: ToolNameCodec,
         on_reasoning_delta=None,
         structured=False,
+        on_model_label=None,
     ) -> Tuple[Optional[str], List[ToolCall], str]:
         accumulator = ToolCallAccumulator()
         full_content = ""
@@ -203,6 +216,7 @@ class AIGatewayClient:
         usage = None
         reasoning_length = 0
         saw_done = False
+        model_label = None
 
         async with client.stream("POST", url, json=body, headers=self._get_headers()) as response:
             response.raise_for_status()
@@ -220,6 +234,8 @@ class AIGatewayClient:
                     raise GatewayStreamError(payload.get('code'))
                 context_truncated = context_truncated or bool(payload.get('context_truncated'))
                 usage = payload.get('usage') or usage
+                if payload.get('gateway_complete'):
+                    model_label = safe_model_label(payload.get('model_label'))
 
                 choice = payload.get("choices", [{}])[0] if payload.get("choices") else {}
                 delta = choice.get("delta", {})
@@ -259,6 +275,9 @@ class AIGatewayClient:
             finish_reason = "stream_interrupted"
         elif tool_calls and (not finish_reason or finish_reason == "stop"):
             finish_reason = "tool_calls"
+        model_label = model_label if saw_done else None
+        if on_model_label:
+            on_model_label(model_label)
         if structured:
             return ModelReply(
                 content=final_text,
@@ -268,6 +287,7 @@ class AIGatewayClient:
                 usage=usage,
                 reasoning_length=reasoning_length,
                 stream_incomplete=not saw_done,
+                model_label=model_label,
             )
         return final_text, tool_calls, finish_reason
 

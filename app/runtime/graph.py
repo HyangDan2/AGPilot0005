@@ -2,7 +2,7 @@
 import json
 from typing import Any, Dict, Literal
 from langgraph.graph import StateGraph, END
-from app.gateway.client import gateway_client
+from app.gateway.client import AIGatewayClient, gateway_client
 from app.runtime.context import context_manager
 from app.runtime.state import AgentState
 from app.runtime.public_grounding import public_outline_calls, public_section_calls, public_chunk_calls, public_grounded_messages
@@ -63,6 +63,13 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
         tools = [tool for tool in tools if tool.function.name == "document.get_outline"]
     
     # 3. Call Client (custom_client if provided, else default gateway_client)
+    model_label = None
+
+    def capture_label(label):
+        nonlocal model_label
+        model_label = label
+
+    label_options = {'on_model_label': capture_label} if isinstance(client, AIGatewayClient) else {}
     content, tool_calls, finish_reason = await client.execute(
         messages=pruned_msgs,
         tools=tools if not public_grounding and state.tool_call_count < state.max_tool_calls else None,
@@ -71,8 +78,10 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
         reasoning_effort=state.reasoning_effort,
         on_reasoning_delta=on_reasoning_delta,
         on_content_delta=on_delta,
+        **label_options,
     )
     if public_grounding and not content and not tool_calls:
+        model_label = None
         content, tool_calls, finish_reason = await client.execute(
             messages=pruned_msgs,
             tools=None,
@@ -81,6 +90,7 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
             reasoning_effort=state.reasoning_effort,
             on_reasoning_delta=on_reasoning_delta,
             on_content_delta=on_delta,
+            **label_options,
         )
     if public_grounding and not content and not tool_calls:
         raise RuntimeError("Public document answer was empty")
@@ -104,6 +114,7 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
     else:
         updates["status"] = "completed"
         updates["final_answer"] = content or ""
+        updates["model_label"] = model_label
         
     return updates
 

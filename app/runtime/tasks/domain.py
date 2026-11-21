@@ -97,6 +97,7 @@ class UserReply(BaseModel):
 
 class CompositionNode(BaseModel):
     """A resumable synthesis checkpoint; original drafts remain untouched."""
+    model_label: str | None = None
     draft: Draft | None = None
     verification: Verification | None = None
     attempts: int = 0
@@ -105,6 +106,9 @@ class CompositionNode(BaseModel):
 
 
 class Task(BaseModel):
+    model_label: str | None = None
+    draft_model_labels: dict[str, str | None] = Field(default_factory=dict)
+    _last_model_label: str | None = PrivateAttr(default=None)
     schema_version: int = 2
     job_id: str
     owner_id: str
