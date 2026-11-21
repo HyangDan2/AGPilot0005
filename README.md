@@ -50,7 +50,7 @@ Base path `/api/v1`.
 | `POST` | `/agent/runs/{run_id}/cancel` | Cancel a running agent |
 | `GET` | `/agents` | Registered agent profiles and their allowed tools |
 | `POST` | `/agent/analyses` | Owner-scoped persistent document analysis (`202`, `context_refs` 1–10) |
-| `GET` | `/agent/analyses/{job_id}` | Analysis state, plan progress and answer |
+| `GET` | `/agent/analyses/{job_id}` | Analysis state, plan progress and answer. Send `Accept: text/event-stream` for updates. |
 | `POST` | `/agent/analyses/{job_id}/resume` | Resume a paused analysis within its original budget |
 | `POST` | `/agent/analyses/{job_id}/cancel` | Cancel an analysis |
 | `GET` | `/config/agent` | Current runtime limits and per-route token budgets |
@@ -72,7 +72,7 @@ Full request/response payloads are in [docs/API_CONTRACT.md](docs/API_CONTRACT.m
 
 ### Document tasks
 
-Requests from `hd2ai-admin`, `hd2ai-beta` or `hd2ai-public` that carry `context_refs` or `analysis_refs` create a persistent Task and answer with `run.deferred` plus a job id; the `/agent/analyses/*` endpoints then read, resume or cancel it. The task runtime lives in `app/runtime/tasks/` (typed task/plan/budget/evidence state, planner, writer, verifier, answer composition and presentation). A final answer that fails verification stays `partial` or `needs_input` rather than publishing unverified or concatenated group text.
+Requests from `hd2ai-admin`, `hd2ai-beta` or `hd2ai-public` that carry `context_refs` or `analysis_refs` create a persistent Task and answer with `run.deferred` plus a job id; the `/agent/analyses/*` endpoints then read, resume or cancel it. With `Accept: text/event-stream`, the status endpoint emits `analysis.snapshot` events. Each event replaces the previous snapshot, including its answer. The stream ends on a terminal state. Clients can recover using the same job ID via the JSON status endpoint. The task runtime lives in `app/runtime/tasks/` (typed task/plan/budget/evidence state, planner, writer, verifier, answer composition and presentation). A final answer that fails verification stays `partial` or `needs_input` rather than publishing unverified or concatenated group text.
 
 ---
 

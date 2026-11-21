@@ -8,6 +8,7 @@ from .ports import ScopedDocuments
 from .services import estimate
 from .progress import TaskProgress
 from .presentation import AnswerPresenter
+from .draft_stream import DraftStreamRenderer
 
 
 class TaskOrchestrator:
@@ -265,6 +266,8 @@ class TaskOrchestrator:
         groups = self._groups(task)
         if task.plan.intent == 'extract' and task.plan.entity_type == 'api' and self.evidence_selector:
             groups = await self.evidence_selector.groups(task, groups)
+        stream_direct_answer = len(groups) == 1 and task.plan.intent not in ('summary', 'compare')
+        publish_verified_groups = task.plan.intent == 'extract' and task.plan.entity_type == 'api'
         for sources in groups:
             group_id = hashlib.sha256(str([(s['key'], s['part'], s.get('focus')) for s in sources]).encode()).hexdigest()
             if group_id in task.verified_groups: continue
@@ -276,7 +279,8 @@ class TaskOrchestrator:
                 if draft is None:
                     self.progress.phase(task, 'write', '근거 묶음 답변 작성')
                     task._last_model_label = None
-                    draft = await self.writer.write(task, sources, repair)
+                    preview = DraftStreamRenderer(task, self.repository, self.clock) if stream_direct_answer else None
+                    draft = await self.writer.write(task, sources, repair, **({'preview': preview} if preview else {}))
                     task.draft_model_labels[group_id] = task._last_model_label
                     task.drafts[group_id] = draft
                     self.repository.save(task)
@@ -295,6 +299,9 @@ class TaskOrchestrator:
                 self.repository.save(task)
                 if verification.satisfied:
                     task.record_verification(group_id, verification)
+                    if publish_verified_groups:
+                        verified = {key: value for key, value in task.drafts.items() if key in task.verified_groups}
+                        task.answer = self.presenter.render(task.model_copy(update={'drafts': verified, 'final_draft': None}))
                     self.repository.save(task)
                     break
                 if attempt >= self.max_answer_repairs:
@@ -385,6 +392,6 @@ class TaskOrchestrator:
             if not re.fullmatch(r'[a-z_0-9]{1,80}', latest.error_code): latest.error_code = 'task_contract_invalid'
             if latest.requires_composition():
                 latest.answer = None
-            elif latest.drafts:
+            else:
                 latest.answer = '\n\n'.join(d.render() for k, d in latest.drafts.items() if k in latest.verified_groups) or None
             self.repository.save(latest)

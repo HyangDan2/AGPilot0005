@@ -93,6 +93,7 @@ class ModelInvoker:
         include_persona=None,
         allow_empty_sections=False,
         on_content_delta=None,
+        on_content_start=None,
     ):
         task._last_model_label = None
         payload = dict(data)
@@ -108,6 +109,7 @@ class ModelInvoker:
                 request_id=request_id,
                 include_persona=include_persona,
                 on_content_delta=on_content_delta,
+                on_content_start=on_content_start,
             )
             try:
                 validated = target_schema.model_validate(value)
@@ -172,6 +174,7 @@ class ModelInvoker:
         request_id=None,
         include_persona=None,
         on_content_delta=None,
+        on_content_start=None,
     ):
         body = json.dumps(data, ensure_ascii=False)
         budget, has_contract = await self.budget_for(task)
@@ -185,6 +188,8 @@ class ModelInvoker:
         for attempt in range(5):
             if estimate(body) + estimate(instructions) + max_tokens + 1000 > effective_input_tokens:
                 raise BudgetExceeded('context_budget_exceeded')
+            if on_content_start is not None:
+                on_content_start()
             task.budget.reserve('model', self.clock())
             task.budget.estimated_input_tokens += estimate(body) + estimate(instructions)
             self.repository.save(task)
@@ -431,7 +436,7 @@ class AnswerWriter:
         self.invoker = invoker
         self.chunk_reasoning = chunk_reasoning
 
-    async def write(self, task, sources, repair=None):
+    async def write(self, task, sources, repair=None, preview=None):
         instructions = CHUNK_EXTRACT_PROMPT
         budget, has_contract = await self.invoker.budget_for(task) if hasattr(self.invoker, 'budget_for') else (None, False)
         effort = (task.reasoning_effort if (self.chunk_reasoning and task.plan.intent in ('lookup', 'extract')) else 'off')
@@ -446,7 +451,10 @@ class AnswerWriter:
             'repair': repair}, Draft,
             max_tokens=write_tokens,
             reasoning_effort=effort,
-            allow_empty_sections=True)
+            allow_empty_sections=True,
+            **({'on_content_delta': preview.feed, 'on_content_start': preview.reset} if preview else {}))
+        if preview:
+            preview.flush()
         allowed_keys = [s['key'] for s in sources if isinstance(s, dict) and s.get('key')]
         allowed_set = set(allowed_keys)
         for section in draft.sections:

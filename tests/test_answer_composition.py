@@ -249,7 +249,7 @@ async def test_empty_chunk_sections_skip_verifier_and_planner_auto_normalizes(tm
 @pytest.mark.asyncio
 async def test_final_composition_streams_answer_incrementally_after_reasoning(tmp_path):
     from app.runtime.document_analysis import AnalysisStore
-    from app.runtime.tasks.composition import _DraftStreamRenderer
+    from app.runtime.tasks.draft_stream import DraftStreamRenderer
     from app.runtime.tasks.domain import Task, BudgetLedger, Plan
     from app.runtime.tasks.ports import JsonTaskRepository
     repo = JsonTaskRepository(AnalysisStore(str(tmp_path)), time.time)
@@ -267,7 +267,7 @@ async def test_final_composition_streams_answer_incrementally_after_reasoning(tm
     repo.save(task)
 
     ticks = [0.0]
-    renderer = _DraftStreamRenderer(task, repo, lambda: ticks[0])
+    renderer = DraftStreamRenderer(task, repo, lambda: ticks[0])
     chunks = [
         '{"sections":[{"heading":"문서 개',
         '요","body":"첫 번째 줄\\n두 번',

@@ -1,5 +1,9 @@
 """Owner-scoped asynchronous full-document analysis API."""
+import asyncio
+import json
+
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Literal
 
@@ -31,13 +35,35 @@ async def create_analysis(body: AnalysisRequest, request: Request):
 @router.get("/{job_id}")
 async def get_analysis(job_id: str, request: Request):
     owner, service = _identity(request)
+    manager = services(request.app)
     try:
-        result = services(request.app).get(job_id, owner, service)
+        result = manager.get(job_id, owner, service)
     except ValueError:
         result = None
     if result is None:
         raise HTTPException(status_code=404, detail="Analysis not found")
-    return result
+    if "text/event-stream" not in request.headers.get("accept", ""):
+        return result
+
+    async def snapshots():
+        current, previous = result, None
+        heartbeat = 0
+        while current is not None:
+            if current != previous:
+                yield "event: analysis.snapshot\ndata: " + json.dumps(current, ensure_ascii=True) + "\n\n"
+                previous = current
+                heartbeat = 0
+            elif heartbeat >= 20:
+                yield ": heartbeat\n\n"
+                heartbeat = 0
+            if current["status"] not in {"queued", "planning", "running", "verifying"}:
+                return
+            await asyncio.sleep(0.5)
+            current = manager.get(job_id, owner, service)
+            heartbeat += 1
+
+    return StreamingResponse(snapshots(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no", "Vary": "Accept"})
 
 
 @router.post("/{job_id}/resume")
