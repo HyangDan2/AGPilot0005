@@ -22,6 +22,7 @@ export default function App() {
     baseUrl: 'https://integrate.api.nvidia.com/v1',
     model: 'nvidia/nemotron-3.5-super-vl-120b-a12b',
     apiKey: '',
+    gatewayRoute: 'hd2ai-admin',
   });
 
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusResult | null>(null);
@@ -177,8 +178,7 @@ export default function App() {
       {/* Header */}
       <header className="console-header">
         <div className="brand-wrapper">
-          <img src="./assets/LOGO.png" alt="HD2Lab" className="brand-logo" />
-          <span className="brand-title">AGPilot0005 — Agent Demo Console</span>
+          <span className="brand-title">Agent Demo Console</span>
           <span className="brand-badge">v1.1 MVP</span>
         </div>
         <div className="header-actions">

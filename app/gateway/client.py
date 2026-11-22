@@ -352,6 +352,46 @@ class AIGatewayClient:
             await on_content_delta(greeting)
         return greeting, [], "stop"
 
+    async def get_route_status(self, route: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch live readiness and model label for a route from AI Gateway."""
+        target = (route or self.route or "").strip()
+        if not target:
+            return {"ok": False, "status_code": 400, "route": "", "error": "라우트가 지정되지 않았습니다."}
+        if self.mock_mode:
+            return {
+                "ok": True,
+                "status_code": 200,
+                "route": target,
+                "data": {"ready": True, "model_label": "mock-gateway"},
+            }
+        url = f"{self.base_url}/internal/{target}/status"
+        transport = self._get_transport()
+        try:
+            async with httpx.AsyncClient(transport=transport, timeout=5.0) as client:
+                resp = await client.get(url, headers=self._get_headers())
+                if resp.status_code != 200:
+                    return {
+                        "ok": False,
+                        "status_code": resp.status_code,
+                        "route": target,
+                        "error": f"AI Gateway 응답 오류 (HTTP {resp.status_code})",
+                    }
+                data = resp.json()
+                if not isinstance(data, dict):
+                    return {"ok": False, "status_code": 502, "route": target, "error": "AI Gateway 응답 형식이 올바르지 않습니다."}
+                safe_data = {
+                    "ready": bool(data.get("ready")),
+                    "model_label": safe_model_label(data.get("model_label")),
+                    "context_tokens": data.get("context_tokens"),
+                    "max_output_tokens": data.get("max_output_tokens"),
+                    "reasoning_effort": data.get("reasoning_effort"),
+                    "version": data.get("version"),
+                    "revision": data.get("revision"),
+                }
+                return {"ok": True, "status_code": 200, "route": target, "data": safe_data}
+        except Exception as e:
+            return {"ok": False, "status_code": 503, "route": target, "error": f"AI Gateway 통신 실패: {type(e).__name__}"}
+
     async def get_route_limits(self, route: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Fetch active token limits for a route from AI Gateway."""
         if self.mock_mode:
@@ -374,3 +414,27 @@ class AIGatewayClient:
         return None
 
 gateway_client = AIGatewayClient()
+
+_beta_gateway = None
+_beta_token_path = os.environ.get("AGCORE_BETA_GATEWAY_TOKEN_FILE")
+if _beta_token_path:
+    _beta_token = Path(_beta_token_path).read_text(encoding="utf-8").strip()
+    if not _beta_token:
+        raise RuntimeError("Beta Gateway credential is empty")
+    _beta_gateway = AIGatewayClient(route="hd2ai-beta", token=_beta_token)
+
+
+def gateway_for_service(service_id, default=None):
+    if service_id == "hd2ai-beta" and _beta_gateway is not None:
+        return _beta_gateway
+    return gateway_client if default is None else default
+
+
+def authorized_gateway_clients() -> Dict[str, AIGatewayClient]:
+    """Return only AI Gateway clients for routes AGCore holds explicit credentials for."""
+    clients: Dict[str, AIGatewayClient] = {}
+    if gateway_client.route:
+        clients[gateway_client.route] = gateway_client
+    if _beta_gateway is not None and _beta_gateway.route:
+        clients[_beta_gateway.route] = _beta_gateway
+    return clients

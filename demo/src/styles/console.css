@@ -113,11 +113,12 @@ body {
 
 .brand-badge {
   font-size: 0.75rem;
-  background-color: rgba(255, 130, 79, 0.2);
-  color: var(--accent);
-  padding: 2px 8px;
+  font-weight: 600;
+  background-color: var(--accent-soft);
+  color: var(--accent-text);
+  padding: 2px 9px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 130, 79, 0.4);
+  border: 1px solid var(--olive-border);
 }
 
 .header-actions {
@@ -147,7 +148,11 @@ body {
   border: 1px solid var(--card-border);
   border-radius: 10px;
   padding: 18px 20px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 2px 10px rgba(29, 25, 43, 0.06);
+}
+
+[data-theme="dark"] .console-card {
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
 }
 
 .card-title {

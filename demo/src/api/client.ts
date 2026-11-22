@@ -7,6 +7,26 @@ export interface ModelConnectionConfig {
   baseUrl: string;
   model: string;
   apiKey: string;
+  gatewayRoute?: string;
+}
+
+export interface GatewayRouteItem {
+  route: string;
+  authorized: boolean;
+  ready: boolean;
+  model_label?: string | null;
+  engine?: string | null;
+  context_tokens?: number | null;
+  max_output_tokens?: number | null;
+  reasoning_effort?: string | null;
+  error?: string | null;
+}
+
+export interface GatewayRoutesResponse {
+  socket_available: boolean;
+  default_route: string | null;
+  routes: GatewayRouteItem[];
+  gatewayAdminAccess: 'granted' | 'denied' | 'unavailable';
 }
 
 export interface ConnectionStatusResult {
@@ -15,6 +35,8 @@ export interface ConnectionStatusResult {
   duration_ms?: number;
   message: string;
   ready?: boolean;
+  route?: string;
+  model_label?: string | null;
 }
 
 export interface ToolDefinitionItem {
@@ -55,6 +77,10 @@ const API_BASE = IS_ADMIN_PROXY
   ? '/admin/agcore/api/v1/demo'
   : '/api/v1/demo';
 
+const CONFIG_API_BASE = IS_ADMIN_PROXY
+  ? '/admin/agcore/api/v1/config/agent'
+  : '/api/v1/config/agent';
+
 async function getAdminAuthHeaders(signal?: AbortSignal): Promise<Record<string, string>> {
   if (!IS_ADMIN_PROXY) return {};
   try {
@@ -71,6 +97,109 @@ async function getAdminAuthHeaders(signal?: AbortSignal): Promise<Record<string,
   }
 }
 
+export async function fetchGatewayRoutes(signal?: AbortSignal): Promise<GatewayRoutesResponse> {
+  const authorizedMap = new Map<string, GatewayRouteItem>();
+  let socketAvailable = false;
+  let defaultRoute: string | null = null;
+
+  try {
+    const res = await fetch(`${API_BASE}/gateway-routes`, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal,
+    });
+    if (res.ok) {
+      const data = await res.json();
+      socketAvailable = Boolean(data.socket_available);
+      defaultRoute = data.default_route || null;
+      for (const item of Array.isArray(data.routes) ? data.routes : []) {
+        if (item && typeof item.route === 'string') {
+          authorizedMap.set(item.route, {
+            route: item.route,
+            authorized: Boolean(item.authorized),
+            ready: Boolean(item.ready),
+            model_label: item.model_label ?? null,
+            context_tokens: item.context_tokens ?? null,
+            max_output_tokens: item.max_output_tokens ?? null,
+            reasoning_effort: item.reasoning_effort ?? null,
+            error: item.error ?? null,
+          });
+        }
+      }
+    }
+  } catch {
+    // handled below with empty list
+  }
+
+  let gatewayAdminAccess: 'granted' | 'denied' | 'unavailable' = 'unavailable';
+
+  if (IS_ADMIN_PROXY) {
+    try {
+      // Uses the logged-in user's own SSO cookie; Nginx admin-sso-api.conf enforces per-user RBAC.
+      const gwRes = await fetch('/admin/ai-gateway/api/settings', {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal,
+      });
+      if (gwRes.status === 401 || gwRes.status === 403) {
+        gatewayAdminAccess = 'denied';
+      } else if (gwRes.ok) {
+        gatewayAdminAccess = 'granted';
+        const gwData = await gwRes.json();
+        const policyRoutes = gwData?.policy?.routes;
+        if (policyRoutes && typeof policyRoutes === 'object') {
+          for (const [routeName, cfg] of Object.entries<any>(policyRoutes)) {
+            const existing = authorizedMap.get(routeName);
+            const engineLabel = typeof cfg?.engine === 'string' ? cfg.engine : null;
+            const modelFromCfg =
+              typeof cfg?.model === 'string' && cfg.model.trim()
+                ? cfg.model.trim()
+                : typeof cfg?.local_model === 'string' && cfg.local_model.trim()
+                  ? cfg.local_model.trim()
+                  : null;
+            if (existing) {
+              existing.engine = engineLabel;
+              if (!existing.model_label && modelFromCfg) {
+                existing.model_label = modelFromCfg;
+              }
+            } else {
+              authorizedMap.set(routeName, {
+                route: routeName,
+                authorized: false,
+                ready: Boolean(cfg?.enabled),
+                model_label: modelFromCfg,
+                engine: engineLabel,
+                context_tokens: cfg?.context_tokens ?? null,
+                max_output_tokens: cfg?.max_output_tokens ?? null,
+                reasoning_effort: cfg?.reasoning_effort ?? null,
+              });
+            }
+          }
+        }
+      }
+    } catch {
+      gatewayAdminAccess = 'unavailable';
+    }
+  }
+
+  const routes = Array.from(authorizedMap.values()).sort((a, b) => {
+    if (a.authorized !== b.authorized) return a.authorized ? -1 : 1;
+    return a.route.localeCompare(b.route);
+  });
+
+  if (!defaultRoute) {
+    const firstAuth = routes.find((r) => r.authorized);
+    defaultRoute = firstAuth ? firstAuth.route : null;
+  }
+
+  return {
+    socket_available: socketAvailable,
+    default_route: defaultRoute,
+    routes,
+    gatewayAdminAccess,
+  };
+}
+
 export async function testConnection(config: ModelConnectionConfig): Promise<ConnectionStatusResult> {
   const authHeaders = await getAdminAuthHeaders();
   const res = await fetch(`${API_BASE}/connect`, {
@@ -82,6 +211,7 @@ export async function testConnection(config: ModelConnectionConfig): Promise<Con
       base_url: config.baseUrl,
       model: config.model,
       api_key: config.apiKey,
+      gateway_route: config.gatewayRoute,
     }),
   });
 
@@ -125,6 +255,7 @@ export async function streamRun(
       base_url: config.baseUrl,
       model: config.model,
       api_key: config.apiKey,
+      gateway_route: config.gatewayRoute,
       message,
       stream: true,
     }),
@@ -220,15 +351,17 @@ export interface AgentRuntimeConfigDto {
 }
 
 export async function fetchAgentConfig(): Promise<AgentRuntimeConfigDto> {
-  const res = await fetch('/api/v1/config/agent');
+  const res = await fetch(CONFIG_API_BASE, { credentials: 'same-origin', cache: 'no-store' });
   if (!res.ok) throw new Error('설정 조회 실패');
   return res.json();
 }
 
 export async function updateAgentConfig(patch: Partial<AgentRuntimeConfigDto>): Promise<AgentRuntimeConfigDto> {
-  const res = await fetch('/api/v1/config/agent', {
+  const authHeaders = await getAdminAuthHeaders();
+  const res = await fetch(CONFIG_API_BASE, {
+    credentials: 'same-origin',
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders },
     body: JSON.stringify(patch),
   });
   if (!res.ok) throw new Error('설정 저장 실패');
@@ -236,7 +369,12 @@ export async function updateAgentConfig(patch: Partial<AgentRuntimeConfigDto>): 
 }
 
 export async function resetAgentConfig(): Promise<AgentRuntimeConfigDto> {
-  const res = await fetch('/api/v1/config/agent/reset', { method: 'POST' });
+  const authHeaders = await getAdminAuthHeaders();
+  const res = await fetch(`${CONFIG_API_BASE}/reset`, {
+    credentials: 'same-origin',
+    method: 'POST',
+    headers: { ...authHeaders },
+  });
   if (!res.ok) throw new Error('설정 초기화 실패');
   return res.json();
 }
