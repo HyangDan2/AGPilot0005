@@ -2,14 +2,14 @@
 import json
 from typing import Any, Dict, Literal
 from langgraph.graph import StateGraph, END
-from app.gateway.client import AIGatewayClient, gateway_client
-from app.runtime.context import context_manager
+from app.gateway.client import AIGatewayClient, gateway_client, gateway_for_service
+from app.runtime.context import context_manager, is_context_overflow_error
 from app.runtime.state import AgentState
 from app.runtime.public_grounding import public_outline_calls, public_section_calls, public_chunk_calls, public_grounded_messages
 from app.schemas.gateway import GatewayMessage
 from app.tools.dispatcher import dispatcher
 from app.tools.registry import registry
-from app.adapters.document import document_owner_id
+from app.adapters.document import document_owner_id, tool_token_budget
 
 async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) -> Dict[str, Any]:
     """Invokes AI Gateway with current messages and tools."""
@@ -43,17 +43,19 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
             return {'messages':list(state.messages)+[GatewayMessage(role='assistant',content=None,tool_calls=calls)],
                     'step_count':state.step_count,'pending_tool_calls':calls,'status':'running'}
 
-    # 1. Prune and budget check
+    # 1. Dynamic budget resolution and 3-stage compaction
     from app.core.runtime_config import get_effective_route_budget
-    client = state.custom_client or gateway_client
+    client = state.custom_client or gateway_for_service(state.service_id, gateway_client)
     route_budget, has_contract = await get_effective_route_budget(client, state.service_id)
-    pruned_msgs, trimmed = context_manager.prune_and_compress(
+    effective_input_budget = route_budget.input_budget_tokens if has_contract else None
+    pruned_msgs, _report = context_manager.compact_with_report(
         state.messages,
-        budget_tokens=route_budget.input_budget_tokens if has_contract else None,
+        budget_tokens=effective_input_budget,
+        route=state.service_id,
     )
     public_grounding = state.service_id == "hd2ai-public" and bool(state.context_refs)
     if public_grounding:
-        max_body_chars = min(48000, max(12000, route_budget.input_budget_tokens)) if has_contract else 12000
+        max_body_chars = max(1200, int((route_budget.input_budget_tokens if has_contract else context_manager.budget_tokens) * 2))
         pruned_msgs = public_grounded_messages(state, max_body_chars=max_body_chars)
     
     # 2. Get tool definitions for this service
@@ -62,7 +64,7 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
     if first_document_step:
         tools = [tool for tool in tools if tool.function.name == "document.get_outline"]
     
-    # 3. Call Client (custom_client if provided, else default gateway_client)
+    # 3. Call Client (with 1-shot reactive compaction recovery on context overflow)
     model_label = None
 
     def capture_label(label):
@@ -70,16 +72,40 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
         model_label = label
 
     label_options = {'on_model_label': capture_label} if isinstance(client, AIGatewayClient) else {}
-    content, tool_calls, finish_reason = await client.execute(
-        messages=pruned_msgs,
-        tools=tools if not public_grounding and state.tool_call_count < state.max_tool_calls else None,
-        tool_choice=("required" if first_document_step else "auto") if not public_grounding and state.tool_call_count < state.max_tool_calls else "none",
-        stream=state.stream,
-        reasoning_effort=state.reasoning_effort,
-        on_reasoning_delta=on_reasoning_delta,
-        on_content_delta=on_delta,
-        **label_options,
-    )
+    call_tools = tools if not public_grounding and state.tool_call_count < state.max_tool_calls else None
+    call_choice = ("required" if first_document_step else "auto") if not public_grounding and state.tool_call_count < state.max_tool_calls else "none"
+    try:
+        content, tool_calls, finish_reason = await client.execute(
+            messages=pruned_msgs,
+            tools=call_tools,
+            tool_choice=call_choice,
+            stream=state.stream,
+            reasoning_effort=state.reasoning_effort,
+            on_reasoning_delta=on_reasoning_delta,
+            on_content_delta=on_delta,
+            **label_options,
+        )
+    except Exception as exc:
+        if not is_context_overflow_error(exc):
+            raise
+        context_manager.bump_calibration_on_overflow(state.service_id)
+        pruned_msgs, _ = context_manager.compact_with_report(
+            pruned_msgs,
+            budget_tokens=effective_input_budget,
+            route=state.service_id,
+            force_ratio=0.72,
+        )
+        model_label = None
+        content, tool_calls, finish_reason = await client.execute(
+            messages=pruned_msgs,
+            tools=call_tools,
+            tool_choice=call_choice,
+            stream=state.stream,
+            reasoning_effort=state.reasoning_effort,
+            on_reasoning_delta=on_reasoning_delta,
+            on_content_delta=on_delta,
+            **label_options,
+        )
     if public_grounding and not content and not tool_calls:
         model_label = None
         content, tool_calls, finish_reason = await client.execute(
@@ -136,8 +162,17 @@ async def tool_node(state: AgentState, on_tool_event=None) -> Dict[str, Any]:
         for call in calls:
             await on_tool_event("started", call, state.step_count)
 
-    # Execute batch of calls concurrently
+    # Execute batch of calls concurrently with dynamic per-tool token_budget
+    from app.core.runtime_config import resolve_route_budget
+    active_budget = resolve_route_budget(state.service_id)
+    per_tool_budget = context_manager.compute_tool_token_budget(
+        state.messages,
+        budget_tokens=active_budget.input_budget_tokens if active_budget else None,
+        route=state.service_id,
+        tool_count=max(1, len(calls)),
+    )
     owner_token = document_owner_id.set(state.owner_id)
+    budget_token = tool_token_budget.set(per_tool_budget)
     try:
         results = await dispatcher.execute_batch(
             calls=calls,
@@ -146,6 +181,7 @@ async def tool_node(state: AgentState, on_tool_event=None) -> Dict[str, Any]:
             allowed_document_ids=state.context_refs or None,
         )
     finally:
+        tool_token_budget.reset(budget_token)
         document_owner_id.reset(owner_token)
     
     for res in results:

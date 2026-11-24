@@ -71,11 +71,24 @@ def _fallback_budget() -> TokenBudgetValues:
     return rec
 
 
+class CompactionPolicy(BaseModel):
+    """Ratio-driven dynamic token allocation and compaction thresholds (no hardcoded token counts)."""
+    safety_margin_ratio: float = Field(default=0.05, ge=0.01, le=0.25)
+    recent_pool_ratio: float = Field(default=0.35, ge=0.10, le=0.70)
+    evidence_pool_ratio: float = Field(default=0.45, ge=0.10, le=0.75)
+    summary_pool_ratio: float = Field(default=0.20, ge=0.05, le=0.50)
+    soft_threshold_ratio: float = Field(default=0.75, ge=0.40, le=0.90)
+    compact_threshold_ratio: float = Field(default=0.85, ge=0.50, le=0.95)
+    hard_cap_ratio: float = Field(default=0.95, ge=0.60, le=0.99)
+    tool_stub_share_ratio: float = Field(default=0.08, ge=0.02, le=0.25)
+
+
 class AgentRuntimeConfig(BaseModel):
     max_tool_calls: int = Field(default=DEFAULT_MAX_TOOL_CALLS, ge=1, le=32, description="최대 허용 도구 호출 수")
     max_agent_steps: int = Field(default=DEFAULT_MAX_AGENT_STEPS, ge=1, le=40, description="최대 에이전트 단계 수")
     run_timeout_seconds: float = Field(default=DEFAULT_RUN_TIMEOUT_SECONDS, ge=30.0, le=600.0, description="실행 제한 시간(초)")
     token_budgets: Dict[str, RouteTokenBudget] = Field(default_factory=dict, description="AI Gateway 컨트랙트 연동 라우트별 토큰 예산")
+    compaction_policy: CompactionPolicy = Field(default_factory=CompactionPolicy, description="비율 기반 동적 토큰 할당 및 컴팩팅 정책")
 
 
 def _resolve_config_path() -> Path:

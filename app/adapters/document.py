@@ -13,6 +13,7 @@ from app.config import settings
 
 logger = logging.getLogger("agcore.adapters.document")
 document_owner_id: ContextVar[str] = ContextVar("document_owner_id", default="default_user")
+tool_token_budget: ContextVar[Optional[int]] = ContextVar("tool_token_budget", default=None)
 
 class DocumentSection(BaseModel):
     section_id: str
@@ -269,21 +270,35 @@ class AGToolsHttpAdapter(DocumentAdapter):
             resp = await client.get(url, headers=self._headers())
             if resp.status_code == 200:
                 data = resp.json()
-                return {
+                content = data.get("content") or ""
+                budget = tool_token_budget.get()
+                truncated = False
+                if budget is not None and budget > 0:
+                    char_cap = max(256, int(budget * 3))
+                    if len(content) > char_cap:
+                        content = content[:char_cap] + "\n...[토큰 예산에 맞춰 섹션 일부 생략됨]"
+                        truncated = True
+                out = {
                     "doc_id": doc_id,
                     "section_id": data.get("section_id"),
                     "title": data.get("title"),
-                    "content": data.get("content"),
+                    "content": content,
                     "figure_ids": data.get("figure_ids", []),
                     "source": data.get("source"),
                 }
+                if truncated:
+                    out["truncated"] = True
+                return out
             if resp.status_code == 404:
                 return {"error": True, "code": "not_found", "message": f"Section '{section_id}' not found in document '{doc_id}'."}
             return {"error": True, "code": f"http_{resp.status_code}", "message": resp.text}
 
     async def search(self, doc_id: str, query: str, limit: int = 5) -> Dict[str, Any]:
         url = f"{self.base_url}/documents/{doc_id}/search"
-        payload = {"query": query, "limit": limit}
+        payload: Dict[str, Any] = {"query": query, "limit": limit}
+        budget = tool_token_budget.get()
+        if budget is not None and budget > 0:
+            payload["token_budget"] = int(budget)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(url, json=payload, headers=self._headers())
             if resp.status_code == 200:
