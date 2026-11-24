@@ -30,6 +30,8 @@ class ToolCallAccumulator:
                 target["name"] += func["name"]
             if "arguments" in func and func["arguments"]:
                 target["arguments"] += func["arguments"]
+            if "extra_content" in delta and isinstance(delta["extra_content"], dict):
+                target["extra_content"] = delta["extra_content"]
 
     def is_empty(self) -> bool:
         return len(self._calls_by_index) == 0
@@ -46,6 +48,7 @@ class ToolCallAccumulator:
                         name=item["name"],
                         arguments=item["arguments"],
                     ),
+                    extra_content=item.get("extra_content"),
                 )
             )
         return results

@@ -10,6 +10,7 @@ class ToolCall(BaseModel):
     id: str
     type: Literal["function"] = "function"
     function: FunctionCall
+    extra_content: Optional[Dict[str, Any]] = None
 
 class GatewayMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
