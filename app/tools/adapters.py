@@ -20,8 +20,9 @@ class ContextAdapter:
         if active_tool_names:
             lines.append(f"사용 가능한 도구: {', '.join(active_tool_names)}")
             lines.append(
-                "[도구 우선 원칙] 질문이 현재 시점의 사실·외부 정보·문서 처리 등 활성화된 도구로 확인할 수 있는 영역이라면, "
-                "'도구가 없다'고 먼저 단정하지 말고 활성 도구 스키마를 확인해 적합한 도구를 호출한 뒤 근거에 기반해 답변하세요."
+                "[도구 우선 원칙 / Tool-First Policy] 질문이 현재 시점의 사실·실시간 외부 정보·문서 처리 등 활성화된 도구로 확인할 수 있는 영역이라면, "
+                "'도구가 없다'고 먼저 단정하지 말고 활성 도구 스키마를 확인해 적합한 도구를 먼저 호출한 뒤 근거에 기반해 답변하세요. "
+                "(When a request requires current/live external information or actions covered by an enabled tool, invoke the appropriate tool first rather than refusing or claiming you lack live access.)"
             )
             lines.append(
                 "[도구 결과 품질 처리 원칙] 도구 응답의 meta.quality가 'shallow' 또는 'empty'이면 "
