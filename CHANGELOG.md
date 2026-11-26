@@ -1,7 +1,17 @@
 # Changelog
 
-## [1.2.0-r1.2] - 2026-11-26 (feature/runtime-r1-corrective)
-### R1.2 Release Candidate Hotfix (CP1 `4c7451a` & CP2 — `CR-01` ~ `CR-09`)
+## [1.2.0] - 2026-11-27 (main)
+### Release Gate & Final Defect Closure (`HF-01` ~ `HF-07`, `ADD-01` ~ `ADD-02`, `RB-01` ~ `RB-02`)
+- Removed legacy `SERVICE_TOKENS` / `ADMIN_SERVICE_TOKENS` scope-bypass branches; unified caller auth to `AGCORE_CREDENTIAL_SCOPES` + `AGCORE_CREDENTIAL_SECRETS` and verified Trusted Proxy (`X-Trusted-Proxy-Secret`); blocked invalid credential → Trusted Proxy fallback and unregistered service API/tool fallback (`HF-01`, `ADD-01`).
+- Enforced full-path verified `ExecutionScope` (Tenant + Owner + Service) across Document Adapter, Document Reference pre-validation, Durable Document Analysis (`create` & `resume` via `ScopedDocuments`), Trajectory, and Feedback without auto-adopting legacy tenant-less data (`HF-02`, `ADD-02`).
+- Enforced explicit admin management scope (`allowed_tenants`, `allowed_services`) with fail-closed on `None`/empty and no implicit wildcard; forbade single `:` delimiter collisions across auth, `AnalysisServices`, and boot configuration (`ADD-01`, `RB-01`, `RB-02`).
+- Propagated policy-approved `context_budget_tokens` to Document Tool's own `tool_token_budget` (`HF-03`).
+- Upgraded SQLite feedback dedup integrity check with exact `WHERE` predicate matching and `SAVEPOINT` runtime dedup enforcement probe (`HF-04`).
+- Made SSE cursor validation, replay snapshot, and subscriber registration atomic via `RunEventBus.open_stream()` (`HF-05`).
+- Made Active Run Admission Control (`max_active_runs`, HTTP `429`) atomic via synchronous lock reservation with zero `await` inside lock and immediate failure rollback (`HF-06`).
+- Unified `AsyncTrajectoryWriter.flush()` and `shutdown()` under a single monotonic deadline (`HF-07`).
+
+### R1.2 Release Candidate Hotfix (CP1 `4c7451a` & CP2 `ed4a196` — `CR-01` ~ `CR-09`)
 - Fixed `_register_http_tools()` undefined variable error, scoped `AGTOOLS_ENABLED=false` strictly to AGTools provider, and handled read-only policy persistence gracefully (`CR-01`).
 - Unified verified immutable `ExecutionScope` propagation through `AgentRunner` (Legacy + LangGraph) to `tool_node` / `Dispatcher` with Tenant + Owner + Service isolation (`CR-02`).
 - Added duplicate credential secret collision fail-fast in `validate_boot_configuration()` and removed all developer PC absolute paths from `app/` and `tests/` (`CR-03`).
