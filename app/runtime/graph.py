@@ -144,13 +144,22 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
         
     return updates
 
-async def tool_node(state: AgentState, on_tool_event=None) -> Dict[str, Any]:
-    """Executes pending tool calls and updates message state."""
-    calls = state.pending_tool_calls
+async def tool_node(
+    state: AgentState,
+    on_tool_event=None,
+    *,
+    validated_calls=None,
+    constraints=None,
+    timeout_override=None,
+) -> Dict[str, Any]:
+    """Executes pending (or strictly ValidatedAction-approved) tool calls and updates message state."""
+    calls = list(validated_calls) if validated_calls is not None else list(state.pending_tool_calls)
+    approved_ids = {c.id for c in calls}
+    unapproved_calls = [c for c in state.pending_tool_calls if c.id not in approved_ids] if validated_calls is not None else []
     new_traces = list(state.traces)
     new_messages = list(state.messages)
     citations = list(state.citations)
-    if state.context_refs and state.tool_call_count == 0:
+    if validated_calls is None and state.context_refs and state.tool_call_count == 0:
         for index, call in enumerate(calls):
             if call.function.name == "document.get_outline":
                 call.function.arguments = json.dumps({"doc_id": state.context_refs[min(index, len(state.context_refs) - 1)]})
@@ -178,7 +187,9 @@ async def tool_node(state: AgentState, on_tool_event=None) -> Dict[str, Any]:
             calls=calls,
             step=state.step_count,
             service=state.service_id,
+            timeout=timeout_override,
             allowed_document_ids=state.context_refs or None,
+            constraints=constraints,
         )
     finally:
         tool_token_budget.reset(budget_token)
@@ -209,7 +220,18 @@ async def tool_node(state: AgentState, on_tool_event=None) -> Dict[str, Any]:
         )
         if on_tool_event:
             await on_tool_event("completed", res, state.step_count)
-            
+
+    # R1-FIX-01.12: Record explicit rejected tool messages for any pending calls excluded from ValidatedAction
+    for rej in unapproved_calls:
+        new_messages.append(
+            GatewayMessage(
+                role="tool",
+                content=json.dumps({"error": True, "code": "tool_call_not_approved"}, ensure_ascii=False),
+                tool_call_id=rej.id,
+                name=rej.function.name,
+            )
+        )
+
     return {
         "messages": new_messages,
         "tool_call_count": new_tool_count,

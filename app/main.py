@@ -39,22 +39,36 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS Middleware (Local dev & admin domain)
+# Deployment Profile-based CORS Middleware (R1-FIX-05 C.1)
+_cors_origins = [o.strip() for o in settings.CORS_ALLOW_ORIGINS.split(",") if o.strip()] or ["https://hd2lab.duckdns.org"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=("*" not in _cors_origins),
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 @app.middleware("http")
 async def security_and_limit_middleware(request: Request, call_next):
-    # Enforce request body size limits (2MB max)
+    # R1-FIX-05 C.2-C.4: Validate Content-Length safely AND enforce actual received body size
+    max_bytes = settings.MAX_REQUEST_BODY_BYTES
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > 2 * 1024 * 1024:
-        return JSONResponse(status_code=413, content={"detail": "Request payload too large (max 2MB)."})
-        
+    if content_length is not None:
+        try:
+            parsed_len = int(content_length.strip())
+            if parsed_len < 0:
+                return JSONResponse(status_code=400, content={"detail": "invalid_content_length"})
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "invalid_content_length"})
+        if parsed_len > max_bytes:
+            return JSONResponse(status_code=413, content={"detail": "Request payload too large."})
+
+    if request.method in ("POST", "PUT", "PATCH"):
+        body = await request.body()
+        if len(body) > max_bytes:
+            return JSONResponse(status_code=413, content={"detail": "Request payload too large."})
+
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"

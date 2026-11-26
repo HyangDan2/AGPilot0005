@@ -68,6 +68,8 @@ class TrajectoryEventStore:
                         run_id TEXT NOT NULL,
                         decision_id TEXT,
                         action_id TEXT,
+                        owner_id TEXT,
+                        service_id TEXT,
                         timestamp REAL NOT NULL,
                         payload_json TEXT NOT NULL
                     );
@@ -87,10 +89,22 @@ class TrajectoryEventStore:
                     END;
                     """
                 )
+                # Backward-compatible schema migration for existing DBs missing owner_id/service_id
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(trajectory_events)").fetchall()}
+                if "owner_id" not in cols:
+                    conn.execute("ALTER TABLE trajectory_events ADD COLUMN owner_id TEXT;")
+                if "service_id" not in cols:
+                    conn.execute("ALTER TABLE trajectory_events ADD COLUMN service_id TEXT;")
             finally:
                 conn.close()
 
-    def append(self, event: AnyTrajectoryEvent) -> str:
+    def append(
+        self,
+        event: AnyTrajectoryEvent,
+        *,
+        owner_id: Optional[str] = None,
+        service_id: Optional[str] = None,
+    ) -> str:
         payload = event.model_dump()
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         decision_id = getattr(event, "decision_id", None)
@@ -105,8 +119,8 @@ class TrajectoryEventStore:
                     INSERT INTO trajectory_events (
                         event_id, event_type, schema_version,
                         trajectory_id, run_id, decision_id, action_id,
-                        timestamp, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        owner_id, service_id, timestamp, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.event_id,
@@ -116,6 +130,8 @@ class TrajectoryEventStore:
                         event.run_id,
                         decision_id,
                         action_id,
+                        owner_id,
+                        service_id,
                         float(event.timestamp),
                         payload_json,
                     ),
@@ -135,6 +151,66 @@ class TrajectoryEventStore:
                 raise
             finally:
                 conn.close()
+
+    def get_run_metadata(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Returns authoritative ownership & referential integrity metadata for a stored run (R1-FIX-02)."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT trajectory_id, owner_id, service_id, event_type, decision_id
+                    FROM trajectory_events
+                    WHERE run_id = ?
+                    ORDER BY seq ASC
+                    """,
+                    (run_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+        if not rows:
+            return None
+        trajectory_id = rows[0][0]
+        owner_id = next((r[1] for r in rows if r[1]), None)
+        service_id = next((r[2] for r in rows if r[2]), None)
+        decision_ids = {r[4] for r in rows if r[3] == "DecisionEvent" and r[4]}
+        return {
+            "run_id": run_id,
+            "trajectory_id": trajectory_id,
+            "owner_id": owner_id,
+            "service_id": service_id,
+            "decision_ids": decision_ids,
+        }
+
+    def has_duplicate_feedback(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        decision_id: Optional[str],
+        feedback_type: str,
+    ) -> bool:
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT owner_id, decision_id, payload_json
+                    FROM trajectory_events
+                    WHERE run_id = ? AND event_type = 'FeedbackEvent'
+                    """,
+                    (run_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+        for r_owner, r_dec, pjson in rows:
+            try:
+                p = json.loads(pjson)
+            except Exception:
+                continue
+            if (r_owner or "") == (owner_id or "") and r_dec == decision_id and p.get("feedback_type") == feedback_type:
+                return True
+        return False
 
     def list_events(
         self,
@@ -322,6 +398,8 @@ class TrajectoryLogger:
         action_probability: Optional[float],
         validator_result: Mapping[str, Any],
         event_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        service_id: Optional[str] = None,
     ) -> DecisionEvent:
         ev = DecisionEvent(
             event_id=event_id or self.new_id("dec-evt"),
@@ -342,7 +420,7 @@ class TrajectoryLogger:
             validator_result=sanitize_mapping(validator_result),
             timestamp=self.clock.now_epoch(),
         )
-        self.store.append(ev)
+        self.store.append(ev, owner_id=owner_id, service_id=service_id)
         return ev
 
     def log_action(
@@ -356,6 +434,8 @@ class TrajectoryLogger:
         executed_parameters: Mapping[str, Any],
         fallback_applied: bool,
         event_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        service_id: Optional[str] = None,
     ) -> ActionEvent:
         ev = ActionEvent(
             event_id=event_id or self.new_id("act-evt"),
@@ -369,7 +449,7 @@ class TrajectoryLogger:
             fallback_applied=bool(fallback_applied),
             timestamp=self.clock.now_epoch(),
         )
-        self.store.append(ev)
+        self.store.append(ev, owner_id=owner_id, service_id=service_id)
         return ev
 
     def log_outcome(
@@ -386,6 +466,8 @@ class TrajectoryLogger:
         token_usage: Optional[Dict[str, int]] = None,
         terminal_status: Optional[str] = None,
         event_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        service_id: Optional[str] = None,
     ) -> OutcomeEvent:
         ev = OutcomeEvent(
             event_id=event_id or self.new_id("out-evt"),
@@ -402,7 +484,7 @@ class TrajectoryLogger:
             terminal_status=terminal_status,
             timestamp=self.clock.now_epoch(),
         )
-        self.store.append(ev)
+        self.store.append(ev, owner_id=owner_id, service_id=service_id)
         return ev
 
     def log_feedback(
@@ -414,6 +496,8 @@ class TrajectoryLogger:
         reward_signal: float,
         decision_id: Optional[str] = None,
         event_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        service_id: Optional[str] = None,
     ) -> FeedbackEvent:
         ev = FeedbackEvent(
             event_id=event_id or self.new_id("fb-evt"),
@@ -425,7 +509,7 @@ class TrajectoryLogger:
             reward_signal=float(reward_signal),
             timestamp=self.clock.now_epoch(),
         )
-        self.store.append(ev)
+        self.store.append(ev, owner_id=owner_id, service_id=service_id)
         return ev
 
 

@@ -24,6 +24,7 @@ class StateView:
     estimated_context_tokens: int
     has_pending_tool_calls: bool
     pending_tool_names: Tuple[str, ...] = ()
+    pending_tool_call_ids: Tuple[str, ...] = ()
     pending_tool_count: int = 0
     has_final_answer: bool = False
     context_compacted: bool = False
@@ -86,6 +87,7 @@ class DefaultAGPolicy:
                 chosen_action=ActionType.CALL_TOOLS.value,
                 proposed_parameters=MappingProxyType(
                     {
+                        "tool_call_ids": state_view.pending_tool_call_ids,
                         "tool_names": state_view.pending_tool_names,
                         "tool_count": state_view.pending_tool_count,
                     }

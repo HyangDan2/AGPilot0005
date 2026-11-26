@@ -15,6 +15,8 @@ from app.schemas.agent import AgentRunRequest, AgentRunResponse, ToolExecutionTr
 from app.schemas.events import SSEEvent
 from app.schemas.gateway import GatewayMessage
 from app.adapters.document import document_adapter, document_owner_id
+from app.runtime.event_bus import RunEventBus
+from app.runtime.fence import HardDeadline, TerminalStateFence
 
 class DocumentReferenceError(ValueError):
     pass
@@ -22,25 +24,20 @@ class DocumentReferenceError(ValueError):
 class AgentRunSession:
     def __init__(self, state: AgentState):
         self.state = state
-        self.queue: asyncio.Queue[Optional[SSEEvent]] = asyncio.Queue(maxsize=128)
+        self.event_bus = RunEventBus(run_id=state.run_id)
+        self.fence = TerminalStateFence()
         self.task: Optional[asyncio.Task] = None
         self.created_at = time.time()
         self.finished_at: Optional[float] = None
-        self._event_counter = 0
-
-    def next_event_id(self) -> str:
-        self._event_counter += 1
-        return f"{self.state.run_id}-{self._event_counter}"
 
     async def emit(self, event_name: str, data: Dict[str, Any]):
-        evt = SSEEvent(
-            run_id=self.state.run_id,
-            event_id=self.next_event_id(),
-            event=event_name, # type: ignore
-            status=self.state.status,
-            data=data,
-        )
-        await self.queue.put(evt)
+        if event_name in ("run.completed", "run.failed", "run.cancelled"):
+            self.event_bus.publish_terminal(event_name, self.state.status, data)
+            return
+        if self.fence.is_terminal:
+            self.fence.record_late_result()
+            return
+        self.event_bus.publish(event_name, self.state.status, data)
 
 class AgentRunner:
     def __init__(self):
@@ -119,9 +116,10 @@ class AgentRunner:
         if not session or not session.task or session.task.done():
             return False
         session.task.cancel()
-        session.state.status = "cancelled"
-        await session.emit("run.cancelled", {"message": "User requested cancellation"})
-        await session.queue.put(None)
+        if session.fence.try_finalize("cancelled"):
+            session.state.status = "cancelled"
+            session.finished_at = time.time()
+            await session.emit("run.cancelled", {"message": "User requested cancellation"})
         return True
 
     async def _run_loop(self, session: AgentRunSession):
@@ -136,6 +134,7 @@ class AgentRunner:
         })
         
         timeout_seconds = get_runtime_config().run_timeout_seconds
+        run_deadline = HardDeadline(timeout_seconds)
         start_time = time.time()
 
         try:
@@ -148,18 +147,27 @@ class AgentRunner:
                 constraints = ConstraintSpec.from_runtime(
                     service_id=state.service_id,
                     owner_id=state.owner_id,
+                    authenticated=True,
                     allowed_tools=allowed_tool_set,
                     max_steps=state.max_steps,
                     max_tool_calls=state.max_tool_calls,
-                    time_budget_seconds=timeout_seconds,
+                    time_budget_seconds=run_deadline.remaining_seconds(),
                     context_budget_tokens=settings.CONTEXT_BUDGET_TOKENS,
                     default_reasoning_effort=state.reasoning_effort or "default",
                 )
                 traj_logger = get_trajectory_logger() if settings.TRAJECTORY_ENABLED else None
                 r1_runtime = LangGraphR1Runtime(trajectory_logger=traj_logger)
-                r1_res = await r1_runtime.execute(state, constraints, emit=session.emit)
+                async with asyncio.timeout(run_deadline.remaining_seconds()):
+                    r1_res = await r1_runtime.execute(
+                        state,
+                        constraints,
+                        emit=session.emit,
+                        deadline=run_deadline,
+                        fence=session.fence,
+                    )
                 session.finished_at = time.time()
                 if state.status == "completed":
+                    session.fence.try_finalize("completed")
                     await session.emit("run.completed", {
                         "citations": state.citations,
                         "answer_kind": "answer",
@@ -174,6 +182,7 @@ class AgentRunner:
                         "runtime_engine": "langgraph_r1",
                     })
                 else:
+                    session.fence.try_finalize("failed")
                     err_info = state.error or {}
                     state.error = {
                         "code": err_info.get("code") or "terminated",
@@ -188,7 +197,7 @@ class AgentRunner:
                     })
                 return
 
-            async with asyncio.timeout(timeout_seconds):
+            async with asyncio.timeout(run_deadline.remaining_seconds()):
                 # We execute the graph step-by-step to emit fine-grained SSE events
                 last_tool_meta = None
                 attempted_tool_sigs = set()
@@ -293,65 +302,63 @@ class AgentRunner:
             if state.pending_tool_calls or not (state.final_answer or "").strip():
                 raise DocumentReferenceError("agent_answer_incomplete")
             # Completed successfully
-            state.status = "completed"
-            session.finished_at = time.time()
-            await session.emit("run.completed", {
-                'citations': state.citations, 'answer_kind': 'answer',
-                "answer": state.final_answer or "",
-                "model_label": state.model_label,
-                "total_steps": state.step_count,
-                "total_tool_calls": state.tool_call_count,
-                "duration_seconds": round(session.finished_at - start_time, 2),
-            })
+            if session.fence.try_finalize("completed"):
+                state.status = "completed"
+                session.finished_at = time.time()
+                await session.emit("run.completed", {
+                    'citations': state.citations, 'answer_kind': 'answer',
+                    "answer": state.final_answer or "",
+                    "model_label": state.model_label,
+                    "total_steps": state.step_count,
+                    "total_tool_calls": state.tool_call_count,
+                    "duration_seconds": round(session.finished_at - start_time, 2),
+                })
 
         except asyncio.CancelledError:
-            state.status = "cancelled"
-            session.finished_at = time.time()
-            await session.emit("run.cancelled", {"message": "Execution cancelled."})
+            if session.fence.try_finalize("cancelled"):
+                state.status = "cancelled"
+                session.finished_at = time.time()
+                await session.emit("run.cancelled", {"message": "Execution cancelled."})
         except TimeoutError:
-            state.status = "failed"
-            state.error = {"code": "run_timeout", "message": f"전체 실행 제한 시간({timeout_seconds}초)을 초과했습니다."}
-            session.finished_at = time.time()
-            await session.emit("run.failed", state.error)
+            if session.fence.try_finalize("failed"):
+                state.status = "failed"
+                state.error = {"code": "run_timeout", "message": f"전체 실행 제한 시간({timeout_seconds}초)을 초과했습니다."}
+                session.finished_at = time.time()
+                await session.emit("run.failed", state.error)
         except DocumentReferenceError as exc:
-            state.status = "failed"
-            state.error = {"code": str(exc), "message": "도구 예산 또는 답변 검증으로 작업을 완료하지 못했습니다."}
-            session.finished_at = time.time()
-            await session.emit("run.failed", state.error)
+            if session.fence.try_finalize("failed"):
+                state.status = "failed"
+                state.error = {"code": str(exc), "message": "도구 예산 또는 답변 검증으로 작업을 완료하지 못했습니다."}
+                session.finished_at = time.time()
+                await session.emit("run.failed", state.error)
         except GatewayStreamError as exc:
-            state.status = 'failed'
-            state.error = {'code':'gateway_' + exc.code, 'message':'모델 게이트웨이 요청을 완료하지 못했습니다 (' + exc.code + ').'}
-            session.finished_at = time.time()
-            await session.emit('run.failed', state.error)
+            if session.fence.try_finalize("failed"):
+                state.status = 'failed'
+                state.error = {'code':'gateway_' + exc.code, 'message':'모델 게이트웨이 요청을 완료하지 못했습니다 (' + exc.code + ').'}
+                session.finished_at = time.time()
+                await session.emit('run.failed', state.error)
         except Exception as e:
-            state.status = "failed"
-            empty_answer = isinstance(e, RuntimeError) and str(e) == "Public document answer was empty"
-            provider_status = re.match(r"Model Provider Error \((\d{3})\)", str(e))
-            state.error = {
-                "code": "model_empty_response" if empty_answer else "internal_error",
-                "message": ("모델이 문서 답변을 반환하지 않았습니다." if empty_answer
-                            else f"Model Provider Error ({provider_status.group(1)})" if provider_status
-                            else "에이전트 실행 중 내부 오류가 발생했습니다."),
-            }
-            session.finished_at = time.time()
-            await session.emit("run.failed", state.error)
+            if session.fence.try_finalize("failed"):
+                state.status = "failed"
+                empty_answer = isinstance(e, RuntimeError) and str(e) == "Public document answer was empty"
+                provider_status = re.match(r"Model Provider Error \((\d{3})\)", str(e))
+                state.error = {
+                    "code": "model_empty_response" if empty_answer else "internal_error",
+                    "message": ("모델이 문서 답변을 반환하지 않았습니다." if empty_answer
+                                else f"Model Provider Error ({provider_status.group(1)})" if provider_status
+                                else "에이전트 실행 중 내부 오류가 발생했습니다."),
+                }
+                session.finished_at = time.time()
+                await session.emit("run.failed", state.error)
         finally:
-            await session.queue.put(None)
+            if not session.event_bus.is_finalized:
+                session.event_bus.publish_terminal("run.failed", state.status, state.error or {"code": "terminated", "message": "실행이 종료되었습니다."})
 
-    async def stream_events(self, run_id: str) -> AsyncGenerator[str, None]:
+    async def stream_events(self, run_id: str, *, last_event_id: Optional[str] = None) -> AsyncGenerator[str, None]:
         session = self.get_session(run_id)
         if not session:
             return
-        
-        while True:
-            try:
-                evt = await asyncio.wait_for(session.queue.get(), timeout=2.0)
-            except TimeoutError:
-                yield ": heartbeat\n\n"
-                continue
-
-            if evt is None:
-                break
-            yield evt.to_sse()
+        async for frame in session.event_bus.stream(last_event_id=last_event_id):
+            yield frame
 
 runner = AgentRunner()

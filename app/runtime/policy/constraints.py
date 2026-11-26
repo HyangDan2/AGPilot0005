@@ -34,7 +34,7 @@ class ConstraintSpec:
 
     service_id: str
     owner_id: str
-    authenticated: bool = True
+    authenticated: bool = False
     allowed_tools: FrozenSet[str] = field(default_factory=frozenset)
     allowed_actions: FrozenSet[str] = field(default_factory=lambda: DEFAULT_ALLOWED_ACTIONS)
     max_steps: int = 20

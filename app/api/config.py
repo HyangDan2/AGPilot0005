@@ -1,7 +1,8 @@
 """Agent Runtime Configuration Endpoints."""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
+from app.core.auth import require_admin_caller
 from app.core.runtime_config import (
     AgentRuntimeConfig,
     RouteTokenBudget,
@@ -14,7 +15,7 @@ from app.core.runtime_config import (
     DEFAULT_RUN_TIMEOUT_SECONDS,
 )
 
-router = APIRouter(prefix="/config/agent", tags=["Config"])
+router = APIRouter(prefix="/config/agent", tags=["Config"], dependencies=[Depends(require_admin_caller)])
 
 
 class UpdateAgentRuntimeConfigRequest(BaseModel):

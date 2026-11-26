@@ -1,32 +1,32 @@
-"""Phase R1 Amendment 02: LangGraph StateGraph Runtime with Execution Boundary & Trajectory Integrity."""
+"""Phase R1.1: LangGraph StateGraph Runtime with ValidatedAction, HardDeadline & TerminalStateFence."""
 from __future__ import annotations
 
 import asyncio
-import json
-import time
 from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
+from app.config import settings
 from app.core.clock import Clock, system_clock
 from app.gateway.client import GatewayStreamError
 from app.runtime.context import context_manager
+from app.runtime.fence import HardDeadline, TerminalStateFence
 from app.runtime.graph import model_node, tool_node
 from app.runtime.policy.ag_policy import AGPolicy, DefaultAGPolicy, PolicyProposal, StateView
 from app.runtime.policy.constraints import ActionType, ConstraintSpec
-from app.runtime.policy.validator import ActionValidator, FallbackAction, ValidationResult
+from app.runtime.policy.validator import ActionValidator, FallbackAction, ValidatedAction, ValidationResult
 from app.runtime.state import AgentState
-from app.schemas.gateway import GatewayMessage
+from app.schemas.gateway import FunctionCall, GatewayMessage, ToolCall
 from app.tools.adapters import EscalationGate, PostCallAdapter
 from app.tracing.store import TrajectoryLogger
 
 
 class R1GraphState(TypedDict, total=False):
-    # Internal mutable runtime objects (never exposed to AGPolicy)
     agent_state: AgentState
     constraints: ConstraintSpec
     trajectory_id: str
-    started_monotonic: float
+    deadline: HardDeadline
+    fence: TerminalStateFence
     step_index: int
     context_compacted: bool
     fallback_count: int
@@ -36,15 +36,11 @@ class R1GraphState(TypedDict, total=False):
     last_tool_meta: Optional[Dict[str, Any]]
     attempted_tool_sigs: List[str]
     escalations_used: int
-    # Current step handoff between propose -> validate -> execute
     proposal: Optional[PolicyProposal]
     validation: Optional[ValidationResult]
-    effective_action: str
-    effective_parameters: Dict[str, Any]
-    fallback_applied: bool
+    validated_action: Optional[ValidatedAction]
     decision_id: str
     terminal_status: Optional[str]
-    # Deterministic replay telemetry
     node_trace: List[str]
     decision_records: List[Dict[str, Any]]
     fallback_records: List[Dict[str, Any]]
@@ -61,22 +57,23 @@ def _estimate_tokens(messages: List[GatewayMessage]) -> int:
     return max(1, total_chars // 4)
 
 
-def _build_state_view(gstate: R1GraphState, clock: Clock) -> StateView:
+def _build_state_view(gstate: R1GraphState) -> StateView:
     st: AgentState = gstate["agent_state"]
     constraints: ConstraintSpec = gstate["constraints"]
-    elapsed = max(0.0, clock.monotonic() - gstate["started_monotonic"])
-    remaining = max(0.0, constraints.time_budget_seconds - elapsed)
+    deadline: HardDeadline = gstate["deadline"]
     pending_names = tuple(tc.function.name for tc in (st.pending_tool_calls or []))
+    pending_ids = tuple(tc.id for tc in (st.pending_tool_calls or []))
     return StateView(
         run_id=st.run_id,
-        service_id=st.service_id,
+        service_id=st.service_id or constraints.service_id,
         step_count=st.step_count,
         tool_call_count=st.tool_call_count,
-        elapsed_seconds=elapsed,
-        remaining_time_budget_seconds=remaining,
+        elapsed_seconds=deadline.elapsed_seconds(),
+        remaining_time_budget_seconds=deadline.remaining_seconds(),
         estimated_context_tokens=_estimate_tokens(st.messages),
         has_pending_tool_calls=bool(st.pending_tool_calls),
         pending_tool_names=pending_names,
+        pending_tool_call_ids=pending_ids,
         pending_tool_count=len(pending_names),
         has_final_answer=bool(st.final_answer is not None and not st.pending_tool_calls),
         context_compacted=bool(gstate.get("context_compacted", False)),
@@ -88,7 +85,7 @@ def _build_state_view(gstate: R1GraphState, clock: Clock) -> StateView:
 
 
 class LangGraphR1Runtime:
-    """Executes AgentState under strict FIX-R1-01/02/03/04 boundaries using LangGraph StateGraph."""
+    """Executes AgentState under strict R1.1 ValidatedAction, HardDeadline, and TerminalStateFence."""
 
     def __init__(
         self,
@@ -110,11 +107,18 @@ class LangGraphR1Runtime:
         *,
         emit: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
         trajectory_id: Optional[str] = None,
+        deadline: Optional[HardDeadline] = None,
+        fence: Optional[TerminalStateFence] = None,
     ) -> R1GraphState:
         tid = trajectory_id or f"traj-{state.run_id}"
-        started_mono = self.clock.monotonic()
+        run_deadline = deadline or HardDeadline(constraints.time_budget_seconds, clock=self.clock)
+        run_fence = fence or TerminalStateFence()
 
         async def _emit(event_name: str, data: Dict[str, Any]) -> None:
+            # R1-FIX-04 B.5: Block non-terminal user events once TerminalStateFence is closed
+            if run_fence.is_terminal:
+                run_fence.record_late_result()
+                return
             if emit is not None:
                 res = emit(event_name, data)
                 if asyncio.iscoroutine(res):
@@ -123,8 +127,7 @@ class LangGraphR1Runtime:
         async def propose_node(gstate: R1GraphState) -> Dict[str, Any]:
             trace = list(gstate.get("node_trace", []))
             trace.append("propose")
-            sv = _build_state_view(gstate, self.clock)
-            # AGPolicy receives ONLY immutable StateView + ConstraintSpec (REG-POL-11)
+            sv = _build_state_view(gstate)
             proposal = self.policy.propose(sv, gstate["constraints"])
             return {
                 "node_trace": trace,
@@ -138,32 +141,45 @@ class LangGraphR1Runtime:
             st: AgentState = gstate["agent_state"]
             constraints_spec: ConstraintSpec = gstate["constraints"]
             proposal: PolicyProposal = gstate["proposal"]  # type: ignore[assignment]
-            sv = _build_state_view(gstate, self.clock)
+            sv = _build_state_view(gstate)
 
-            vres = self.validator.validate(proposal, sv, constraints_spec)
+            vres = self.validator.validate(
+                proposal,
+                sv,
+                constraints_spec,
+                pending_tool_calls=st.pending_tool_calls if proposal.chosen_action == ActionType.CALL_TOOLS.value else None,
+                deadline_monotonic=run_deadline.deadline_monotonic,
+            )
             rejected_sigs = list(gstate.get("rejected_signatures", []))
-            fallback_applied = False
-            effective_action = proposal.chosen_action
-            effective_params: Dict[str, Any] = dict(proposal.proposed_parameters)
             last_fb_reason = gstate.get("last_fallback_reason")
+            va: Optional[ValidatedAction] = vres.validated_action
 
-            if not vres.accepted:
+            if not vres.accepted or va is None:
                 rejected_sigs.append(proposal.signature())
                 fb: FallbackAction = vres.fallback_action or FallbackAction(
                     action=ActionType.TERMINATE.value,
                     reason_code=vres.reason_code or "validation_rejected",
                 )
-                # FIX-R1-02 / REG-POL-13: Every fallback action MUST also pass ActionValidator
-                fb_vres = self.validator.validate_fallback(fb, sv, constraints_spec)
-                if not fb_vres.accepted:
-                    fb = fb_vres.fallback_action or FallbackAction(
+                fb_vres = self.validator.validate_fallback(
+                    fb,
+                    sv,
+                    constraints_spec,
+                    deadline_monotonic=run_deadline.deadline_monotonic,
+                )
+                if not fb_vres.accepted or fb_vres.validated_action is None:
+                    term_fb = fb_vres.fallback_action or FallbackAction(
                         action=ActionType.TERMINATE.value,
                         reason_code=fb_vres.reason_code or "fallback_rejected",
                     )
-                fallback_applied = True
-                effective_action = fb.action
-                effective_params = dict(fb.parameters)
-                last_fb_reason = fb.reason_code or vres.reason_code
+                    term_res = self.validator.validate_fallback(
+                        term_fb, sv, constraints_spec, deadline_monotonic=run_deadline.deadline_monotonic
+                    )
+                    va = term_res.validated_action
+                else:
+                    va = fb_vres.validated_action
+                last_fb_reason = (va.reason_code if va else None) or fb.reason_code or vres.reason_code
+
+            assert va is not None, "ActionValidator must always produce a ValidatedAction"
 
             decision_id = f"{st.run_id}-dec-{gstate['step_index']}"
             dec_record = {
@@ -173,13 +189,12 @@ class LangGraphR1Runtime:
                 "proposed_parameters": dict(proposal.proposed_parameters),
                 "action_probability": proposal.action_probability,
                 "validator_result": vres.to_dict(),
-                "effective_action": effective_action,
-                "fallback_applied": fallback_applied,
+                "effective_action": va.action,
+                "fallback_applied": va.fallback_applied,
             }
             decision_records = list(gstate.get("decision_records", []))
             decision_records.append(dec_record)
 
-            # FIX-R1-03: Log DecisionEvent AFTER validation and BEFORE execution
             if self.trajectory_logger is not None:
                 self.trajectory_logger.log_decision(
                     trajectory_id=gstate["trajectory_id"],
@@ -196,15 +211,15 @@ class LangGraphR1Runtime:
                     config_digest=constraints_spec.digest(),
                     action_probability=proposal.action_probability,
                     validator_result=vres.to_dict(),
+                    owner_id=constraints_spec.owner_id,
+                    service_id=constraints_spec.service_id,
                 )
 
             return {
                 "node_trace": trace,
                 "validation": vres,
-                "effective_action": effective_action,
-                "effective_parameters": effective_params,
-                "fallback_applied": fallback_applied,
-                "fallback_applied_any": bool(gstate.get("fallback_applied_any", False) or fallback_applied),
+                "validated_action": va,
+                "fallback_applied_any": bool(gstate.get("fallback_applied_any", False) or va.fallback_applied),
                 "last_fallback_reason": last_fb_reason,
                 "rejected_signatures": rejected_sigs,
                 "decision_id": decision_id,
@@ -216,9 +231,10 @@ class LangGraphR1Runtime:
             trace.append("execute")
             st: AgentState = gstate["agent_state"]
             constraints_spec: ConstraintSpec = gstate["constraints"]
-            action = gstate["effective_action"]
-            params = dict(gstate.get("effective_parameters", {}))
-            fallback_applied = bool(gstate.get("fallback_applied", False))
+            va: ValidatedAction = gstate["validated_action"]  # type: ignore[assignment]
+            action = va.action
+            params = dict(va.parameters)
+            fallback_applied = va.fallback_applied
             decision_id = gstate["decision_id"]
             action_id = f"{decision_id}-act"
             act_start = self.clock.monotonic()
@@ -227,7 +243,11 @@ class LangGraphR1Runtime:
             if fallback_applied:
                 fallback_count += 1
 
-            # FIX-R1-03: Log ActionEvent at execution start
+            # Block any new execution if TerminalStateFence is already closed (R1-FIX-04 B.3)
+            if run_fence.is_terminal:
+                run_fence.record_late_result()
+                return {"node_trace": trace, "terminal_status": run_fence.terminal_state}
+
             if self.trajectory_logger is not None:
                 self.trajectory_logger.log_action(
                     trajectory_id=gstate["trajectory_id"],
@@ -237,6 +257,8 @@ class LangGraphR1Runtime:
                     executed_action=action,
                     executed_parameters=params,
                     fallback_applied=fallback_applied,
+                    owner_id=constraints_spec.owner_id,
+                    service_id=constraints_spec.service_id,
                 )
 
             outcome = "success"
@@ -249,12 +271,19 @@ class LangGraphR1Runtime:
 
             try:
                 if action in (ActionType.CALL_MODEL.value, ActionType.DEFAULT_CONFIG.value, ActionType.SAFE_RESPOND.value):
+                    if run_deadline.is_expired():
+                        raise TimeoutError("run_deadline_exceeded")
+
                     if action == ActionType.DEFAULT_CONFIG.value:
                         st.reasoning_effort = params.get("reasoning_effort", constraints_spec.default_reasoning_effort)
+                    elif action == ActionType.CALL_MODEL.value and "reasoning_effort" in params:
+                        st.reasoning_effort = params["reasoning_effort"]
+
+                    # R1-FIX-07: SAFE_RESPOND disables tools cleanly without mutating actual tool_call_count
+                    prev_max_tools = st.max_tool_calls
                     if action == ActionType.SAFE_RESPOND.value:
-                        # Disable further tool calls safely without exposing denied data
                         st.pending_tool_calls = []
-                        st.tool_call_count = st.max_tool_calls
+                        st.max_tool_calls = st.tool_call_count
 
                     await _emit("step.started", {"step": st.step_count + 1})
                     await _emit(
@@ -268,7 +297,17 @@ class LangGraphR1Runtime:
                     async def on_reasoning_delta(chunk: str):
                         await _emit("reasoning.delta", {"delta": chunk, "step": st.step_count})
 
-                    res = await model_node(st, on_delta=on_delta, on_reasoning_delta=on_reasoning_delta)
+                    try:
+                        async with asyncio.timeout(run_deadline.remaining_seconds()):
+                            res = await model_node(st, on_delta=on_delta, on_reasoning_delta=on_reasoning_delta)
+                    finally:
+                        if action == ActionType.SAFE_RESPOND.value:
+                            st.max_tool_calls = prev_max_tools
+
+                    if run_fence.is_terminal:
+                        run_fence.record_late_result()
+                        return {"node_trace": trace, "terminal_status": run_fence.terminal_state}
+
                     st.messages = res["messages"]
                     st.step_count = res["step_count"]
                     st.pending_tool_calls = res.get("pending_tool_calls", [])
@@ -299,18 +338,36 @@ class LangGraphR1Runtime:
                             last_tool_meta = None
                             st.final_answer = None
                             st.messages.append(GatewayMessage(role="user", content=esc_prompt))
-                            await _emit("step.completed", {"step": st.step_count})
-                        else:
-                            await _emit("step.completed", {"step": st.step_count})
-                    else:
-                        await _emit("step.completed", {"step": st.step_count})
+                    await _emit("step.completed", {"step": st.step_count})
 
                     if action == ActionType.SAFE_RESPOND.value:
-                        st.status = "completed"
-                        terminal_status = "completed"
+                        if (st.final_answer or "").strip():
+                            if run_fence.try_finalize("completed"):
+                                st.status = "completed"
+                                terminal_status = "completed"
+                        else:
+                            if run_fence.try_finalize("failed"):
+                                st.status = "failed"
+                                st.error = {"code": "empty_safe_response", "message": "안전 응답 생성 결과가 비어 있습니다."}
+                                terminal_status = "failed"
+                                outcome = "failed"
 
                 elif action == ActionType.CALL_TOOLS.value:
-                    for tc in st.pending_tool_calls:
+                    if run_deadline.is_expired():
+                        raise TimeoutError("run_deadline_exceeded")
+
+                    # R1-FIX-01: Execute ONLY the exact validated ToolCall list from ValidatedAction!
+                    validated_tc_objs = [
+                        ToolCall(
+                            id=vtc.tool_call_id,
+                            function=FunctionCall(name=vtc.tool_name, arguments=vtc.arguments_json),
+                        )
+                        for vtc in va.validated_tool_calls
+                    ]
+                    if not validated_tc_objs:
+                        raise RuntimeError("validated_action_missing_tool_calls")
+
+                    for tc in validated_tc_objs:
                         await _emit(
                             "tool.started",
                             {
@@ -319,28 +376,48 @@ class LangGraphR1Runtime:
                                 "tool_call_id": tc.id,
                             },
                         )
-                    t_res = await tool_node(st)
+
+                    tool_timeout = run_deadline.cap_timeout(settings.TOOL_TIMEOUT_SECONDS)
+                    async with asyncio.timeout(run_deadline.remaining_seconds()):
+                        t_res = await tool_node(
+                            st,
+                            validated_calls=validated_tc_objs,
+                            constraints=constraints_spec,
+                            timeout_override=tool_timeout,
+                        )
+
+                    if run_fence.is_terminal:
+                        run_fence.record_late_result()
+                        return {"node_trace": trace, "terminal_status": run_fence.terminal_state}
+
                     st.messages = t_res["messages"]
                     st.tool_call_count = t_res["tool_call_count"]
                     st.traces = t_res.get("traces", st.traces)
+                    st.citations = t_res.get("citations", st.citations)
                     st.pending_tool_calls = []
-                    recent_count = len(params.get("tool_names", [])) or len(st.traces)
-                    for tr in st.traces[-recent_count:]:
+
+                    recent_traces = st.traces[-len(validated_tc_objs):]
+                    any_tool_err = False
+                    for tr in recent_traces:
+                        is_err = tr.status != "success"
+                        if is_err:
+                            any_tool_err = True
                         await _emit(
                             "tool.completed",
                             {
                                 "step": st.step_count,
                                 "tool_name": tr.tool_name,
                                 "tool_call_id": tr.tool_call_id,
-                                "is_error": tr.status != "success",
+                                "is_error": is_err,
                                 "duration_ms": tr.duration_ms,
                             },
                         )
-                    # Track tool quality metadata for EscalationGate
+                    if any_tool_err:
+                        outcome = "failed"
                     for msg in reversed(st.messages):
                         if msg.role == "tool":
                             last_tool_meta = PostCallAdapter.inspect(
-                                msg.name or "", msg.content or "", is_error=False
+                                msg.name or "", msg.content or "", is_error=any_tool_err
                             )
                             break
 
@@ -354,43 +431,58 @@ class LangGraphR1Runtime:
                 elif action == ActionType.DENY.value:
                     outcome = "denied"
                     terminal_status = "denied"
-                    st.status = "failed"
-                    st.error = {
-                        "code": gstate.get("last_fallback_reason") or "permission_denied",
-                        "message": "요청이 보안 및 권한 정책에 의해 차단되었습니다.",
-                    }
-                    st.final_answer = None
-                    st.pending_tool_calls = []
-
-                elif action == ActionType.TERMINATE.value:
-                    tstat = params.get("terminal_status") or ("completed" if st.final_answer is not None else "failed")
-                    terminal_status = tstat
-                    if tstat == "completed":
-                        st.status = "completed"
-                        outcome = "success"
-                    elif tstat == "timeout":
-                        st.status = "failed"
-                        st.error = {"code": "run_timeout", "message": "실행 제한 시간을 초과했습니다."}
-                        outcome = "timeout"
-                    else:
+                    if run_fence.try_finalize("failed"):
                         st.status = "failed"
                         st.error = {
-                            "code": gstate.get("last_fallback_reason") or "terminated",
-                            "message": "실행 제약 조건에 의해 중단되었습니다.",
+                            "code": gstate.get("last_fallback_reason") or "permission_denied",
+                            "message": "요청이 보안 및 권한 정책에 의해 차단되었습니다.",
                         }
-                        outcome = "failed"
+                        st.final_answer = None
+                        st.pending_tool_calls = []
+
+                elif action == ActionType.TERMINATE.value:
+                    tstat = params.get("terminal_status") or ("completed" if (st.final_answer or "").strip() else "failed")
+                    if tstat == "completed" and (st.pending_tool_calls or not (st.final_answer or "").strip()):
+                        tstat = "failed"
+                    terminal_status = tstat
+                    if tstat == "completed":
+                        if run_fence.try_finalize("completed"):
+                            st.status = "completed"
+                            outcome = "success"
+                    elif tstat == "timeout":
+                        if run_fence.try_finalize("failed"):
+                            st.status = "failed"
+                            st.error = {"code": "run_timeout", "message": "실행 제한 시간을 초과했습니다."}
+                            outcome = "timeout"
+                    else:
+                        if run_fence.try_finalize("failed"):
+                            st.status = "failed"
+                            st.error = {
+                                "code": gstate.get("last_fallback_reason") or "terminated",
+                                "message": "실행 제약 조건에 의해 중단되었습니다.",
+                            }
+                            outcome = "failed"
                     st.pending_tool_calls = []
 
+            except TimeoutError:
+                outcome = "timeout"
+                terminal_status = "timeout"
+                if run_fence.try_finalize("failed"):
+                    st.status = "failed"
+                    st.error = {"code": "run_timeout", "message": "실행 제한 시간을 초과했습니다."}
+                    st.pending_tool_calls = []
             except GatewayStreamError as gse:
                 outcome = "failed"
                 terminal_status = "failed"
-                st.status = "failed"
-                st.error = {"code": f"gateway_{gse.code}", "message": gse.message}
+                if run_fence.try_finalize("failed"):
+                    st.status = "failed"
+                    st.error = {"code": f"gateway_{gse.code}", "message": gse.message}
             except Exception as exc:
                 outcome = "failed"
                 terminal_status = "failed"
-                st.status = "failed"
-                st.error = {"code": "internal_error", "message": str(exc)}
+                if run_fence.try_finalize("failed"):
+                    st.status = "failed"
+                    st.error = {"code": "internal_error", "message": str(exc)}
 
             if fallback_applied:
                 fallback_records.append(
@@ -410,11 +502,9 @@ class LangGraphR1Runtime:
                     "context_compacted": context_compacted,
                     "fallback_count": fallback_count,
                     "last_tool_meta": last_tool_meta,
-                },
-                self.clock,
+                }
             )
 
-            # FIX-R1-03: Log OutcomeEvent on completion/failure/termination
             if self.trajectory_logger is not None:
                 self.trajectory_logger.log_outcome(
                     trajectory_id=gstate["trajectory_id"],
@@ -425,6 +515,8 @@ class LangGraphR1Runtime:
                     next_state_features=next_sv.to_features_dict(),
                     execution_latency=latency,
                     terminal_status=terminal_status,
+                    owner_id=constraints_spec.owner_id,
+                    service_id=constraints_spec.service_id,
                 )
 
             return {
@@ -439,7 +531,7 @@ class LangGraphR1Runtime:
             }
 
         def should_continue(gstate: R1GraphState) -> Literal["propose", "end"]:
-            if gstate.get("terminal_status") is not None:
+            if gstate.get("terminal_status") is not None or run_fence.is_terminal:
                 return "end"
             st: AgentState = gstate["agent_state"]
             if st.status != "running":
@@ -460,7 +552,8 @@ class LangGraphR1Runtime:
             "agent_state": state,
             "constraints": constraints,
             "trajectory_id": tid,
-            "started_monotonic": started_mono,
+            "deadline": run_deadline,
+            "fence": run_fence,
             "step_index": 0,
             "context_compacted": False,
             "fallback_count": 0,

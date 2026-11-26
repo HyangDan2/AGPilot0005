@@ -235,6 +235,7 @@ class ToolDispatcher:
         allowed_document_ids: Optional[List[str]] = None,
         input_budget_tokens: Optional[int] = None,
         remaining_input_tokens: Optional[int] = None,
+        constraints: Optional[Any] = None,
     ) -> List[DispatchResult]:
         """Executes multiple tool calls concurrently if they are read-only."""
         batch_size = max(1, len(calls))
@@ -248,6 +249,7 @@ class ToolDispatcher:
                 input_budget_tokens=input_budget_tokens,
                 remaining_input_tokens=remaining_input_tokens,
                 batch_size=batch_size,
+                constraints=constraints,
             )
             for call in calls
         ]

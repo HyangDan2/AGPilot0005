@@ -32,17 +32,27 @@ class Settings(BaseModel):
     TOOL_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_TOOL_TIMEOUT_SECONDS", "30.0"))
     RUN_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_RUN_TIMEOUT_SECONDS", "180.0"))
     
-    # Service Auth Tokens (Callers allowed to invoke AGCore)
+    # Service Auth Tokens & Trusted Proxy (R1-FIX-05 Fail-closed)
     SERVICE_TOKENS: str = os.environ.get("AGCORE_SERVICE_TOKENS", "")
+    TRUSTED_PROXY_IPS: str = os.environ.get("AGCORE_TRUSTED_PROXY_IPS", "127.0.0.1,::1")
+    CORS_ALLOW_ORIGINS: str = os.environ.get(
+        "AGCORE_CORS_ALLOW_ORIGINS",
+        "https://hd2lab.duckdns.org" if os.environ.get("AGCORE_ENV", "development").lower() == "production" else "*",
+    )
+    MAX_REQUEST_BODY_BYTES: int = int(os.environ.get("AGCORE_MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 
-    # Environment & Mock Policy
+    # Environment & Mock Policy (production blocks mock fallback fail-closed)
     ENVIRONMENT: str = os.environ.get("AGCORE_ENV", "development")
-    ALLOW_MOCK_FALLBACK: bool = os.environ.get("AGCORE_ALLOW_MOCK_FALLBACK", "true").lower() in ("true", "1", "yes")
+    ALLOW_MOCK_FALLBACK: bool = (
+        False
+        if os.environ.get("AGCORE_ENV", "development").lower() == "production"
+        else os.environ.get("AGCORE_ALLOW_MOCK_FALLBACK", "true").lower() in ("true", "1", "yes")
+    )
 
-    # AGPilot0006 (Document Intelligence) Service Integration
+    # AGPilot0006 (Document Intelligence) Service Integration — NO hardcoded default secret (R1-FIX-05 B.1)
     AGTOOLS_URL: str = os.environ.get("AGCORE_AGTOOLS_URL", "http://127.0.0.1:8006/api/v1")
     AGTOOLS_TENANT: str = os.environ.get("AGCORE_AGTOOLS_TENANT", "default_tenant")
-    AGTOOLS_TOKEN: str = os.environ.get("AGCORE_AGTOOLS_TOKEN", "hd2-doc-secret-token-key-2026")
+    AGTOOLS_TOKEN: str = os.environ.get("AGCORE_AGTOOLS_TOKEN", "")
     AGTOOLS_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_AGTOOLS_TIMEOUT_SECONDS", "10.0"))
 
     # Persistent, bounded full-document analysis (separate from general Agent limits).
