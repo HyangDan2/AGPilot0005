@@ -240,6 +240,8 @@ class AGToolsHttpAdapter(DocumentAdapter):
     def _headers(self) -> Dict[str, str]:
         from app.core.auth import is_agtools_token_valid
 
+        if not settings.AGTOOLS_ENABLED:
+            raise RuntimeError("agtools_disabled")
         if not is_agtools_token_valid(self.token):
             raise RuntimeError("agtools_token_missing_or_invalid")
         headers = {

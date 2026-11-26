@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import hmac
+import json
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import FrozenSet, Optional, Protocol
+from typing import Any, Dict, FrozenSet, List, Optional, Protocol
 
 from fastapi import HTTPException, Request
 
@@ -11,6 +13,13 @@ from app.config import settings
 
 
 ADMIN_ROLES: FrozenSet[str] = frozenset({"admin", "admiral"})
+
+
+class CredentialScopeViolation(PermissionError):
+    """Raised when an authenticated credential attempts to exceed its bound service/tenant/role scope (NG-03)."""
+
+
+current_execution_scope: ContextVar[Optional["ExecutionScope"]] = ContextVar("current_execution_scope", default=None)
 _FORBIDDEN_TOKEN_PLACEHOLDERS: FrozenSet[str] = frozenset(
     {
         "changeme",
@@ -95,18 +104,100 @@ def _is_trusted_proxy_client(request: Request) -> bool:
     return True
 
 
+def _match_credential_scope(provided_token: Optional[str], request: Request) -> Optional[ExecutionScope]:
+    """NG-03: Matches a presented service token against configured Credential Scopes (secret separated from ID)."""
+    if not provided_token or not provided_token.strip():
+        return None
+    raw_scopes = (settings.CREDENTIAL_SCOPES_JSON or "").strip()
+    raw_secrets = (settings.CREDENTIAL_SECRETS_JSON or "").strip()
+    if not raw_scopes or not raw_secrets:
+        return None
+    try:
+        scopes_map: Dict[str, Any] = json.loads(raw_scopes)
+        secrets_map: Dict[str, List[str]] = json.loads(raw_secrets)
+    except Exception:
+        return None
+
+    candidate = provided_token.strip()
+    matched_id: Optional[str] = None
+    for cid, secret_list in secrets_map.items():
+        if cid not in scopes_map or not isinstance(secret_list, list):
+            continue
+        for sec in secret_list:
+            if isinstance(sec, str) and sec.strip() and hmac.compare_digest(candidate, sec.strip()):
+                matched_id = cid
+                break
+        if matched_id:
+            break
+
+    if matched_id is None:
+        return None
+
+    cfg = scopes_map[matched_id]
+    allowed_services = [str(s).strip() for s in (cfg.get("allowed_services") or []) if str(s).strip()]
+    allowed_roles = [str(r).strip().lower() for r in (cfg.get("allowed_roles") or ["service"]) if str(r).strip()]
+    allowed_tenants = [str(t).strip() for t in (cfg.get("allowed_tenants") or [settings.AGTOOLS_TENANT]) if str(t).strip()]
+    owner_delegation = bool(cfg.get("owner_delegation", False))
+    fixed_owner = str(cfg.get("fixed_owner") or matched_id).strip()
+
+    req_service = (request.headers.get("X-HD2Lab-Service") or "").strip()
+    if not req_service:
+        req_service = allowed_services[0] if len(allowed_services) == 1 else ""
+    if not req_service or req_service not in allowed_services:
+        raise CredentialScopeViolation("service_not_in_credential_scope")
+
+    req_tenant = (request.headers.get("X-HD2Lab-Tenant") or "").strip()
+    if req_tenant:
+        if req_tenant not in allowed_tenants:
+            raise CredentialScopeViolation("tenant_not_in_credential_scope")
+        tenant_id = req_tenant
+    else:
+        tenant_id = allowed_tenants[0] if allowed_tenants else settings.AGTOOLS_TENANT
+
+    req_role = (request.headers.get("X-HD2Lab-Role") or "").strip().lower()
+    if req_role and req_role in allowed_roles:
+        role = req_role
+    else:
+        # Never escalate outside allowed_roles
+        role = allowed_roles[0] if allowed_roles else "service"
+
+    if owner_delegation:
+        req_user = (request.headers.get("X-HD2Lab-User") or "").strip()
+        if not req_user:
+            raise CredentialScopeViolation("delegated_owner_header_required")
+        owner_id = req_user
+    else:
+        owner_id = fixed_owner
+
+    return ExecutionScope(
+        tenant_id=tenant_id,
+        owner_id=owner_id,
+        service_id=req_service,
+        role=role,
+        authenticated=True,
+        auth_source=f"credential_scope:{matched_id}",
+    )
+
+
 def resolve_caller_scope(request: Request) -> ExecutionScope:
     """Resolves verified Caller Identity into ExecutionScope.
 
+    - Credential Scopes (NG-03) take highest precedence and strictly bind service, tenant, role, and owner delegation.
     - Standard Service Tokens CANNOT escalate to admin/admiral via HTTP headers (FIX-201).
-    - Admin role requires either ADMIN_SERVICE_TOKENS or a verified Trusted Proxy (with proxy secret in prod).
     - Supports comma-separated key rotation (current + previous keys accepted simultaneously).
     """
     is_prod = settings.ENVIRONMENT.lower() == "production"
+    has_cred_scopes = bool((settings.CREDENTIAL_SCOPES_JSON or "").strip())
     has_service_tokens = bool((settings.SERVICE_TOKENS or "").strip())
     has_admin_tokens = bool((settings.ADMIN_SERVICE_TOKENS or "").strip())
     has_proxy_secret = bool((settings.TRUSTED_PROXY_SECRET or "").strip())
     provided_token = request.headers.get("X-Service-Token")
+
+    # 0. Explicit Credential Scope Binding (NG-03)
+    if has_cred_scopes:
+        scoped = _match_credential_scope(provided_token, request)
+        if scoped is not None:
+            return scoped
 
     # 1. Explicit Admin Service Token (grants admin/admiral capability)
     if has_admin_tokens and validate_service_token(provided_token, settings.ADMIN_SERVICE_TOKENS):
@@ -191,18 +282,28 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
 
 
 def require_authenticated_caller(request: Request) -> ExecutionScope:
-    scope = resolve_caller_scope(request)
+    try:
+        scope = resolve_caller_scope(request)
+    except CredentialScopeViolation as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     if not scope.authenticated:
         raise HTTPException(status_code=401, detail="authentication_required")
     return scope
 
 
 def require_admin_caller(request: Request) -> ExecutionScope:
-    scope = resolve_caller_scope(request)
+    try:
+        scope = resolve_caller_scope(request)
+    except CredentialScopeViolation as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     if not scope.authenticated:
         raise HTTPException(status_code=401, detail="authentication_required")
     is_prod = settings.ENVIRONMENT.lower() == "production"
-    has_token_gate = bool((settings.SERVICE_TOKENS or "").strip() or (settings.ADMIN_SERVICE_TOKENS or "").strip())
+    has_token_gate = bool(
+        (settings.SERVICE_TOKENS or "").strip()
+        or (settings.ADMIN_SERVICE_TOKENS or "").strip()
+        or (settings.CREDENTIAL_SCOPES_JSON or "").strip()
+    )
     if (is_prod or has_token_gate) and not scope.is_admin:
         raise HTTPException(status_code=403, detail="admin_permission_required")
     return scope

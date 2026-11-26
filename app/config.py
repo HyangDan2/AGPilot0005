@@ -32,9 +32,11 @@ class Settings(BaseModel):
     TOOL_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_TOOL_TIMEOUT_SECONDS", "30.0"))
     RUN_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_RUN_TIMEOUT_SECONDS", "180.0"))
     
-    # Service Auth Tokens & Trusted Proxy (R1-FIX-05 / FIX-201 / FIX-203 Fail-closed)
+    # Service Auth Tokens, Credential Scopes & Trusted Proxy (NG-01 / NG-03 Fail-closed)
     SERVICE_TOKENS: str = os.environ.get("AGCORE_SERVICE_TOKENS", "")
     ADMIN_SERVICE_TOKENS: str = os.environ.get("AGCORE_ADMIN_SERVICE_TOKENS", "")
+    CREDENTIAL_SCOPES_JSON: str = os.environ.get("AGCORE_CREDENTIAL_SCOPES", "")
+    CREDENTIAL_SECRETS_JSON: str = os.environ.get("AGCORE_CREDENTIAL_SECRETS", "")
     TRUSTED_PROXY_IPS: str = os.environ.get("AGCORE_TRUSTED_PROXY_IPS", "127.0.0.1,::1")
     TRUSTED_PROXY_SECRET: str = os.environ.get("AGCORE_TRUSTED_PROXY_SECRET", "")
     CORS_ALLOW_ORIGINS: str = os.environ.get(
@@ -91,10 +93,25 @@ def validate_boot_configuration() -> None:
     missing = []
     if settings.AGTOOLS_ENABLED and not is_agtools_token_valid(settings.AGTOOLS_TOKEN):
         missing.append("AGCORE_AGTOOLS_TOKEN")
-    has_service_auth = bool((settings.SERVICE_TOKENS or "").strip() or (settings.ADMIN_SERVICE_TOKENS or "").strip())
+    has_service_auth = bool(
+        (settings.SERVICE_TOKENS or "").strip()
+        or (settings.ADMIN_SERVICE_TOKENS or "").strip()
+        or (settings.CREDENTIAL_SCOPES_JSON or "").strip()
+    )
     has_proxy_auth = bool((settings.TRUSTED_PROXY_SECRET or "").strip())
     if not has_service_auth and not has_proxy_auth:
-        missing.append("AGCORE_SERVICE_TOKENS_OR_AGCORE_TRUSTED_PROXY_SECRET")
+        missing.append("AGCORE_SERVICE_TOKENS_OR_AGCORE_CREDENTIAL_SCOPES_OR_AGCORE_TRUSTED_PROXY_SECRET")
+    if (settings.CREDENTIAL_SCOPES_JSON or "").strip():
+        import json as _json
+        try:
+            scopes = _json.loads(settings.CREDENTIAL_SCOPES_JSON)
+            secrets = _json.loads(settings.CREDENTIAL_SECRETS_JSON or "{}")
+            for cid in scopes:
+                vals = secrets.get(cid)
+                if not isinstance(vals, list) or not vals or not all(is_agtools_token_valid(v) for v in vals):
+                    missing.append(f"AGCORE_CREDENTIAL_SECRETS[{cid}]")
+        except Exception:
+            missing.append("AGCORE_CREDENTIAL_SCOPES_INVALID_JSON")
     if missing:
         raise RuntimeError(
             "Production boot fail-fast: missing or invalid required credentials: " + ", ".join(missing)

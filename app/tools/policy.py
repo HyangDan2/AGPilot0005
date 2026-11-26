@@ -114,13 +114,25 @@ def validate_provider_url(base_url: str) -> str:
     return base_url.strip().rstrip("/")
 
 
-def auth_headers(auth_preset: str, service_id: str = "hd2ai-admin", owner_id: str = "agcore") -> Dict[str, str]:
+def auth_headers(auth_preset: str, service_id: Optional[str] = None, owner_id: Optional[str] = None) -> Dict[str, str]:
     if auth_preset == "agtools_service_token":
-        tenant = "public_tenant" if service_id == "hd2ai-public" else settings.AGTOOLS_TENANT
+        from app.core.auth import current_execution_scope, is_agtools_token_valid
+
+        if not settings.AGTOOLS_ENABLED:
+            raise RuntimeError("agtools_disabled")
+        if not is_agtools_token_valid(settings.AGTOOLS_TOKEN):
+            raise RuntimeError("agtools_token_missing_or_invalid")
+        scope = current_execution_scope.get()
+        if scope is not None:
+            resolved_tenant = scope.tenant_id
+            resolved_owner = scope.owner_id
+        else:
+            resolved_tenant = "public_tenant" if service_id == "hd2ai-public" else settings.AGTOOLS_TENANT
+            resolved_owner = owner_id or "agcore_sync"
         return {
-            "X-Service-Token": settings.AGTOOLS_TOKEN,
-            "X-Tenant-Id": tenant,
-            "X-Owner-Id": owner_id,
+            "X-Service-Token": settings.AGTOOLS_TOKEN.strip(),
+            "X-Tenant-Id": resolved_tenant,
+            "X-Owner-Id": resolved_owner,
             "X-Access-Scope": "private",
         }
     return {}
@@ -172,6 +184,9 @@ class ToolPolicyStore:
         if tool_name in BUILTIN_TOOLS:
             if not providers.get("builtin", {}).get("enabled", True):
                 return False, "builtin_provider_disabled"
+            # NG-01: Respect global AGTOOLS_ENABLED switch across all document.* tools
+            if tool_name.startswith("document.") and not settings.AGTOOLS_ENABLED:
+                return False, "agtools_disabled"
             # If document.* is globally disabled in agtools manifest (when synced), respect it
             agtools = providers.get("agtools", {})
             if tool_name.startswith("document.") and agtools.get("enabled") is False:
@@ -180,12 +195,15 @@ class ToolPolicyStore:
                 synced_names = {t.get("name") for t in agtools.get("tools", [])}
                 if tool_name in ("document.get_outline", "document.search", "document.read_chunk") and tool_name not in synced_names:
                     return False, "tool_globally_disabled"
+        else:
+            if not settings.AGTOOLS_ENABLED:
+                return False, "agtools_disabled"
         if not service_id:
             return True, None
         profile_id = policy.get("service_bindings", {}).get(service_id)
         if not profile_id:
-            # Unknown service defaults to public-safe for safety
-            profile_id = "public-safe"
+            # NG-03 C: Unregistered service MUST fail-closed (no implicit public-safe fallback!)
+            return False, "unregistered_service"
         profile = policy.get("profiles", {}).get(profile_id)
         if not profile:
             return False, "profile_not_found"
@@ -218,6 +236,17 @@ class ToolPolicyStore:
         for prev in list(prov.get("tools") or []):
             if prev.get("kind") == "http":
                 tool_registry.unregister(prev["name"])
+
+        if provider_id == "agtools" and not settings.AGTOOLS_ENABLED:
+            prov["tools"] = []
+            prov["last_sync_at"] = time.time()
+            prov["last_sync_ok"] = True
+            prov["last_error"] = "agtools_disabled"
+            try:
+                self.save(policy)
+            except OSError:
+                pass
+            return prov
 
         if not prov.get("enabled", True):
             prov["tools"] = []
@@ -252,6 +281,17 @@ class ToolPolicyStore:
             return prov
 
     def _register_http_tools(self, prov: Dict[str, Any], tool_registry: Any) -> None:
+        if provider_id == "agtools" and not settings.AGTOOLS_ENABLED:
+            prov["tools"] = []
+            prov["last_sync_at"] = time.time()
+            prov["last_sync_ok"] = True
+            prov["last_error"] = "agtools_disabled"
+            try:
+                self.save(policy)
+            except OSError:
+                pass
+            return prov
+
         if not prov.get("enabled", True):
             return
         base_url = prov.get("base_url") or ""
