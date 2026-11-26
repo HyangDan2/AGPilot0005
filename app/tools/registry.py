@@ -6,6 +6,7 @@ from app.schemas.gateway import ToolDefinition, ToolFunctionDefinition
 from app.tools.builtin.system import echo, get_datetime
 from app.tools.builtin.math import calculate
 from app.tools.builtin.document import get_outline, read_section, search, read_chunk, get_figure_info
+from app.tools.policy import tool_policy
 
 class ToolRegistration(BaseModel):
     name: str
@@ -55,6 +56,9 @@ class ToolRegistry:
         res = []
         for reg in self._tools.values():
             if service and reg.allowed_services and service not in reg.allowed_services:
+                continue
+            allowed, _ = tool_policy.is_tool_allowed(reg.name, service)
+            if not allowed:
                 continue
             res.append(reg)
         return res

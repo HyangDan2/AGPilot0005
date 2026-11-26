@@ -13,6 +13,9 @@ from app.api.document_analysis import router as document_analysis_router
 from app.api.demo import router as demo_router
 from app.api.health import router as health_router
 from app.api.config import router as config_router
+from app.api.tools_admin import router as tools_admin_router
+from app.tools.policy import tool_policy
+from app.tools.registry import registry
 from app.config import settings
 from app.core.runtime_config import sync_contracts_from_gateway
 from app.gateway.client import gateway_client
@@ -23,6 +26,7 @@ BASE_PATH = Path(__file__).resolve().parent.parent
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await sync_contracts_from_gateway(gateway_client, [gateway_client.route, "hd2ai-admin", "hd2ai-public"])
+    await tool_policy.sync_all(registry)
     yield
 
 
@@ -53,7 +57,8 @@ async def security_and_limit_middleware(request: Request, call_next):
         
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
     return response
 
 # Brand Favicons and Assets
@@ -88,6 +93,7 @@ async def custom_swagger_ui_html(request: Request):
 # Include API Routers under /api/v1
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
+app.include_router(tools_admin_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
 app.include_router(document_analysis_router, prefix="/api/v1")
 app.include_router(demo_router, prefix="/api/v1")
@@ -114,3 +120,9 @@ if demo_dist.exists():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host=settings.HOST, port=settings.PORT, reload=True)
+
+
+@app.get("/tool-policy-panel.js", include_in_schema=False)
+async def tool_policy_panel_js():
+    path = BASE_PATH / "demo" / "dist" / "tool-policy-panel.js"
+    return FileResponse(str(path), media_type="application/javascript") if path.exists() else JSONResponse(status_code=404, content={"detail": "Not Found"})

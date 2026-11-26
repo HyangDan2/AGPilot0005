@@ -1,5 +1,8 @@
 """Agent Runner with Lifecycle, SSE Event Streaming, and Cancellation."""
 import asyncio
+import json
+from app.tools.registry import registry
+from app.tools.adapters import ContextAdapter, PostCallAdapter, EscalationGate
 from app.gateway.client import GatewayStreamError
 import time
 import uuid
@@ -72,7 +75,8 @@ class AgentRunner:
         finally:
             document_owner_id.reset(owner_token)
 
-        messages = []
+        active_tool_names = [t.name for t in registry.list_tools(service=service_id)]
+        messages = [GatewayMessage(role="system", content=ContextAdapter.build_system_message(active_tool_names))]
         if refs:
             messages.append(GatewayMessage(
                 role="system",
@@ -135,8 +139,61 @@ class AgentRunner:
         start_time = time.time()
 
         try:
+            if settings.RUNTIME_ENGINE == "langgraph_r1":
+                from app.runtime.langgraph_r1 import LangGraphR1Runtime
+                from app.runtime.policy.constraints import ConstraintSpec
+                from app.tracing.store import get_trajectory_logger
+
+                allowed_tool_set = {t.name for t in registry.list_tools(service=state.service_id)}
+                constraints = ConstraintSpec.from_runtime(
+                    service_id=state.service_id,
+                    owner_id=state.owner_id,
+                    allowed_tools=allowed_tool_set,
+                    max_steps=state.max_steps,
+                    max_tool_calls=state.max_tool_calls,
+                    time_budget_seconds=timeout_seconds,
+                    context_budget_tokens=settings.CONTEXT_BUDGET_TOKENS,
+                    default_reasoning_effort=state.reasoning_effort or "default",
+                )
+                traj_logger = get_trajectory_logger() if settings.TRAJECTORY_ENABLED else None
+                r1_runtime = LangGraphR1Runtime(trajectory_logger=traj_logger)
+                r1_res = await r1_runtime.execute(state, constraints, emit=session.emit)
+                session.finished_at = time.time()
+                if state.status == "completed":
+                    await session.emit("run.completed", {
+                        "citations": state.citations,
+                        "answer_kind": "answer",
+                        "answer": state.final_answer or "",
+                        "model_label": state.model_label,
+                        "total_steps": state.step_count,
+                        "total_tool_calls": state.tool_call_count,
+                        "duration_seconds": round(session.finished_at - start_time, 2),
+                        "terminal_status": r1_res.get("terminal_status") or "completed",
+                        "fallback_applied": bool(r1_res.get("fallback_applied_any", False)),
+                        "reason_code": r1_res.get("last_fallback_reason"),
+                        "runtime_engine": "langgraph_r1",
+                    })
+                else:
+                    err_info = state.error or {}
+                    state.error = {
+                        "code": err_info.get("code") or "terminated",
+                        "message": err_info.get("message") or "에이전트 실행이 중단되었습니다.",
+                    }
+                    await session.emit("run.failed", {
+                        **state.error,
+                        "terminal_status": r1_res.get("terminal_status") or "failed",
+                        "fallback_applied": bool(r1_res.get("fallback_applied_any", False)),
+                        "reason_code": r1_res.get("last_fallback_reason"),
+                        "runtime_engine": "langgraph_r1",
+                    })
+                return
+
             async with asyncio.timeout(timeout_seconds):
                 # We execute the graph step-by-step to emit fine-grained SSE events
+                last_tool_meta = None
+                attempted_tool_sigs = set()
+                escalations_used = 0
+                allowed_tool_set = {t.name for t in registry.list_tools(service=state.service_id)}
                 while state.step_count < state.max_steps and state.status == "running":
                     await session.emit("step.started", {"step": state.step_count + 1})
                     await session.emit("model.started", {"step": state.step_count + 1, 'reasoning_effort': state.reasoning_effort or 'default'})
@@ -167,6 +224,16 @@ class AgentRunner:
                     if state.pending_tool_calls and state.tool_call_count + len(state.pending_tool_calls) > state.max_tool_calls:
                         raise DocumentReferenceError("tool_call_budget_exceeded")
                     if not state.pending_tool_calls:
+                        should_esc, esc_prompt = EscalationGate.evaluate(
+                            last_tool_meta, attempted_tool_sigs, allowed_tool_set, escalations_used, budget=1
+                        )
+                        if should_esc and esc_prompt and state.step_count + 1 < state.max_steps:
+                            escalations_used += 1
+                            last_tool_meta = None
+                            state.messages.append(GatewayMessage(role="user", content=esc_prompt))
+                            await session.emit("tool.started", {"step": state.step_count, "tool_name": "quality.escalate", "tool_call_id": f"esc-{escalations_used}"})
+                            await session.emit("tool.completed", {"step": state.step_count, "tool_name": "quality.escalate", "tool_call_id": f"esc-{escalations_used}", "is_error": False, "duration_ms": 1})
+                            continue
                         answer = state.final_answer or "".join(answer_parts)
                         if state.citations:
                             from app.runtime.tasks.presentation import legacy_citations
@@ -207,6 +274,12 @@ class AgentRunner:
                         tool_res = await tool_node(state, on_tool_event=on_tool_event)
                         for k, v in tool_res.items():
                             setattr(state, k, v)
+                        for m in state.messages[-max(1, len(tool_res.get("traces", []))):]:
+                            if getattr(m, "role", None) == "tool":
+                                last_tool_meta = PostCallAdapter.inspect(getattr(m, "name", ""), getattr(m, "content", ""), False)
+                        for tr in tool_res.get("traces", []):
+                            sig = f"{tr.tool_name}:{json.dumps(tr.arguments or {}, sort_keys=True, ensure_ascii=False)}"
+                            attempted_tool_sigs.add(sig)
                             
                         await session.emit("step.completed", {
                             "step": state.step_count,

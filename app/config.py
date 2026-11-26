@@ -55,4 +55,14 @@ class Settings(BaseModel):
     TASK_MAX_REPLANS: int = int(os.environ.get("AGCORE_TASK_MAX_REPLANS", "2"))
     TASK_MAX_ANSWER_REPAIRS: int = int(os.environ.get("AGCORE_TASK_MAX_ANSWER_REPAIRS", "2"))
 
+    # Phase R1 Amendment 02: Feature-flagged LangGraph R1 runtime & Append-only Trajectory store
+    RUNTIME_ENGINE: str = os.environ.get("AGCORE_RUNTIME_ENGINE", "legacy")  # "legacy" | "langgraph_r1"
+    TRAJECTORY_DB_PATH: str = os.environ.get(
+        "AGCORE_TRAJECTORY_DB_PATH",
+        "/var/lib/hd2lab-agcore/trajectory.db"
+        if os.access("/var/lib/hd2lab-agcore", os.W_OK)
+        else str(Path(__file__).resolve().parents[1] / "data" / "trajectory.db"),
+    )
+    TRAJECTORY_ENABLED: bool = os.environ.get("AGCORE_TRAJECTORY_ENABLED", "true").lower() in ("true", "1", "yes")
+
 settings = Settings()

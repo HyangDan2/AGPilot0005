@@ -22,7 +22,7 @@ async def test_completed_reference_is_in_agent_context():
         )
     assert session.state.owner_id == "alice"
     assert session.state.context_refs == ["doc_abc123"]
-    assert "doc_abc123" in session.state.messages[0].content
+    assert any("doc_abc123" in (m.content or "") for m in session.state.messages if m.role == "system")
     assert session.state.messages[-1].content == "이 문서를 요약해줘"
 
 

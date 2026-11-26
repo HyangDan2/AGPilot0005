@@ -1,14 +1,24 @@
 """Agent Execution and Tracing REST API Endpoints."""
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from typing import Literal, Optional
 from app.runtime.runner import runner, DocumentReferenceError
 from app.schemas.agent import AgentRunRequest, AgentRunResponse
 from app.tools.registry import registry
 from app.runtime.tasks.bootstrap import services
+from app.tracing.store import get_trajectory_logger
 import json
 import re
 
 router = APIRouter(prefix="/agent", tags=["Agent"])
+
+
+class RunFeedbackRequest(BaseModel):
+    feedback_type: Literal["thumbs_up", "thumbs_down", "delayed_eval"]
+    reward_signal: float = Field(ge=-1.0, le=1.0)
+    decision_id: Optional[str] = None
+    trajectory_id: Optional[str] = None
 
 
 def durable_job(run_id):
@@ -134,6 +144,46 @@ async def cancel_agent_run(run_id: str, request: Request):
     if not success:
         raise HTTPException(status_code=400, detail="Cannot cancel run (already finished or not found).")
     return {"run_id": run_id, "status": "cancelled", "message": "Run cancelled."}
+
+
+@router.post("/runs/{run_id}/feedback", status_code=201)
+async def submit_run_feedback(run_id: str, body: RunFeedbackRequest, request: Request):
+    """FIX-R1-03 / REG-POL-18: Records asynchronous FeedbackEvent linked to a run/trajectory."""
+    if not re.fullmatch(r"run-[A-Za-z0-9_-]{4,64}", run_id):
+        raise HTTPException(status_code=422, detail="invalid_run_id")
+    tlogger = get_trajectory_logger()
+    existing = tlogger.store.list_events(run_id=run_id)
+    trajectory_id = body.trajectory_id or (existing[0]["trajectory_id"] if existing else f"traj-{run_id}")
+    ev = tlogger.log_feedback(
+        trajectory_id=trajectory_id,
+        run_id=run_id,
+        decision_id=body.decision_id,
+        feedback_type=body.feedback_type,
+        reward_signal=body.reward_signal,
+    )
+    return {
+        "event_id": ev.event_id,
+        "trajectory_id": ev.trajectory_id,
+        "run_id": ev.run_id,
+        "decision_id": ev.decision_id,
+        "feedback_type": ev.feedback_type,
+        "reward_signal": ev.reward_signal,
+        "timestamp": ev.timestamp,
+    }
+
+
+@router.get("/runs/{run_id}/trajectory")
+async def get_run_trajectory(run_id: str, request: Request):
+    """Reconstructs append-only trajectory events for offline evaluation / admin diagnostics."""
+    if not re.fullmatch(r"run-[A-Za-z0-9_-]{4,64}", run_id):
+        raise HTTPException(status_code=422, detail="invalid_run_id")
+    role = (request.headers.get("X-HD2Lab-Role") or "").lower()
+    service_id = request.headers.get("X-HD2Lab-Service", "hd2ai-admin")
+    if service_id == "hd2ai-public" and role not in ("admin", "admiral"):
+        raise HTTPException(status_code=403, detail="forbidden")
+    tlogger = get_trajectory_logger()
+    return tlogger.store.reconstruct_trajectory(run_id=run_id)
+
 
 @router.get("/agents")
 async def list_agents():

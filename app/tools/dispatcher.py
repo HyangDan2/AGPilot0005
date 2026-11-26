@@ -115,6 +115,7 @@ class ToolDispatcher:
         input_budget_tokens: Optional[int] = None,
         remaining_input_tokens: Optional[int] = None,
         batch_size: int = 1,
+        constraints: Optional[Any] = None,
     ) -> DispatchResult:
         func_name = call.function.name
         call_id = call.id
@@ -162,7 +163,10 @@ class ToolDispatcher:
             error_json = json.dumps({"error": True, "code": "tool_not_found", "message": trace.error_message}, ensure_ascii=False)
             return DispatchResult(call_id, func_name, error_json, trace, is_error=True)
 
-        allowed, deny_reason = tool_policy.is_tool_allowed(func_name, service)
+        if constraints is not None:
+            allowed, deny_reason = constraints.check_tool_permission(func_name)
+        else:
+            allowed, deny_reason = tool_policy.is_tool_allowed(func_name, service)
         if not allowed or (service and reg.allowed_services and service not in reg.allowed_services):
             trace.status = "failed"
             trace.error_code = "permission_denied"
