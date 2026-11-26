@@ -49,6 +49,11 @@
 3. **Migration**: Startup idempotently adds missing columns/index. If pre-existing duplicate feedback rows prevent unique index creation, feedback writes fail closed with **HTTP `503`** while regular agent runs continue unaffected.
 4. **Rollback**: Stop AGCore, restore previous release symlink and `trajectory-pre-r1.2.db`, restart service.
 
+### 4.1 Legacy Tenant-less Durable Analysis Jobs Policy (`RB-01` / `ADD-02`)
+- **Isolation**: Durable analysis jobs created after R1.2 persist a validated `tenant_id::owner_id` composite key (`tenant_id` and `owner_id` containing `::` are rejected with HTTP `403` at API entry and `ValueError` in `AnalysisServices`).
+- **No Auto-Adoption / No Fallback**: Pre-existing tenant-less analysis jobs stored on disk with raw `owner_id` (no `tenant_id::` prefix) are strictly isolated from tenant-scoped API calls (`GET`, `POST /resume`, `POST /cancel` return HTTP `404`). They are NEVER auto-adopted into any tenant or returned via fallback lookup.
+- **Operator Cutover Procedure**: Drain or archive any in-flight legacy jobs under `/var/lib/hd2lab-agcore/analyses/` prior to cutover; post-cutover inspection of legacy job files is operator filesystem-only.
+
 ## 5. HD2AI Frontend Compatibility (`404` / `410` / `503`)
 - **HD2AI Frontend Compatibility (`404` / `410` / `429` / `503`)**
   - `agentClient.ts` treats non-2xx on `GET /runs/{id}`, `POST /runs`, `/cancel`, or `/events` as user-visible error message; `submitRunFeedback` returns `false` on `409`/`503` and shows toast `"피드백 전송에 실패했습니다."` without breaking chat.

@@ -14,7 +14,13 @@ class AnalysisServices:
 
     @staticmethod
     def _effective_owner(owner: str, tenant_id: str | None) -> str:
-        return f"{tenant_id}::{owner}" if tenant_id else owner
+        from app.core.auth import validate_scope_identifier
+
+        safe_owner = validate_scope_identifier(owner, "owner_id")
+        if tenant_id is not None:
+            safe_tenant = validate_scope_identifier(tenant_id, "tenant_id")
+            return f"{safe_tenant}::{safe_owner}"
+        return safe_owner
 
     async def create(
         self,

@@ -19,6 +19,19 @@ class CredentialScopeViolation(PermissionError):
     """Raised when an authenticated credential attempts to exceed its bound service/tenant/role scope (NG-03)."""
 
 
+SCOPE_DELIMITER = "::"
+
+
+def validate_scope_identifier(value: str, field_name: str) -> str:
+    """RB-01: Shared input validation blocking '::' delimiter collisions in tenant_id and owner_id."""
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise ValueError(f"empty_{field_name}")
+    if SCOPE_DELIMITER in cleaned:
+        raise ValueError(f"invalid_{field_name}_delimiter")
+    return cleaned
+
+
 current_execution_scope: ContextVar[Optional["ExecutionScope"]] = ContextVar("current_execution_scope", default=None)
 _FORBIDDEN_TOKEN_PLACEHOLDERS: FrozenSet[str] = frozenset(
     {
@@ -57,28 +70,28 @@ class ExecutionScope:
         return self.authenticated and self.role in ADMIN_ROLES
 
     def can_access_tenant(self, target_tenant: Optional[str]) -> bool:
-        """HF-02 / ADD-01: Strict tenant isolation with NO implicit wildcard for regular admins."""
+        """HF-02 / ADD-01 / RB-02: Strict tenant isolation; admin with None/empty scope explicitly fails closed."""
         if not self.authenticated:
             return False
         if not self.is_admin:
             return bool(target_tenant) and target_tenant == self.tenant_id
-        if self.allowed_tenants is not None:
-            if "*" in self.allowed_tenants:
-                return True
-            return bool(target_tenant) and target_tenant in self.allowed_tenants
-        return bool(target_tenant) and target_tenant == self.tenant_id
+        if not self.allowed_tenants:
+            return False
+        if "*" in self.allowed_tenants:
+            return True
+        return bool(target_tenant) and target_tenant in self.allowed_tenants
 
     def can_access_service(self, target_service: Optional[str]) -> bool:
-        """ADD-01: Strict service isolation with NO implicit wildcard for regular admins."""
+        """ADD-01 / RB-02: Strict service isolation; admin with None/empty scope explicitly fails closed."""
         if not self.authenticated:
             return False
         if not self.is_admin:
             return bool(target_service) and target_service == self.service_id
-        if self.allowed_services is not None:
-            if "*" in self.allowed_services:
-                return True
-            return bool(target_service) and target_service in self.allowed_services
-        return bool(target_service) and target_service == self.service_id
+        if not self.allowed_services:
+            return False
+        if "*" in self.allowed_services:
+            return True
+        return bool(target_service) and target_service in self.allowed_services
 
 
 def scoped_analysis_owner(scope: ExecutionScope) -> str:
@@ -167,7 +180,19 @@ def _match_credential_scope(provided_token: Optional[str], request: Request) -> 
     cfg = scopes_map[matched_id]
     allowed_services = [str(s).strip() for s in (cfg.get("allowed_services") or []) if str(s).strip()]
     allowed_roles = [str(r).strip().lower() for r in (cfg.get("allowed_roles") or ["service"]) if str(r).strip()]
-    allowed_tenants = [str(t).strip() for t in (cfg.get("allowed_tenants") or [settings.AGTOOLS_TENANT]) if str(t).strip()]
+    req_role = (request.headers.get("X-HD2Lab-Role") or "").strip().lower()
+    if req_role and req_role in allowed_roles:
+        role = req_role
+    else:
+        role = allowed_roles[0] if allowed_roles else "service"
+
+    # RB-02: For admin roles, NEVER auto-default omitted/empty allowed_tenants (must fail closed!)
+    raw_tenants = cfg.get("allowed_tenants")
+    if role in ADMIN_ROLES:
+        allowed_tenants = [str(t).strip() for t in (raw_tenants or []) if str(t).strip()]
+    else:
+        allowed_tenants = [str(t).strip() for t in (raw_tenants if raw_tenants is not None else [settings.AGTOOLS_TENANT]) if str(t).strip()]
+
     owner_delegation = bool(cfg.get("owner_delegation", False))
     fixed_owner = str(cfg.get("fixed_owner") or matched_id).strip()
 
@@ -187,13 +212,6 @@ def _match_credential_scope(provided_token: Optional[str], request: Request) -> 
     else:
         tenant_id = concrete_tenants[0] if concrete_tenants else settings.AGTOOLS_TENANT
 
-    req_role = (request.headers.get("X-HD2Lab-Role") or "").strip().lower()
-    if req_role and req_role in allowed_roles:
-        role = req_role
-    else:
-        # Never escalate outside allowed_roles
-        role = allowed_roles[0] if allowed_roles else "service"
-
     if owner_delegation:
         req_user = (request.headers.get("X-HD2Lab-User") or "").strip()
         if not req_user:
@@ -201,6 +219,12 @@ def _match_credential_scope(provided_token: Optional[str], request: Request) -> 
         owner_id = req_user
     else:
         owner_id = fixed_owner
+
+    try:
+        tenant_id = validate_scope_identifier(tenant_id, "tenant_id")
+        owner_id = validate_scope_identifier(owner_id, "owner_id")
+    except ValueError as exc:
+        raise CredentialScopeViolation(str(exc)) from exc
 
     return ExecutionScope(
         tenant_id=tenant_id,
@@ -336,6 +360,11 @@ def _assert_registered_service(scope: ExecutionScope) -> None:
 
     if not tool_policy.is_registered_service(scope.service_id):
         raise HTTPException(status_code=403, detail="unregistered_service")
+    try:
+        validate_scope_identifier(scope.tenant_id, "tenant_id")
+        validate_scope_identifier(scope.owner_id, "owner_id")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 def require_authenticated_caller(request: Request) -> ExecutionScope:

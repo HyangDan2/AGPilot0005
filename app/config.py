@@ -116,6 +116,14 @@ def validate_boot_configuration() -> None:
                         if norm_v in seen_secrets and seen_secrets[norm_v] != cid:
                             missing.append(f"duplicate_credential_secret:{seen_secrets[norm_v]}:{cid}")
                         seen_secrets[norm_v] = cid
+                    cfg = scopes.get(cid) or {}
+                    if isinstance(cfg, dict):
+                        fixed_owner = str(cfg.get("fixed_owner") or "")
+                        if "::" in fixed_owner:
+                            missing.append(f"invalid_fixed_owner_delimiter:{cid}")
+                        for t in (cfg.get("allowed_tenants") or []):
+                            if "::" in str(t):
+                                missing.append(f"invalid_tenant_delimiter:{cid}")
         except Exception:
             missing.append("AGCORE_CREDENTIAL_SCOPES_INVALID_JSON")
     if missing:
