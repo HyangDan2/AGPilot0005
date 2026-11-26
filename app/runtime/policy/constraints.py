@@ -91,7 +91,7 @@ class ConstraintSpec:
         max_tool_calls: int,
         time_budget_seconds: float,
         context_budget_tokens: int,
-        authenticated: bool = True,
+        authenticated: bool = False,
         safety_blocked: bool = False,
         safety_reason: Optional[str] = None,
         default_reasoning_effort: str = "default",

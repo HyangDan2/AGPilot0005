@@ -238,14 +238,17 @@ class AGToolsHttpAdapter(DocumentAdapter):
         self.timeout = timeout or settings.AGTOOLS_TIMEOUT_SECONDS
 
     def _headers(self) -> Dict[str, str]:
+        from app.core.auth import is_agtools_token_valid
+
+        if not is_agtools_token_valid(self.token):
+            raise RuntimeError("agtools_token_missing_or_invalid")
         headers = {
             "Accept": "application/json",
             "User-Agent": "HD2Lab-AGCore/1.1",
+            "Authorization": f"Bearer {self.token.strip()}",
+            "X-Owner-Id": document_owner_id.get(),
+            "X-Tenant-Id": settings.AGTOOLS_TENANT,
         }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        headers["X-Owner-Id"] = document_owner_id.get()
-        headers["X-Tenant-Id"] = settings.AGTOOLS_TENANT
         return headers
 
     async def get_outline(self, doc_id: str) -> Dict[str, Any]:

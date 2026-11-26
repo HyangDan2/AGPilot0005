@@ -53,7 +53,20 @@ class AgentRunner:
         service_id: str = "hd2ai-admin",
         custom_client: Optional[Any] = None,
         owner_id: str = "default_user",
+        caller_scope: Optional[Any] = None,
     ) -> AgentRunSession:
+        # FIX-202: Fail-closed authentication check on runtime entry
+        if caller_scope is not None:
+            if not getattr(caller_scope, "authenticated", False):
+                raise PermissionError("unauthenticated_runtime_entry")
+            service_id = caller_scope.service_id or service_id
+            owner_id = caller_scope.owner_id or owner_id
+            is_authenticated = True
+        else:
+            if settings.ENVIRONMENT.lower() == "production":
+                raise PermissionError("caller_scope_required_in_production")
+            is_authenticated = True
+
         run_id = f"run-{uuid.uuid4().hex[:16]}"
         opts = req.options
         refs = list(dict.fromkeys(req.context_refs))
@@ -91,6 +104,7 @@ class AgentRunner:
             session_id=req.session_id,
             service_id=service_id,
             owner_id=owner_id,
+            authenticated=is_authenticated,
             context_refs=refs,
             document_titles=titles,
             messages=messages,
@@ -147,7 +161,7 @@ class AgentRunner:
                 constraints = ConstraintSpec.from_runtime(
                     service_id=state.service_id,
                     owner_id=state.owner_id,
-                    authenticated=True,
+                    authenticated=bool(state.authenticated),
                     allowed_tools=allowed_tool_set,
                     max_steps=state.max_steps,
                     max_tool_calls=state.max_tool_calls,

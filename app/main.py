@@ -25,6 +25,8 @@ BASE_PATH = Path(__file__).resolve().parent.parent
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    from app.config import validate_boot_configuration
+    validate_boot_configuration()
     await sync_contracts_from_gateway(gateway_client, [gateway_client.route, "hd2ai-admin", "hd2ai-public"])
     await tool_policy.sync_all(registry)
     try:

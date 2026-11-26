@@ -81,6 +81,7 @@ def test_reg_pol_12_validator_reject_and_safe_fallback():
     base_constraints = ConstraintSpec.from_runtime(
         service_id="hd2ai-public",
         owner_id="guest",
+        authenticated=True,
         allowed_tools=["system.echo"],
         max_steps=4,
         max_tool_calls=2,
@@ -112,7 +113,7 @@ def test_reg_pol_12_validator_reject_and_safe_fallback():
 
     # 3. Safety policy violation -> DENY
     unsafe = ConstraintSpec.from_runtime(
-        service_id="hd2ai-public", owner_id="guest", allowed_tools=["system.echo"],
+        service_id="hd2ai-public", owner_id="guest", authenticated=True, allowed_tools=["system.echo"],
         max_steps=4, max_tool_calls=2, time_budget_seconds=60.0, context_budget_tokens=2000,
         safety_blocked=True, safety_reason="blocked_policy", check_live_tool_policy=False,
     )
@@ -165,6 +166,7 @@ def test_reg_pol_13_fallback_permission_revalidation():
     constraints = ConstraintSpec.from_runtime(
         service_id="hd2ai-public",
         owner_id="guest",
+        authenticated=True,
         allowed_tools=["system.echo"],
         max_steps=4,
         max_tool_calls=2,
@@ -195,7 +197,7 @@ def test_reg_pol_13_fallback_permission_revalidation():
 def test_reg_pol_14_no_infinite_retry_loop():
     validator = ActionValidator()
     constraints = ConstraintSpec.from_runtime(
-        service_id="hd2ai-admin", owner_id="u1", allowed_tools=["system.echo"],
+        service_id="hd2ai-admin", owner_id="u1", authenticated=True, allowed_tools=["system.echo"],
         max_steps=5, max_tool_calls=2, time_budget_seconds=60.0, context_budget_tokens=2000,
         check_live_tool_policy=False,
     )
@@ -289,6 +291,7 @@ async def test_reg_pol_18_delayed_feedback_linkage(tmp_path, monkeypatch):
         constraints={}, chosen_action="CALL_MODEL", proposed_parameters={},
         behavior_policy_version="agpolicy-r1-v1", config_digest="1122",
         action_probability=None, validator_result={"accepted": True},
+        owner_id="default_user", service_id="hd2ai-admin",
     )
     monkeypatch.setattr("app.api.agent.get_trajectory_logger", lambda: tlogger)
 
@@ -318,6 +321,7 @@ async def test_reg_pol_19_deterministic_mock_clock_replay(tmp_path):
     constraints = ConstraintSpec.from_runtime(
         service_id="hd2ai-admin",
         owner_id="replay-user",
+        authenticated=True,
         allowed_tools=["system.echo"],
         max_steps=6,
         max_tool_calls=4,

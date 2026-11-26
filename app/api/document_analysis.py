@@ -2,15 +2,16 @@
 import asyncio
 import json
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Literal
 
+from app.core.auth import ExecutionScope, require_authenticated_caller
 from app.runtime.tasks.bootstrap import services
 from app.runtime.tasks.domain import BudgetExceeded
 
-router = APIRouter(prefix="/agent/analyses", tags=["Document Analysis"])
+router = APIRouter(prefix="/agent/analyses", tags=["Document Analysis"], dependencies=[Depends(require_authenticated_caller)])
 
 
 class AnalysisRequest(BaseModel):
@@ -20,7 +21,8 @@ class AnalysisRequest(BaseModel):
 
 
 def _identity(request: Request) -> tuple[str, str]:
-    return request.headers.get("X-HD2Lab-User") or "default_user", request.headers.get("X-HD2Lab-Service") or "hd2ai-admin"
+    scope: ExecutionScope = require_authenticated_caller(request)
+    return scope.owner_id, scope.service_id
 
 
 @router.post("", status_code=202)

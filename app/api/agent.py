@@ -33,10 +33,10 @@ def durable_job(run_id):
 
 @router.post("/runs")
 async def create_agent_run(req: AgentRunRequest, request: Request):
-    """Initiates an agent run session."""
-    # Service identity extracted from header or default
-    service_id = request.headers.get("X-HD2Lab-Service", "hd2ai-admin")
-    owner = request.headers.get("X-HD2Lab-User") or "default_user"
+    """Initiates an agent run session with verified Caller ExecutionScope (FIX-201 / FIX-202)."""
+    scope = require_authenticated_caller(request)
+    service_id = scope.service_id
+    owner = scope.owner_id
     if any(m.get('role') not in ('user', 'assistant') or set(m) - {'role', 'content'} for m in req.history) or len(json.dumps(req.history, ensure_ascii=False).encode()) > 24000:
         raise HTTPException(422, 'invalid_task_history')
     if service_id in ('hd2ai-admin', 'hd2ai-beta', 'hd2ai-public') and (req.context_refs or req.analysis_refs):
@@ -53,10 +53,11 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
             return StreamingResponse(deferred(), media_type='text/event-stream', headers={'Cache-Control':'no-store','X-Accel-Buffering':'no'})
         return JSONResponse({'run_id': run_id, **job}, status_code=202)
     try:
-        session = await runner.create_run(req, service_id=service_id,
-                                          owner_id=request.headers.get("X-HD2Lab-User") or "default_user")
+        session = await runner.create_run(req, service_id=service_id, owner_id=owner, caller_scope=scope)
     except DocumentReferenceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
     await runner.start_run(session)
     
     if req.stream:
@@ -83,15 +84,16 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
 @router.get("/runs/{run_id}", response_model=AgentRunResponse)
 async def get_agent_run(run_id: str, request: Request):
     """Retrieves current run status, final answer, and execution traces."""
+    scope = require_authenticated_caller(request)
     job_id = durable_job(run_id)
     if job_id:
-        job = services(request.app).get(job_id, request.headers.get('X-HD2Lab-User') or 'default_user', request.headers.get('X-HD2Lab-Service', 'hd2ai-admin'))
+        job = services(request.app).get(job_id, scope.owner_id, scope.service_id)
         if job is None: raise HTTPException(404, 'Run not found')
         return AgentRunResponse(run_id=run_id, agent_id='general-agent', status=job['status'], answer=job['answer'], model_label=job.get('model_label'),
             usage={'job_id':job_id,'model_calls':job['model_calls'],'document_calls':job.get('document_calls',0)},
             created_at=job['created_at'], error={'code':job['error_code'],'message':job['error_code']} if job['error_code'] else None)
     session = runner.get_session(run_id)
-    if not session or session.state.owner_id != (request.headers.get('X-HD2Lab-User') or 'default_user') or session.state.service_id != request.headers.get('X-HD2Lab-Service', 'hd2ai-admin'):
+    if not session or (not scope.is_admin and (session.state.owner_id != scope.owner_id or session.state.service_id != scope.service_id)):
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
         
     state = session.state
@@ -152,13 +154,14 @@ async def get_agent_events(run_id: str, request: Request):
 @router.post("/runs/{run_id}/cancel")
 async def cancel_agent_run(run_id: str, request: Request):
     """Cancels an in-progress agent run."""
+    scope = require_authenticated_caller(request)
     job_id = durable_job(run_id)
     if job_id:
-        job = services(request.app).cancel(job_id, request.headers.get('X-HD2Lab-User') or 'default_user', request.headers.get('X-HD2Lab-Service', 'hd2ai-admin'))
+        job = services(request.app).cancel(job_id, scope.owner_id, scope.service_id)
         if job is None: raise HTTPException(404, 'Run not found')
         return {'run_id':run_id,'status':job['status']}
     session = runner.get_session(run_id)
-    if not session or session.state.owner_id != (request.headers.get('X-HD2Lab-User') or 'default_user') or session.state.service_id != request.headers.get('X-HD2Lab-Service', 'hd2ai-admin'):
+    if not session or (not scope.is_admin and (session.state.owner_id != scope.owner_id or session.state.service_id != scope.service_id)):
         raise HTTPException(404, 'Run not found')
     success = await runner.cancel_run(run_id)
     if not success:
@@ -186,11 +189,11 @@ async def submit_run_feedback(run_id: str, body: RunFeedbackRequest, request: Re
     actual_trajectory_id = (meta or {}).get("trajectory_id") or f"traj-{run_id}"
     known_decisions = (meta or {}).get("decision_ids") or set()
 
-    # 2. Ownership & scope verification
+    # 2. Ownership & scope verification (FIX-204: unowned legacy records are strictly admin-only!)
     if not scope.is_admin:
-        if run_owner and run_owner != scope.owner_id:
-            raise HTTPException(status_code=403, detail="forbidden")
-        if run_service and run_service != scope.service_id:
+        if not run_owner or not run_service:
+            raise HTTPException(status_code=403, detail="unowned_run_admin_only")
+        if run_owner != scope.owner_id or run_service != scope.service_id:
             raise HTTPException(status_code=403, detail="forbidden")
 
     # 3. Referential integrity: trajectory_id and decision_id must belong to this run
@@ -251,11 +254,11 @@ async def get_run_trajectory(run_id: str, request: Request):
         raise HTTPException(status_code=404, detail="trajectory_not_found")
 
     if not scope.is_admin:
+        if not meta.get("owner_id") or not meta.get("service_id"):
+            raise HTTPException(status_code=403, detail="unowned_trajectory_admin_only")
         if meta.get("service_id") == "hd2ai-public":
             raise HTTPException(status_code=403, detail="forbidden")
-        if meta.get("owner_id") and meta.get("owner_id") != scope.owner_id:
-            raise HTTPException(status_code=403, detail="forbidden")
-        if meta.get("service_id") and meta.get("service_id") != scope.service_id:
+        if meta.get("owner_id") != scope.owner_id or meta.get("service_id") != scope.service_id:
             raise HTTPException(status_code=403, detail="forbidden")
 
     return tlogger.store.reconstruct_trajectory(run_id=run_id)

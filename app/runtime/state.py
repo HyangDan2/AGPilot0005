@@ -9,6 +9,7 @@ class AgentState(BaseModel):
     session_id: Optional[str] = None
     service_id: Optional[str] = None
     owner_id: str = "default_user"
+    authenticated: bool = False
     context_refs: List[str] = Field(default_factory=list)
     document_titles: Dict[str,str] = Field(default_factory=dict)
     citations: List[Dict[str,Any]] = Field(default_factory=list)
