@@ -217,7 +217,7 @@ class AgentRunner:
                 attempted_tool_sigs = set()
                 escalations_used = 0
                 allowed_tool_set = {t.name for t in registry.list_tools(service=state.service_id)}
-                while state.step_count < state.max_steps and state.status == "running":
+                while state.step_count < state.max_steps and state.status == "running" and not session.fence.is_terminal:
                     await session.emit("step.started", {"step": state.step_count + 1})
                     await session.emit("model.started", {"step": state.step_count + 1, 'reasoning_effort': state.reasoning_effort or 'default'})
                     
@@ -227,6 +227,9 @@ class AgentRunner:
                     is_pseudo_tool = False
                     async def on_delta(token: str):
                         nonlocal has_streamed_delta, is_pseudo_tool
+                        if session.fence.is_terminal:
+                            session.fence.record_late_result()
+                            return
                         answer_parts.append(token)
                         if "<tool_call" in token or "<function" in token or re.search(r"<\s*(?:tool_call|function\b)", "".join(answer_parts), re.I):
                             is_pseudo_tool = True
@@ -235,11 +238,18 @@ class AgentRunner:
                             await session.emit("answer.delta", {"delta": token})
 
                     async def on_reasoning(token: str):
+                        if session.fence.is_terminal:
+                            session.fence.record_late_result()
+                            return
                         await session.emit('reasoning.delta', {'delta': token})
 
                     # 2. Invoke Model Node
                     from app.runtime.graph import model_node, tool_node
                     model_res = await model_node(state, on_delta=on_delta, on_reasoning_delta=on_reasoning)
+                    # FIX-212: Legacy Terminal State Fence — block late model_node mutation after cancel/timeout!
+                    if session.fence.is_terminal:
+                        session.fence.record_late_result()
+                        return
                     for k, v in model_res.items():
                         setattr(state, k, v)
                     await session.emit('model.completed', {'step': state.step_count, 'reasoning_effort': state.reasoning_effort or 'default'})
@@ -295,6 +305,10 @@ class AgentRunner:
                                 })
 
                         tool_res = await tool_node(state, on_tool_event=on_tool_event)
+                        # FIX-212: Legacy Terminal State Fence — block late tool_node mutation after cancel/timeout!
+                        if session.fence.is_terminal:
+                            session.fence.record_late_result()
+                            return
                         for k, v in tool_res.items():
                             setattr(state, k, v)
                         for m in state.messages[-max(1, len(tool_res.get("traces", []))):]:

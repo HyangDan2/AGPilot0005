@@ -39,10 +39,12 @@ class RunEventBus:
         *,
         max_buffer_size: int = 512,
         subscriber_queue_size: int = 256,
+        max_subscribers: int = 32,
     ):
         self.run_id = run_id
         self.max_buffer_size = max(1, int(max_buffer_size))
         self.subscriber_queue_size = max(1, int(subscriber_queue_size))
+        self.max_subscribers = max(1, int(max_subscribers))
         self._seq: int = 0
         self._buffer: Deque[Tuple[int, SSEEvent]] = deque(maxlen=self.max_buffer_size)
         self._terminal_seq: Optional[int] = None
@@ -161,6 +163,8 @@ class RunEventBus:
         return out
 
     def subscribe(self) -> int:
+        if len(self._subscribers) >= self.max_subscribers:
+            raise RuntimeError("max_subscribers_exceeded")
         self._sub_counter += 1
         sid = self._sub_counter
         sub = _Subscriber(queue=asyncio.Queue(maxsize=self.subscriber_queue_size))
@@ -180,27 +184,34 @@ class RunEventBus:
         last_event_id: Optional[str] = None,
         heartbeat_seconds: float = 2.0,
     ) -> AsyncGenerator[str, None]:
-        """Streams replayed + live SSE frames with zero gap and automatic cleanup."""
-        replay_events: List[SSEEvent]
-        if last_event_id is not None:
-            replay_events = self.replay_after(last_event_id)
-        else:
-            replay_events = [evt for _, evt in self._buffer]
-            if self.terminal_event is not None and (
-                not replay_events or replay_events[-1].event_id != self.terminal_event.event_id
-            ):
-                replay_events.append(self.terminal_event)
-
-        last_sent_seq = self._seq
+        """FIX-211: Subscribe BEFORE snapshotting replay so mid-replay terminal events are never lost."""
+        # Subscribe first so any event published during snapshot is captured in sub.queue
         sid = self.subscribe()
         sub = self._sub_map[sid]
         try:
+            if last_event_id is not None:
+                replay_events = self.replay_after(last_event_id)
+            else:
+                replay_events = [evt for _, evt in self._buffer]
+                if self.terminal_event is not None and (
+                    not replay_events or replay_events[-1].event_id != self.terminal_event.event_id
+                ):
+                    replay_events.append(self.terminal_event)
+
+            last_sent_seq = 0
             for evt in replay_events:
+                try:
+                    last_sent_seq = max(last_sent_seq, self.parse_cursor(evt.event_id))
+                except ValueError:
+                    pass
                 yield evt.to_sse()
                 if self.terminal_event is not None and evt.event_id == self.terminal_event.event_id:
                     return
 
             if self.terminal_event is not None:
+                # Deliver terminal event if finalized right after replay loop
+                if self._terminal_seq is None or self._terminal_seq > last_sent_seq:
+                    yield self.terminal_event.to_sse()
                 return
 
             while True:
@@ -208,13 +219,16 @@ class RunEventBus:
                     evt = await asyncio.wait_for(sub.queue.get(), timeout=heartbeat_seconds)
                 except TimeoutError:
                     if self.terminal_event is not None:
+                        if self._terminal_seq is None or self._terminal_seq > last_sent_seq:
+                            yield self.terminal_event.to_sse()
                         break
                     yield ": heartbeat\n\n"
                     continue
 
                 if evt is None:
+                    if self.terminal_event is not None and (self._terminal_seq is None or self._terminal_seq > last_sent_seq):
+                        yield self.terminal_event.to_sse()
                     break
-                # Deduplicate any event already yielded during initial snapshot
                 try:
                     ev_seq = self.parse_cursor(evt.event_id)
                 except ValueError:
@@ -226,4 +240,5 @@ class RunEventBus:
                 if self.terminal_event is not None and evt.event_id == self.terminal_event.event_id:
                     break
         finally:
+            # Disconnect policy (FIX-211): only detach subscriber; NEVER cancel the Agent Run!
             self.unsubscribe(sid)

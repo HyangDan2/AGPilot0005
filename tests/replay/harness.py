@@ -32,6 +32,9 @@ class RecordedGatewayClient:
         self._clock = clock
         self._idx = 0
 
+    def remaining_unused(self) -> int:
+        return max(0, len(self._steps) - self._idx)
+
     async def execute(
         self,
         *,
@@ -188,4 +191,48 @@ async def run_legacy_replay(
         "citations": state.citations,
         "terminal_state": state.status,
         "final_answer": state.final_answer,
+    }
+
+
+async def run_agent_runner_replay(
+    *,
+    engine: str,
+    message: str,
+    recorded_steps: List[RecordedGatewayStep],
+    db_path: str,
+    monkeypatch: Any,
+) -> Dict[str, Any]:
+    """FIX-210: Full production AgentRunner replay under legacy or langgraph_r1 with identical fixtures."""
+    from app.config import settings
+    from app.runtime.runner import runner
+    from app.schemas.agent import AgentRunRequest
+
+    clock = MockClock()
+    client = RecordedGatewayClient(recorded_steps, clock=clock)
+    store = TrajectoryEventStore(db_path)
+    tlogger = TrajectoryLogger(store, clock=clock)
+
+    monkeypatch.setattr(settings, "RUNTIME_ENGINE", engine)
+    monkeypatch.setattr("app.tracing.store.get_trajectory_logger", lambda: tlogger)
+
+    req = AgentRunRequest(message=message, stream=True)
+    session = await runner.create_run(req, owner_id="replay-user", service_id="hd2ai-admin", custom_client=client)
+    await runner.start_run(session)
+
+    sse_events: List[str] = []
+    async for frame in runner.stream_events(session.state.run_id):
+        sse_events.append(frame)
+        if "event: run.completed" in frame or "event: run.failed" in frame or "event: run.cancelled" in frame:
+            break
+    if session.task:
+        await session.task
+
+    return {
+        "engine": engine,
+        "status": session.state.status,
+        "final_answer": session.state.final_answer,
+        "tool_selection": [tr.tool_name for tr in session.state.traces],
+        "tool_arguments": [tr.arguments for tr in session.state.traces],
+        "sse_event_count": len(sse_events),
+        "unused_fixtures": client.remaining_unused(),
     }
