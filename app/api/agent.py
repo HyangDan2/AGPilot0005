@@ -237,8 +237,8 @@ async def submit_run_feedback(run_id: str, body: RunFeedbackRequest, request: Re
     actual_trajectory_id = (meta or {}).get("trajectory_id") or f"traj-{run_id}"
     known_decisions = (meta or {}).get("decision_ids") or set()
 
-    # 2. Ownership & tenant scope verification (FIX-204 / HF-02: never guess missing tenant!)
-    if not scope.can_access_tenant(run_tenant):
+    # 2. Ownership, tenant & service scope verification (FIX-204 / HF-02 / ADD-01)
+    if not scope.can_access_tenant(run_tenant) or not scope.can_access_service(run_service):
         raise HTTPException(status_code=403, detail="forbidden")
     if not scope.is_admin:
         if not run_owner or not run_service:
@@ -313,7 +313,7 @@ async def get_run_trajectory(run_id: str, request: Request):
     if meta is None:
         raise HTTPException(status_code=404, detail="trajectory_not_found")
 
-    if not scope.can_access_tenant(meta.get("tenant_id")):
+    if not scope.can_access_tenant(meta.get("tenant_id")) or not scope.can_access_service(meta.get("service_id")):
         raise HTTPException(status_code=403, detail="forbidden")
     if not scope.is_admin:
         if not meta.get("owner_id") or not meta.get("service_id"):

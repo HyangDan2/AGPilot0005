@@ -17,8 +17,8 @@
 ## 2. Credential Scope Binding & HD2AI Beta Compatibility (`NG-03`)
 - **HD2AI Beta Call Path**: Browser → Nginx `/admin/agcore/` (Admin SSO Trusted Proxy injecting `X-HD2Lab-User`, `X-HD2Lab-Role`) → AGCore `127.0.0.1:8200`.
 - **Required Nginx Addition Before Production Cutover**:
-  1. Strip any client-supplied `X-Trusted-Proxy-Secret`, `X-HD2Lab-User`, `X-HD2Lab-Role`, `X-HD2Lab-Service` at the edge.
-  2. Inject `proxy_set_header X-Trusted-Proxy-Secret "<rotated-proxy-secret>";` on `/admin/agcore/` and `/HD2AI/agent/` blocks matching `AGCORE_TRUSTED_PROXY_SECRET`.
+  1. Strip any client-supplied `X-Trusted-Proxy-Secret`, `X-HD2Lab-User`, `X-HD2Lab-Role`, `X-HD2Lab-Service`, `X-HD2Lab-Tenant`, `X-HD2Lab-Admin-Tenants`, `X-HD2Lab-Admin-Services` at the edge.
+  2. Inject `proxy_set_header X-Trusted-Proxy-Secret "<rotated-proxy-secret>";` (and only server-verified `X-HD2Lab-*` headers) on `/admin/agcore/` and `/HD2AI/agent/` blocks matching `AGCORE_TRUSTED_PROXY_SECRET`.
 - **Credential Scope Configuration (Service-to-Service / BFF / Future Desktop)**:
   - `AGCORE_CREDENTIAL_SCOPES` (JSON keyed by `credential_id` — NEVER raw secret!):
     ```json

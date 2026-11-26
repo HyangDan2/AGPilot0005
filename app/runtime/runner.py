@@ -146,7 +146,7 @@ class AgentRunner:
         sess = self.sessions.get(run_id)
         if sess is not None:
             if caller_scope is not None:
-                if not caller_scope.can_access_tenant(sess.state.tenant_id):
+                if not caller_scope.can_access_tenant(sess.state.tenant_id) or not caller_scope.can_access_service(sess.state.service_id):
                     return None, "SESSION_NOT_FOUND"
                 if not caller_scope.is_admin and (
                     sess.state.owner_id != caller_scope.owner_id or sess.state.service_id != caller_scope.service_id
@@ -161,9 +161,13 @@ class AgentRunner:
         tb = self._tombstones.get(run_id)
         if tb is not None:
             if caller_scope is not None:
-                if caller_scope.can_access_tenant(tb.tenant_id) and (
-                    caller_scope.is_admin
-                    or (tb.owner_id == caller_scope.owner_id and tb.service_id == caller_scope.service_id)
+                if (
+                    caller_scope.can_access_tenant(tb.tenant_id)
+                    and caller_scope.can_access_service(tb.service_id)
+                    and (
+                        caller_scope.is_admin
+                        or (tb.owner_id == caller_scope.owner_id and tb.service_id == caller_scope.service_id)
+                    )
                 ):
                     return None, "SESSION_EXPIRED"
             elif is_admin or (

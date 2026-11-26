@@ -213,9 +213,38 @@ async def test_fix_204_unowned_trajectory_isolated_from_regular_users(tmp_path, 
         )
         assert r_fb.status_code == 403
 
-        # Verified admin CAN inspect unowned legacy record
-        r_adm = await client.get(
+        # Regular admin without explicit wildcard scope MUST ALSO be denied (ADD-01: no implicit wildcard)
+        r_reg_adm = await client.get(
             "/api/v1/agent/runs/run-unowned001/trajectory",
             headers={"X-HD2Lab-User": "ops", "X-HD2Lab-Service": "hd2ai-admin", "X-HD2Lab-Role": "admiral"},
+        )
+        assert r_reg_adm.status_code == 403
+
+        # Explicit server-configured wildcard admin CAN inspect unowned legacy record (ADD-01)
+        import json as _json
+
+        monkeypatch.setattr(
+            settings,
+            "CREDENTIAL_SCOPES_JSON",
+            _json.dumps(
+                {
+                    "global-admin": {
+                        "allowed_services": ["hd2ai-admin", "*"],
+                        "allowed_roles": ["admiral"],
+                        "allowed_tenants": ["*"],
+                        "owner_delegation": False,
+                        "fixed_owner": "ops",
+                    }
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            settings,
+            "CREDENTIAL_SECRETS_JSON",
+            _json.dumps({"global-admin": ["global-admin-secret-204"]}),
+        )
+        r_adm = await client.get(
+            "/api/v1/agent/runs/run-unowned001/trajectory",
+            headers={"X-Service-Token": "global-admin-secret-204", "X-HD2Lab-Service": "hd2ai-admin"},
         )
         assert r_adm.status_code == 200

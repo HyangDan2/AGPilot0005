@@ -50,20 +50,35 @@ class ExecutionScope:
     authenticated: bool
     auth_source: str  # "credential_scope:<id>" | "trusted_proxy" | "dev_local" | "unauthenticated"
     allowed_tenants: Optional[FrozenSet[str]] = None
+    allowed_services: Optional[FrozenSet[str]] = None
 
     @property
     def is_admin(self) -> bool:
         return self.authenticated and self.role in ADMIN_ROLES
 
     def can_access_tenant(self, target_tenant: Optional[str]) -> bool:
-        """HF-02: Enforces strict tenant isolation for users and explicit management scope for admins."""
+        """HF-02 / ADD-01: Strict tenant isolation with NO implicit wildcard for regular admins."""
         if not self.authenticated:
             return False
         if not self.is_admin:
             return bool(target_tenant) and target_tenant == self.tenant_id
-        if self.allowed_tenants is None or "*" in self.allowed_tenants:
-            return True
-        return bool(target_tenant) and target_tenant in self.allowed_tenants
+        if self.allowed_tenants is not None:
+            if "*" in self.allowed_tenants:
+                return True
+            return bool(target_tenant) and target_tenant in self.allowed_tenants
+        return bool(target_tenant) and target_tenant == self.tenant_id
+
+    def can_access_service(self, target_service: Optional[str]) -> bool:
+        """ADD-01: Strict service isolation with NO implicit wildcard for regular admins."""
+        if not self.authenticated:
+            return False
+        if not self.is_admin:
+            return bool(target_service) and target_service == self.service_id
+        if self.allowed_services is not None:
+            if "*" in self.allowed_services:
+                return True
+            return bool(target_service) and target_service in self.allowed_services
+        return bool(target_service) and target_service == self.service_id
 
 
 def scoped_analysis_owner(scope: ExecutionScope) -> str:
@@ -157,18 +172,20 @@ def _match_credential_scope(provided_token: Optional[str], request: Request) -> 
     fixed_owner = str(cfg.get("fixed_owner") or matched_id).strip()
 
     req_service = (request.headers.get("X-HD2Lab-Service") or "").strip()
+    concrete_services = [s for s in allowed_services if s != "*"]
     if not req_service:
-        req_service = allowed_services[0] if len(allowed_services) == 1 else ""
-    if not req_service or req_service not in allowed_services:
+        req_service = concrete_services[0] if len(concrete_services) == 1 else ""
+    if not req_service or (req_service not in allowed_services and "*" not in allowed_services):
         raise CredentialScopeViolation("service_not_in_credential_scope")
 
     req_tenant = (request.headers.get("X-HD2Lab-Tenant") or "").strip()
+    concrete_tenants = [t for t in allowed_tenants if t != "*"]
     if req_tenant:
-        if req_tenant not in allowed_tenants:
+        if req_tenant not in allowed_tenants and "*" not in allowed_tenants:
             raise CredentialScopeViolation("tenant_not_in_credential_scope")
         tenant_id = req_tenant
     else:
-        tenant_id = allowed_tenants[0] if allowed_tenants else settings.AGTOOLS_TENANT
+        tenant_id = concrete_tenants[0] if concrete_tenants else settings.AGTOOLS_TENANT
 
     req_role = (request.headers.get("X-HD2Lab-Role") or "").strip().lower()
     if req_role and req_role in allowed_roles:
@@ -193,24 +210,38 @@ def _match_credential_scope(provided_token: Optional[str], request: Request) -> 
         authenticated=True,
         auth_source=f"credential_scope:{matched_id}",
         allowed_tenants=frozenset(allowed_tenants),
+        allowed_services=frozenset(allowed_services),
     )
 
 
 def resolve_caller_scope(request: Request) -> ExecutionScope:
-    """HF-01: Unified Caller Identity resolution (Credential Scopes + Verified Trusted Proxy only).
+    """HF-01 / ADD-01: Unified Caller Identity resolution (Credential Scopes + Verified Trusted Proxy only).
 
-    Legacy SERVICE_TOKENS / ADMIN_SERVICE_TOKENS scope-bypass branches are removed.
+    - Legacy SERVICE_TOKENS / ADMIN_SERVICE_TOKENS scope-bypass branches are removed.
+    - Invalid X-Service-Token NEVER falls back to Trusted Proxy or dev_local (ADD-01).
+    - Request headers alone CANNOT expand admin_tenants or admin_services (ADD-01).
+    - No implicit wildcard for regular admins (ADD-01).
     """
     is_prod = settings.ENVIRONMENT.lower() == "production"
     has_cred_scopes = bool((settings.CREDENTIAL_SCOPES_JSON or "").strip())
     has_proxy_secret = bool((settings.TRUSTED_PROXY_SECRET or "").strip())
     provided_token = request.headers.get("X-Service-Token")
 
-    # 1. Explicit Credential Scope Binding (NG-03 / HF-01)
-    if has_cred_scopes:
-        scoped = _match_credential_scope(provided_token, request)
-        if scoped is not None:
-            return scoped
+    # 1. Explicit Credential Scope Binding (NG-03 / HF-01 / ADD-01)
+    # If X-Service-Token is presented, NEVER fall back to Trusted Proxy on mismatch!
+    if provided_token is not None:
+        if has_cred_scopes:
+            scoped = _match_credential_scope(provided_token, request)
+            if scoped is not None:
+                return scoped
+        return ExecutionScope(
+            tenant_id="unauthenticated",
+            owner_id="",
+            service_id="",
+            role="guest",
+            authenticated=False,
+            auth_source="invalid_credential",
+        )
 
     # 2. Verified Trusted Proxy (in prod requires explicit TRUSTED_PROXY_SECRET)
     if _is_trusted_proxy_client(request) and (has_proxy_secret or (not is_prod and not has_cred_scopes)):
@@ -218,15 +249,23 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
         service = (request.headers.get("X-HD2Lab-Service") or "").strip()
         role = (request.headers.get("X-HD2Lab-Role") or "user").strip().lower()
         req_tenant = (request.headers.get("X-HD2Lab-Tenant") or "").strip()
-        admin_tenants_hdr = (request.headers.get("X-HD2Lab-Admin-Tenants") or "").strip()
         if is_prod:
             if not owner or not service:
                 return ExecutionScope("unknown", "", "", "guest", False, "unauthenticated")
             tenant_id = req_tenant or ("public_tenant" if service == "hd2ai-public" else settings.AGTOOLS_TENANT)
-            if admin_tenants_hdr:
-                allowed_t = frozenset(t.strip() for t in admin_tenants_hdr.split(",") if t.strip())
-            else:
-                allowed_t = frozenset({tenant_id})
+            # ADD-01: Admin scope headers are ONLY trusted when TRUSTED_PROXY_SECRET is verified
+            admin_tenants_hdr = (request.headers.get("X-HD2Lab-Admin-Tenants") or "").strip() if has_proxy_secret else ""
+            admin_services_hdr = (request.headers.get("X-HD2Lab-Admin-Services") or "").strip() if has_proxy_secret else ""
+            allowed_t = (
+                frozenset(t.strip() for t in admin_tenants_hdr.split(",") if t.strip())
+                if admin_tenants_hdr
+                else frozenset({tenant_id})
+            )
+            allowed_s = (
+                frozenset(s.strip() for s in admin_services_hdr.split(",") if s.strip())
+                if admin_services_hdr
+                else frozenset({service})
+            )
             return ExecutionScope(
                 tenant_id=tenant_id,
                 owner_id=owner,
@@ -235,21 +274,32 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
                 authenticated=True,
                 auth_source="trusted_proxy",
                 allowed_tenants=allowed_t,
+                allowed_services=allowed_s,
             )
-        tenant_id = req_tenant or ("public_tenant" if service == "hd2ai-public" else settings.AGTOOLS_TENANT)
+        resolved_service = service or "hd2ai-admin"
+        tenant_id = req_tenant or ("public_tenant" if resolved_service == "hd2ai-public" else settings.AGTOOLS_TENANT)
+        # In non-prod without verified proxy secret, ignore admin expansion headers & grant NO implicit wildcard
+        admin_tenants_hdr = (request.headers.get("X-HD2Lab-Admin-Tenants") or "").strip() if has_proxy_secret else ""
+        admin_services_hdr = (request.headers.get("X-HD2Lab-Admin-Services") or "").strip() if has_proxy_secret else ""
         allowed_t = (
             frozenset(t.strip() for t in admin_tenants_hdr.split(",") if t.strip())
             if admin_tenants_hdr
-            else None
+            else frozenset({tenant_id})
+        )
+        allowed_s = (
+            frozenset(s.strip() for s in admin_services_hdr.split(",") if s.strip())
+            if admin_services_hdr
+            else frozenset({resolved_service})
         )
         return ExecutionScope(
             tenant_id=tenant_id,
             owner_id=owner or "default_user",
-            service_id=service or "hd2ai-admin",
+            service_id=resolved_service,
             role=role,
             authenticated=True,
             auth_source="dev_local",
             allowed_tenants=allowed_t,
+            allowed_services=allowed_s,
         )
 
     # 3. Development ASGI TestClient (only when not production and no auth gates configured)
@@ -266,6 +316,8 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
             role=role,
             authenticated=True,
             auth_source="dev_local",
+            allowed_tenants=frozenset({tenant_id}),
+            allowed_services=frozenset({service}),
         )
 
     # 4. Fail-closed
