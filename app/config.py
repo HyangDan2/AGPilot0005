@@ -119,10 +119,10 @@ def validate_boot_configuration() -> None:
                     cfg = scopes.get(cid) or {}
                     if isinstance(cfg, dict):
                         fixed_owner = str(cfg.get("fixed_owner") or "")
-                        if "::" in fixed_owner:
+                        if ":" in fixed_owner:
                             missing.append(f"invalid_fixed_owner_delimiter:{cid}")
                         for t in (cfg.get("allowed_tenants") or []):
-                            if "::" in str(t):
+                            if ":" in str(t):
                                 missing.append(f"invalid_tenant_delimiter:{cid}")
         except Exception:
             missing.append("AGCORE_CREDENTIAL_SCOPES_INVALID_JSON")

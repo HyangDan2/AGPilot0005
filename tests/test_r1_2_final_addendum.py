@@ -161,13 +161,15 @@ async def test_add_01_admin_scope_no_header_expansion_and_no_implicit_wildcard(t
         # Legacy NULL tenant/service -> 403 (no implicit wildcard)!
         assert (await client.get("/api/v1/agent/runs/run-a01-legacy-nil/trajectory", headers=forged_hdrs)).status_code == 403
 
-        # 2) Regular Trusted Proxy admin (no wildcard headers) has NO implicit wildcard
+        # 2) Verified Trusted Proxy admin with explicit management scope (NO implicit wildcard)
         proxy_adm_hdrs = {
             "X-Trusted-Proxy-Secret": "proxy-sec-add01-9999",
             "X-HD2Lab-User": "ops",
             "X-HD2Lab-Service": "hd2ai-beta",
             "X-HD2Lab-Tenant": "tenant-alpha",
             "X-HD2Lab-Role": "admin",
+            "X-HD2Lab-Admin-Tenants": "tenant-alpha",
+            "X-HD2Lab-Admin-Services": "hd2ai-beta",
         }
         assert (await client.get("/api/v1/agent/runs/run-a01-beta-alpha/trajectory", headers=proxy_adm_hdrs)).status_code == 200
         assert (await client.get("/api/v1/agent/runs/run-a01-adm-alpha/trajectory", headers=proxy_adm_hdrs)).status_code == 403

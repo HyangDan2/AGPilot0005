@@ -305,7 +305,20 @@ async def test_reg_pol_18_delayed_feedback_linkage(tmp_path, monkeypatch):
         assert body["trajectory_id"] == "traj-fb-1"
         assert body["reward_signal"] == 1.0
 
-        r2 = await client.get("/api/v1/agent/runs/run-fbapi001/trajectory", headers={"X-HD2Lab-Role": "admin"})
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_SECRET", "proxy-sec-regpol18")
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_IPS", "127.0.0.1,::1,testclient")
+        r2 = await client.get(
+            "/api/v1/agent/runs/run-fbapi001/trajectory",
+            headers={
+                "X-Trusted-Proxy-Secret": "proxy-sec-regpol18",
+                "X-HD2Lab-User": "ops",
+                "X-HD2Lab-Service": "hd2ai-admin",
+                "X-HD2Lab-Tenant": "default_tenant",
+                "X-HD2Lab-Role": "admin",
+                "X-HD2Lab-Admin-Tenants": "default_tenant",
+                "X-HD2Lab-Admin-Services": "hd2ai-admin",
+            },
+        )
         assert r2.status_code == 200
         traj = r2.json()
         assert len(traj["feedback"]) == 1

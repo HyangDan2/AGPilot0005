@@ -78,11 +78,43 @@ async def test_rb_01_delimiter_collision_blocked_in_auth_and_analysis(monkeypatc
         )
         assert r_delegated.status_code == 403
 
-    # 4) Direct AnalysisServices._effective_owner MUST also reject '::' in owner or tenant_id
+    # 4) Direct AnalysisServices._effective_owner MUST also reject single ':' boundary collisions
     with pytest.raises(ValueError):
         AnalysisServices._effective_owner("a::b", "tenant-alpha")
     with pytest.raises(ValueError):
         AnalysisServices._effective_owner("alice", "tenant::alpha")
+    # Boundary collision: tenant="a:" + owner="b" vs tenant="a" + owner=":b" both form "a:::b"
+    with pytest.raises(ValueError):
+        AnalysisServices._effective_owner("b", "a:")
+    with pytest.raises(ValueError):
+        AnalysisServices._effective_owner(":b", "a")
+
+    # 5) Boot config validation MUST reject single ':' in fixed_owner and allowed_tenants
+    from app.config import validate_boot_configuration
+
+    monkeypatch.setattr(settings, "AGTOOLS_ENABLED", False)
+    monkeypatch.setattr(
+        settings,
+        "CREDENTIAL_SCOPES_JSON",
+        json.dumps(
+            {
+                "bad-colon": {
+                    "allowed_services": ["hd2ai-beta"],
+                    "allowed_roles": ["user"],
+                    "allowed_tenants": ["a:"],
+                    "owner_delegation": False,
+                    "fixed_owner": ":b",
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        settings,
+        "CREDENTIAL_SECRETS_JSON",
+        json.dumps({"bad-colon": ["tok-bad-colon-rb01-001"]}),
+    )
+    with pytest.raises(RuntimeError, match="invalid_fixed_owner_delimiter|invalid_tenant_delimiter"):
+        validate_boot_configuration()
 
 
 # ---------------------------------------------------------------------------
@@ -172,3 +204,47 @@ async def test_rb_02_admin_unspecified_or_empty_scope_fails_closed(tmp_path, mon
             },
         )
         assert r.status_code == 403
+
+        # 3) Real API check: Trusted Proxy admin with missing or empty admin scope MUST fail closed (403)
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_SECRET", "proxy-sec-rb02-9999")
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_IPS", "127.0.0.1,::1,testclient")
+        r_proxy_missing = await client.get(
+            "/api/v1/agent/runs/run-rb02-0001/trajectory",
+            headers={
+                "X-Trusted-Proxy-Secret": "proxy-sec-rb02-9999",
+                "X-HD2Lab-User": "ops",
+                "X-HD2Lab-Service": "hd2ai-beta",
+                "X-HD2Lab-Tenant": "default_tenant",
+                "X-HD2Lab-Role": "admin",
+            },
+        )
+        assert r_proxy_missing.status_code == 403
+
+        r_proxy_empty = await client.get(
+            "/api/v1/agent/runs/run-rb02-0001/trajectory",
+            headers={
+                "X-Trusted-Proxy-Secret": "proxy-sec-rb02-9999",
+                "X-HD2Lab-User": "ops",
+                "X-HD2Lab-Service": "hd2ai-beta",
+                "X-HD2Lab-Tenant": "default_tenant",
+                "X-HD2Lab-Role": "admin",
+                "X-HD2Lab-Admin-Tenants": "   ",
+                "X-HD2Lab-Admin-Services": "   ",
+            },
+        )
+        assert r_proxy_empty.status_code == 403
+
+        # 4) Trusted Proxy admin WITH explicit verified management scope succeeds (200)
+        r_proxy_explicit = await client.get(
+            "/api/v1/agent/runs/run-rb02-0001/trajectory",
+            headers={
+                "X-Trusted-Proxy-Secret": "proxy-sec-rb02-9999",
+                "X-HD2Lab-User": "ops",
+                "X-HD2Lab-Service": "hd2ai-beta",
+                "X-HD2Lab-Tenant": "default_tenant",
+                "X-HD2Lab-Role": "admin",
+                "X-HD2Lab-Admin-Tenants": "default_tenant",
+                "X-HD2Lab-Admin-Services": "hd2ai-beta",
+            },
+        )
+        assert r_proxy_explicit.status_code == 200

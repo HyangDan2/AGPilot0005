@@ -20,14 +20,15 @@ class CredentialScopeViolation(PermissionError):
 
 
 SCOPE_DELIMITER = "::"
+FORBIDDEN_SCOPE_CHAR = ":"
 
 
 def validate_scope_identifier(value: str, field_name: str) -> str:
-    """RB-01: Shared input validation blocking '::' delimiter collisions in tenant_id and owner_id."""
+    """RB-01: Shared input validation blocking ':' (including '::' boundary collisions) in tenant_id and owner_id."""
     cleaned = (value or "").strip()
     if not cleaned:
         raise ValueError(f"empty_{field_name}")
-    if SCOPE_DELIMITER in cleaned:
+    if FORBIDDEN_SCOPE_CHAR in cleaned:
         raise ValueError(f"invalid_{field_name}_delimiter")
     return cleaned
 
@@ -277,19 +278,16 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
             if not owner or not service:
                 return ExecutionScope("unknown", "", "", "guest", False, "unauthenticated")
             tenant_id = req_tenant or ("public_tenant" if service == "hd2ai-public" else settings.AGTOOLS_TENANT)
-            # ADD-01: Admin scope headers are ONLY trusted when TRUSTED_PROXY_SECRET is verified
+            # ADD-01 / RB-02: Admin scope headers are ONLY trusted when TRUSTED_PROXY_SECRET is verified;
+            # missing or empty admin scope MUST fail closed (frozenset()), NEVER auto-assigned!
             admin_tenants_hdr = (request.headers.get("X-HD2Lab-Admin-Tenants") or "").strip() if has_proxy_secret else ""
             admin_services_hdr = (request.headers.get("X-HD2Lab-Admin-Services") or "").strip() if has_proxy_secret else ""
-            allowed_t = (
-                frozenset(t.strip() for t in admin_tenants_hdr.split(",") if t.strip())
-                if admin_tenants_hdr
-                else frozenset({tenant_id})
-            )
-            allowed_s = (
-                frozenset(s.strip() for s in admin_services_hdr.split(",") if s.strip())
-                if admin_services_hdr
-                else frozenset({service})
-            )
+            if role in ADMIN_ROLES:
+                allowed_t = frozenset(t.strip() for t in admin_tenants_hdr.split(",") if t.strip())
+                allowed_s = frozenset(s.strip() for s in admin_services_hdr.split(",") if s.strip())
+            else:
+                allowed_t = frozenset({tenant_id})
+                allowed_s = frozenset({service})
             return ExecutionScope(
                 tenant_id=tenant_id,
                 owner_id=owner,
@@ -302,19 +300,15 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
             )
         resolved_service = service or "hd2ai-admin"
         tenant_id = req_tenant or ("public_tenant" if resolved_service == "hd2ai-public" else settings.AGTOOLS_TENANT)
-        # In non-prod without verified proxy secret, ignore admin expansion headers & grant NO implicit wildcard
+        # In non-prod without verified proxy secret, ignore admin expansion headers & fail closed for admin scope
         admin_tenants_hdr = (request.headers.get("X-HD2Lab-Admin-Tenants") or "").strip() if has_proxy_secret else ""
         admin_services_hdr = (request.headers.get("X-HD2Lab-Admin-Services") or "").strip() if has_proxy_secret else ""
-        allowed_t = (
-            frozenset(t.strip() for t in admin_tenants_hdr.split(",") if t.strip())
-            if admin_tenants_hdr
-            else frozenset({tenant_id})
-        )
-        allowed_s = (
-            frozenset(s.strip() for s in admin_services_hdr.split(",") if s.strip())
-            if admin_services_hdr
-            else frozenset({resolved_service})
-        )
+        if role in ADMIN_ROLES:
+            allowed_t = frozenset(t.strip() for t in admin_tenants_hdr.split(",") if t.strip())
+            allowed_s = frozenset(s.strip() for s in admin_services_hdr.split(",") if s.strip())
+        else:
+            allowed_t = frozenset({tenant_id})
+            allowed_s = frozenset({resolved_service})
         return ExecutionScope(
             tenant_id=tenant_id,
             owner_id=owner or "default_user",
