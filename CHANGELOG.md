@@ -1,7 +1,18 @@
 # Changelog
 
 ## [1.2.0-r1.2] - 2026-11-26 (feature/runtime-r1-corrective)
-### Final Release Gate Closure (CP1 `5fe923d` & CP2 — `NG-01` ~ `NG-08`)
+### R1.2 Release Candidate Hotfix (CP1 `4c7451a` & CP2 — `CR-01` ~ `CR-09`)
+- Fixed `_register_http_tools()` undefined variable error, scoped `AGTOOLS_ENABLED=false` strictly to AGTools provider, and handled read-only policy persistence gracefully (`CR-01`).
+- Unified verified immutable `ExecutionScope` propagation through `AgentRunner` (Legacy + LangGraph) to `tool_node` / `Dispatcher` with Tenant + Owner + Service isolation (`CR-02`).
+- Added duplicate credential secret collision fail-fast in `validate_boot_configuration()` and removed all developer PC absolute paths from `app/` and `tests/` (`CR-03`).
+- Propagated Policy-approved `context_budget_tokens` into `tool_node()` inside `LangGraphR1Runtime` (`CR-04`).
+- Upgraded SQLite feedback dedup integrity check to verify actual `PRAGMA index_list` + `PRAGMA index_info` + partial `WHERE` clause + NULL counts (`CR-05`).
+- Prevented overflowed SSE slow subscribers from silently skipping dropped events to receive a normal `run.completed` terminal event (`CR-06`).
+- Added Active Run Admission Control (`429`), automatic finished-session eviction on run create/finish, and unified Status/Cancel/SSE expiration contracts (`CR-07`).
+- Re-raised DB exceptions in `mark_incomplete()` so `AsyncTrajectoryWriter` retains Dirty Markers until actual commit, with bounded `incomplete_trajectories` (`CR-08`).
+- Added terminal `expected_event_count` completion metadata, referential/count completeness validation in `reconstruct_trajectory()`, and fail-closed `export_training_jsonl()` (`CR-09`).
+
+### Final Release Gate Closure (CP1 `5fe923d` & CP2 `304cf49` — `NG-01` ~ `NG-08`)
 - Aligned AGTools deployment contract to single `DOCUMENT_SERVICE_TOKEN` ↔ `AGCORE_AGTOOLS_TOKEN`, enforced `AGTOOLS_ENABLED=false` across all outbound paths, and added read-only `scripts/ops_precheck_r12.sh` (`NG-01`).
 - Added `AGCORE_CREDENTIAL_SCOPES` / `AGCORE_CREDENTIAL_SECRETS` binding, unregistered service fail-closed (`unregistered_service`), and run-scoped `current_execution_scope` for dynamic HTTP tools (`NG-03`).
 - Wired real `AIGatewayClient.execute(_structured=True)` with `httpx.MockTransport` HTTP fixture tests (`NG-02`).

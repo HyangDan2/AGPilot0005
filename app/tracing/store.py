@@ -133,15 +133,7 @@ class TrajectoryEventStore:
                             WHERE event_type = 'FeedbackEvent' AND feedback_dedup_key IS NOT NULL;
                         """
                     )
-                    idx_row = conn.execute(
-                        "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_trajectory_feedback_dedup'"
-                    ).fetchone()
-                    null_fb_count = conn.execute(
-                        "SELECT COUNT(*) FROM trajectory_events WHERE event_type = 'FeedbackEvent' AND feedback_dedup_key IS NULL"
-                    ).fetchone()[0]
-                    self.feedback_dedup_integrity_ok = bool(
-                        idx_row and "UNIQUE" in (idx_row[0] or "").upper() and int(null_fb_count) == 0
-                    )
+                    self.feedback_dedup_integrity_ok = self._verify_feedback_dedup_integrity(conn)
                 except sqlite3.IntegrityError:
                     self.feedback_dedup_integrity_ok = False
                     logger.error(
@@ -160,8 +152,30 @@ class TrajectoryEventStore:
             finally:
                 conn.close()
 
+    @staticmethod
+    def _verify_feedback_dedup_integrity(conn: sqlite3.Connection) -> bool:
+        """CR-05: Verifies unique attribute, exact column, partial WHERE clause, and 0 NULL dedup keys via PRAGMA."""
+        idx_list = conn.execute("PRAGMA index_list('trajectory_events')").fetchall()
+        # PRAGMA index_list columns: (seq, name, unique, origin, partial)
+        match = next((r for r in idx_list if r[1] == "uq_trajectory_feedback_dedup"), None)
+        if not match or int(match[2]) != 1 or int(match[4]) != 1:
+            return False
+        cols = [r[2] for r in conn.execute("PRAGMA index_info('uq_trajectory_feedback_dedup')").fetchall()]
+        if cols != ["feedback_dedup_key"]:
+            return False
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_trajectory_feedback_dedup'"
+        ).fetchone()
+        sql_txt = (sql_row[0] if sql_row and sql_row[0] else "").lower()
+        if "feedbackevent" not in sql_txt or "feedback_dedup_key is not null" not in sql_txt:
+            return False
+        null_fb = conn.execute(
+            "SELECT COUNT(*) FROM trajectory_events WHERE event_type = 'FeedbackEvent' AND feedback_dedup_key IS NULL"
+        ).fetchone()[0]
+        return int(null_fb) == 0
+
     def mark_incomplete(self, trajectory_id: str, reason: str, recorded_at: Optional[float] = None) -> None:
-        """FIX-208 E: Persistently records incomplete trajectory status across restarts."""
+        """CR-08: Persistently records incomplete trajectory; propagates DB failures so Dirty Set is preserved."""
         ts = float(recorded_at if recorded_at is not None else system_clock.now_epoch())
         with self._lock:
             conn = self._connect()
@@ -180,6 +194,7 @@ class TrajectoryEventStore:
                     conn.execute("ROLLBACK;")
                 except Exception:
                     pass
+                raise
             finally:
                 conn.close()
 
@@ -494,9 +509,50 @@ class TrajectoryEventStore:
             incomplete_reasons.append("missing_action_outcomes")
         if terminal_status == "UNKNOWN":
             incomplete_reasons.append("missing_terminal_outcome")
+
+        # CR-09: Referential integrity (orphan actions/outcomes, duplicate decisions, missing actions)
+        known_action_ids = {
+            act["action_id"]
+            for acts in actions_by_decision.values()
+            for act in acts
+            if act.get("action_id")
+        }
+        for did_key in actions_by_decision:
+            if did_key not in decisions:
+                incomplete_reasons.append("orphan_action_without_decision")
+                break
+        for ev in events:
+            if ev.get("event_type") == "OutcomeEvent":
+                aid = ev.get("action_id")
+                if aid and aid not in known_action_ids:
+                    incomplete_reasons.append("orphan_outcome_without_action")
+                    break
+        if len(decision_order) != len(set(decision_order)):
+            incomplete_reasons.append("duplicate_decision_id")
+        for did in decision_order:
+            if not actions_by_decision.get(did):
+                incomplete_reasons.append("decision_missing_action")
+                break
+
         step_indices = [s.get("step_index") for s in steps if s.get("step_index") is not None]
         if step_indices and step_indices != list(range(1, len(step_indices) + 1)):
             incomplete_reasons.append("non_contiguous_step_sequence")
+
+        # CR-09.9: Completion Metadata (expected_event_count) check catches whole-bundle drops
+        dao_event_count = sum(1 for e in events if e.get("event_type") in ("DecisionEvent", "ActionEvent", "OutcomeEvent"))
+        terminal_outcomes = [
+            e for e in events if e.get("event_type") == "OutcomeEvent" and e.get("terminal_status")
+        ]
+        expected_counts = [
+            (e.get("next_state_features") or {}).get("expected_event_count")
+            for e in terminal_outcomes
+            if isinstance((e.get("next_state_features") or {}).get("expected_event_count"), int)
+        ]
+        if not expected_counts:
+            incomplete_reasons.append("missing_completion_metadata")
+        elif expected_counts[-1] != dao_event_count:
+            incomplete_reasons.append("event_count_mismatch")
+
         eligible_for_training = len(incomplete_reasons) == 0 and len(steps) > 0
 
         return {
@@ -521,11 +577,14 @@ class TrajectoryEventStore:
         *,
         dirty_trajectories: Optional[set[str]] = None,
         dirty_overflow: bool = False,
+        allow_offline_db_only: bool = False,
     ) -> int:
-        """NG-08 C: Training-safe export strictly excluding incomplete, dirty, or overflow-tainted trajectories."""
+        """NG-08 C / CR-09.13: Training-safe export strictly excluding incomplete, dirty, or overflow-tainted trajectories.
+        Fails closed when dirty_trajectories is omitted unless allow_offline_db_only=True is explicitly asserted.
+        """
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        if dirty_overflow:
+        if dirty_overflow or (dirty_trajectories is None and not allow_offline_db_only):
             out.write_text("", encoding="utf-8")
             return 0
         dirty = set(dirty_trajectories or set())

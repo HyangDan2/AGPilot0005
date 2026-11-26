@@ -39,3 +39,17 @@
 | NG-06 | SSE terminal-cursor reconnect no-dup & mid-replay drain ordering | **PASS** | `tests/test_r1_2_final_cp2.py::test_ng_06_*` |
 | NG-07 | Bounded session TTL & metadata-only Tombstone (410 owner / 404 other) | **PASS** | `tests/test_r1_2_final_cp2.py::test_ng_07_*` |
 | NG-08 | Dirty Set persistence (no new worker/table) & training export filtering | **PASS** | `tests/test_r1_2_final_cp2.py::test_ng_08_*` |
+
+## 4. R1.2 Release Candidate Hotfix Closure Matrix (`CR-01` ~ `CR-09`)
+
+| ID | Verification | Status | Evidence |
+|---|---|---|---|
+| CR-01 | HTTP provider registration (`AGTOOLS_ENABLED=True`/`False`) & non-AGTools provider isolation | **PASS** | `tests/test_r1_2_rc_hotfix_cp1.py::test_cr_01_*` |
+| CR-02 | Real FastAPI → Auth → Immutable `ExecutionScope` → `AgentRunner` (Legacy + LangGraph) → `Dispatcher` → HTTP Tool + Tenant/Owner/Service isolation | **PASS** | `tests/test_r1_2_rc_hotfix_cp1.py::test_cr_02_*` |
+| CR-03 | Credential secret collision (`duplicate_credential_secret`) boot fail-fast & BFF delegation guard | **PASS** | `tests/test_r1_2_rc_hotfix_cp1.py::test_cr_03_*` |
+| CR-04 | `LangGraphR1Runtime` Policy-approved `context_budget_tokens` propagation into `tool_node` | **PASS** | `tests/test_r1_2_rc_hotfix_cp2.py::test_cr_04_*` |
+| CR-05 | SQLite `PRAGMA index_list` + `PRAGMA index_info` real corrupted/wrong-column dedup index detection (no manual flag override) | **PASS** | `tests/test_r1_2_rc_hotfix_cp2.py::test_cr_05_*` |
+| CR-06 | Slow-subscriber overflow gap honesty (never silently skipping to normal `run.completed`) | **PASS** | `tests/test_r1_2_rc_hotfix_cp2.py::test_cr_06_*` |
+| CR-07 | Auto-eviction on `create_run` & finish + Active Run Admission Control (`429`) + Status/Cancel/SSE contract parity | **PASS** | `tests/test_r1_2_rc_hotfix_cp2.py::test_cr_07_*` |
+| CR-08 | `mark_incomplete()` exception propagation preserving Dirty Markers on DB failure until actual commit + bounded `incomplete_trajectories` | **PASS** | `tests/test_r1_2_rc_hotfix_cp2.py::test_cr_08_*` |
+| CR-09 | Trajectory completeness proof (`expected_event_count`, orphan/duplicate checks) & fail-closed `export_training_jsonl()` | **PASS** | `tests/test_r1_2_rc_hotfix_cp2.py::test_cr_09_*` |

@@ -50,8 +50,11 @@
 4. **Rollback**: Stop AGCore, restore previous release symlink and `trajectory-pre-r1.2.db`, restart service.
 
 ## 5. HD2AI Frontend Compatibility (`404` / `410` / `503`)
-- `agentClient.ts` treats non-2xx on `GET /runs/{id}` or `/events` as user-visible error message; `submitRunFeedback` returns `false` on `409`/`503` and shows toast `"피드백 전송에 실패했습니다."` without breaking chat.
-- Session expiration returns **HTTP `410` (`SESSION_EXPIRED`)** for verified owners and **HTTP `404` (`SESSION_NOT_FOUND`)** for missing/unauthorized sessions; SSE cursor expiration returns **HTTP `410` (`event_replay_expired`)**.
+- **HD2AI Frontend Compatibility (`404` / `410` / `429` / `503`)**
+  - `agentClient.ts` treats non-2xx on `GET /runs/{id}`, `POST /runs`, `/cancel`, or `/events` as user-visible error message; `submitRunFeedback` returns `false` on `409`/`503` and shows toast `"피드백 전송에 실패했습니다."` without breaking chat.
+  - Session expiration returns **HTTP `410` (`SESSION_EXPIRED`)** for verified owners and **HTTP `404` (`SESSION_NOT_FOUND`)** for missing/unauthorized sessions consistently across Status, Cancel, and SSE; SSE cursor expiration returns **HTTP `410` (`event_replay_expired`)**.
+  - Active run admission overflow returns **HTTP `429` (`active_run_limit_exceeded`)** without affecting existing active runs.
+  - Duplicate credential secrets across `AGCORE_CREDENTIAL_SECRETS` fail fast at boot (`duplicate_credential_secret`).
 
 ## 6. SSE Buffering, Timeout Hierarchy & Graceful Shutdown
 - Nginx: `proxy_buffering off;`, `proxy_cache off;`, `proxy_read_timeout 300s;` > AGCore `RUN_TIMEOUT_SECONDS` (`180s`) > Tool `TOOL_TIMEOUT_SECONDS` (`30s`, capped to remaining deadline).

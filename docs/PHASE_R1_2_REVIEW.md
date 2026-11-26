@@ -34,3 +34,16 @@
   - `NG-06`: Prevented duplicate terminal event on terminal-cursor reconnect and drained intermediate queued events before terminal delivery.
   - `NG-07`: Added bounded finished-session TTL + metadata-only `_SessionTombstone` returning HTTP `410` (`SESSION_EXPIRED`) for verified owners and HTTP `404` (`SESSION_NOT_FOUND`) for missing/unauthorized callers while preserving active runs.
   - `NG-08`: Reused existing `AsyncTrajectoryWriter` + `incomplete_trajectories` table with bounded `dirty_trajectories` set (bypassing saturated event queue, cleared only after DB commit) and strict `eligible_for_training` + `export_training_jsonl()` filtering.
+
+## R1.2 Release Candidate Hotfix (`CR-01` ~ `CR-09`)
+- **Hotfix CP1 (`4c7451a`) — `CR-01` ~ `CR-03`**:
+  - `CR-01`: Removed undefined variable injection in `_register_http_tools()`, scoped `AGTOOLS_ENABLED=False` strictly to `provider_id == "agtools"` so unrelated HTTP providers remain unaffected, and handled read-only `ToolPolicyStore.save()` `OSError` gracefully.
+  - `CR-02`: Propagated the verified immutable `ExecutionScope` from FastAPI through `AgentState` and `AgentRunner` into `tool_node` via `current_execution_scope` (removed hardcoded `"default_tenant"` / `"user"` reconstruction); enforced Tenant + Owner + Service isolation across Status/SSE/Cancel and verified full E2E paths for both `legacy` and `langgraph_r1`.
+  - `CR-03`: Added `duplicate_credential_secret` collision detection and type validation in `validate_boot_configuration()`; eliminated all developer PC absolute paths (`/Users/...`) from `app/` and `tests/`.
+- **Hotfix CP2 — `CR-04` ~ `CR-09`**:
+  - `CR-04`: Propagated Policy-approved `context_budget_tokens` (`approved_context_budget`) through `R1GraphState` into `tool_node()` during `CALL_TOOLS`.
+  - `CR-05`: Upgraded `_verify_feedback_dedup_integrity()` to inspect actual SQLite schema metadata via `PRAGMA index_list`, `PRAGMA index_info`, `sqlite_master` partial `WHERE` clause, and NULL dedup-key counts.
+  - `CR-06`: Guarded `RunEventBus.stream()` so overflowed slow subscribers never skip dropped events to receive a normal `run.completed` terminal event.
+  - `CR-07`: Added Active Run Admission Control (`max_active_runs`, HTTP `429`), triggered `evict_expired_sessions()` on run creation and completion, and unified `/runs/{run_id}/cancel` with `lookup_session()` (`410 SESSION_EXPIRED` / `404 SESSION_NOT_FOUND`).
+  - `CR-08`: Propagated DB errors from `mark_incomplete()` after rollback so `AsyncTrajectoryWriter` retains Dirty Markers until actual DB commit succeeds, and bounded `incomplete_trajectories` memory usage.
+  - `CR-09`: Emitted `expected_event_count` completion metadata in terminal `OutcomeEvent`, enforced referential/count completeness checks in `reconstruct_trajectory()`, and made `export_training_jsonl()` fail closed when `dirty_trajectories` is omitted without `allow_offline_db_only=True`.

@@ -229,7 +229,7 @@ class RunEventBus:
                     yield q_evt.to_sse()
                     if q_evt.event_id == self.terminal_event.event_id:
                         return
-                if self._terminal_seq is not None and self._terminal_seq > last_sent_seq:
+                if not sub.overflowed and self._terminal_seq is not None and self._terminal_seq > last_sent_seq:
                     yield self.terminal_event.to_sse()
                 return
 
@@ -238,14 +238,17 @@ class RunEventBus:
                     evt = await asyncio.wait_for(sub.queue.get(), timeout=heartbeat_seconds)
                 except TimeoutError:
                     if self.terminal_event is not None:
-                        if self._terminal_seq is None or self._terminal_seq > last_sent_seq:
+                        if not sub.overflowed and (self._terminal_seq is None or self._terminal_seq > last_sent_seq):
                             yield self.terminal_event.to_sse()
                         break
                     yield ": heartbeat\n\n"
                     continue
 
                 if evt is None:
-                    if self.terminal_event is not None and (self._terminal_seq is None or self._terminal_seq > last_sent_seq):
+                    # CR-06: On slow-subscriber overflow, do NOT skip straight to terminal_event pretending continuity!
+                    if not sub.overflowed and self.terminal_event is not None and (
+                        self._terminal_seq is None or self._terminal_seq > last_sent_seq
+                    ):
                         yield self.terminal_event.to_sse()
                     break
                 try:

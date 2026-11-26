@@ -70,6 +70,7 @@ SAFE_EXACT_KEYS = frozenset(
         "limit",
         "top_k",
         "doc_id",
+        "expected_event_count",
     }
 )
 

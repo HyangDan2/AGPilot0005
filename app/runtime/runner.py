@@ -57,6 +57,7 @@ class AgentRunner:
         *,
         finished_session_ttl_seconds: float = 3600.0,
         max_finished_sessions: int = 256,
+        max_active_runs: int = 64,
         tombstone_ttl_seconds: float = 86400.0,
         max_tombstones: int = 1024,
     ):
@@ -64,6 +65,7 @@ class AgentRunner:
         self._tombstones: Dict[str, _SessionTombstone] = {}
         self.finished_session_ttl_seconds = float(finished_session_ttl_seconds)
         self.max_finished_sessions = max(1, int(max_finished_sessions))
+        self.max_active_runs = max(1, int(max_active_runs))
         self.tombstone_ttl_seconds = float(tombstone_ttl_seconds)
         self.max_tombstones = max(1, int(max_tombstones))
         self._lock = asyncio.Lock()
@@ -178,6 +180,12 @@ class AgentRunner:
                 raise PermissionError("caller_scope_required_in_production")
             tenant_id = "public_tenant" if service_id == "hd2ai-public" else settings.AGTOOLS_TENANT
             is_authenticated = True
+
+        # CR-07: Evict expired finished sessions on create & enforce Active Run Admission Control
+        self.evict_expired_sessions()
+        active_count = sum(1 for s in self.sessions.values() if s.state.status in ("queued", "running"))
+        if active_count >= self.max_active_runs:
+            raise RuntimeError("active_run_limit_exceeded")
 
         run_id = f"run-{uuid.uuid4().hex[:16]}"
         opts = req.options
@@ -495,6 +503,7 @@ class AgentRunner:
         finally:
             if not session.event_bus.is_finalized:
                 session.event_bus.publish_terminal("run.failed", state.status, state.error or {"code": "terminated", "message": "실행이 종료되었습니다."})
+            self.evict_expired_sessions()
 
     async def stream_events(self, run_id: str, *, last_event_id: Optional[str] = None) -> AsyncGenerator[str, None]:
         session = self.get_session(run_id)

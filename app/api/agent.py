@@ -58,6 +58,10 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        if str(exc) == "active_run_limit_exceeded":
+            raise HTTPException(status_code=429, detail="active_run_limit_exceeded") from exc
+        raise
     await runner.start_run(session)
     
     if req.stream:
@@ -176,9 +180,17 @@ async def cancel_agent_run(run_id: str, request: Request):
         job = services(request.app).cancel(job_id, scope.owner_id, scope.service_id)
         if job is None: raise HTTPException(404, 'Run not found')
         return {'run_id':run_id,'status':job['status']}
-    session = runner.get_session(run_id)
-    if not session or (not scope.is_admin and (session.state.owner_id != scope.owner_id or session.state.service_id != scope.service_id)):
-        raise HTTPException(404, 'Run not found')
+    session, lookup_err = runner.lookup_session(
+        run_id,
+        owner_id=scope.owner_id,
+        service_id=scope.service_id,
+        tenant_id=scope.tenant_id,
+        is_admin=scope.is_admin,
+    )
+    if lookup_err == "SESSION_EXPIRED":
+        return JSONResponse(status_code=410, content={"error_code": "SESSION_EXPIRED", "detail": "Session has expired."})
+    if not session:
+        raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
     success = await runner.cancel_run(run_id)
     if not success:
         raise HTTPException(status_code=400, detail="Cannot cancel run (already finished or not found).")

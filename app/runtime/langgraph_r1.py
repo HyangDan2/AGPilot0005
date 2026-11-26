@@ -57,6 +57,8 @@ class R1GraphState(TypedDict, total=False):
     validated_action: Optional[ValidatedAction]
     decision_id: str
     terminal_status: Optional[str]
+    approved_context_budget: Optional[int]
+    emitted_event_count: int
     node_trace: List[str]
     decision_records: List[Dict[str, Any]]
     fallback_records: List[Dict[str, Any]]
@@ -188,6 +190,7 @@ async def _validate_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[s
     decision_records = list(gstate.get("decision_records", []))
     decision_records.append(dec_record)
 
+    emitted_count = int(gstate.get("emitted_event_count", 0))
     if ctx.trajectory_logger is not None:
         ctx.trajectory_logger.log_decision(
             trajectory_id=gstate["trajectory_id"],
@@ -207,11 +210,18 @@ async def _validate_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[s
             owner_id=constraints_spec.owner_id,
             service_id=constraints_spec.service_id,
         )
+        emitted_count += 1
+
+    approved_budget = gstate.get("approved_context_budget")
+    if va.action in (ActionType.CALL_MODEL.value, ActionType.DEFAULT_CONFIG.value) and "context_budget_tokens" in va.parameters:
+        approved_budget = int(va.parameters["context_budget_tokens"])
 
     return {
         "node_trace": trace,
         "validation": vres,
         "validated_action": va,
+        "approved_context_budget": approved_budget,
+        "emitted_event_count": emitted_count,
         "fallback_applied_any": bool(gstate.get("fallback_applied_any", False) or va.fallback_applied),
         "last_fallback_reason": last_fb_reason,
         "rejected_signatures": rejected_sigs,
@@ -244,6 +254,7 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
         run_fence.record_late_result()
         return {"node_trace": trace, "terminal_status": run_fence.terminal_state}
 
+    emitted_count = int(gstate.get("emitted_event_count", 0))
     if ctx.trajectory_logger is not None:
         ctx.trajectory_logger.log_action(
             trajectory_id=gstate["trajectory_id"],
@@ -256,6 +267,7 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
             owner_id=constraints_spec.owner_id,
             service_id=constraints_spec.service_id,
         )
+        emitted_count += 1
 
     outcome = "success"
     terminal_status: Optional[str] = None
@@ -400,6 +412,7 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                     validated_calls=validated_tc_objs,
                     constraints=constraints_spec,
                     timeout_override=tool_timeout,
+                    approved_context_budget=gstate.get("approved_context_budget"),
                 )
 
             if run_fence.is_terminal:
@@ -532,13 +545,18 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
     )
 
     if ctx.trajectory_logger is not None:
+        emitted_count += 1
+        out_features = next_sv.to_features_dict()
+        if terminal_status is not None:
+            # CR-09: Record exact emitted Decision/Action/Outcome count in terminal Completion Metadata
+            out_features["expected_event_count"] = emitted_count
         ctx.trajectory_logger.log_outcome(
             trajectory_id=gstate["trajectory_id"],
             run_id=st.run_id,
             decision_id=decision_id,
             action_id=action_id,
             outcome=outcome,
-            next_state_features=next_sv.to_features_dict(),
+            next_state_features=out_features,
             execution_latency=latency,
             token_usage=collected_token_usage,
             terminal_status=terminal_status,
@@ -548,6 +566,7 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
 
     return {
         "node_trace": trace,
+        "emitted_event_count": emitted_count,
         "context_compacted": context_compacted,
         "fallback_count": fallback_count,
         "last_tool_meta": last_tool_meta,
@@ -652,6 +671,8 @@ class LangGraphR1Runtime:
             "decision_records": [],
             "fallback_records": [],
             "terminal_status": None,
+            "approved_context_budget": None,
+            "emitted_event_count": 0,
         }
         compiled = _get_compiled_graph()
         return await compiled.ainvoke(

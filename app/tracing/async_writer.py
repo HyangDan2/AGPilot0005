@@ -62,14 +62,9 @@ class AsyncTrajectoryWriter:
         self._thread.start()
 
     def mark_dirty(self, trajectory_id: str, reason: str) -> None:
-        """NG-08 A: Marks trajectory dirty directly (NEVER enqueues into saturated event queue)."""
+        """NG-08 A / CR-08.7: Marks trajectory dirty directly with bounded memory cap."""
         with self._lock:
-            self.incomplete_trajectories.add(trajectory_id)
-            if trajectory_id not in self.dirty_trajectories:
-                if len(self.dirty_trajectories) >= self.max_dirty_trajectories:
-                    self.dirty_overflow = True
-                    return
-                self.dirty_trajectories[trajectory_id] = reason
+            self._mark_dirty_locked(trajectory_id, reason)
 
     def _drain_dirty_set(self) -> None:
         """Persists dirty markers into existing incomplete_trajectories table; clears ONLY after DB commit."""
@@ -108,7 +103,11 @@ class AsyncTrajectoryWriter:
             return False
 
     def _mark_dirty_locked(self, trajectory_id: str, reason: str) -> None:
-        self.incomplete_trajectories.add(trajectory_id)
+        if trajectory_id not in self.incomplete_trajectories:
+            if len(self.incomplete_trajectories) >= self.max_dirty_trajectories:
+                self.dirty_overflow = True
+            else:
+                self.incomplete_trajectories.add(trajectory_id)
         if trajectory_id not in self.dirty_trajectories:
             if len(self.dirty_trajectories) >= self.max_dirty_trajectories:
                 self.dirty_overflow = True
