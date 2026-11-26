@@ -92,9 +92,13 @@ async def get_agent_run(run_id: str, request: Request):
         return AgentRunResponse(run_id=run_id, agent_id='general-agent', status=job['status'], answer=job['answer'], model_label=job.get('model_label'),
             usage={'job_id':job_id,'model_calls':job['model_calls'],'document_calls':job.get('document_calls',0)},
             created_at=job['created_at'], error={'code':job['error_code'],'message':job['error_code']} if job['error_code'] else None)
-    session = runner.get_session(run_id)
-    if not session or (not scope.is_admin and (session.state.owner_id != scope.owner_id or session.state.service_id != scope.service_id)):
-        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    session, lookup_err = runner.lookup_session(
+        run_id, owner_id=scope.owner_id, service_id=scope.service_id, is_admin=scope.is_admin
+    )
+    if lookup_err == "SESSION_EXPIRED":
+        return JSONResponse(status_code=410, content={"error_code": "SESSION_EXPIRED", "detail": "Session has expired."})
+    if not session:
+        raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
         
     state = session.state
     return AgentRunResponse(
@@ -126,9 +130,13 @@ async def get_agent_events(run_id: str, request: Request):
         async def snapshot():
             yield 'event: run.deferred\ndata: ' + json.dumps({'run_id':run_id,'job_id':job_id,'status':job['status']}) + '\n\n'
         return StreamingResponse(snapshot(), media_type='text/event-stream', headers={'Cache-Control':'no-store'})
-    session = runner.get_session(run_id)
-    if not session or (not scope.is_admin and (session.state.owner_id != scope.owner_id or session.state.service_id != scope.service_id)):
-        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    session, lookup_err = runner.lookup_session(
+        run_id, owner_id=scope.owner_id, service_id=scope.service_id, is_admin=scope.is_admin
+    )
+    if lookup_err == "SESSION_EXPIRED":
+        return JSONResponse(status_code=410, content={"error_code": "SESSION_EXPIRED", "detail": "Session has expired."})
+    if not session:
+        raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
 
     last_event_id = request.headers.get("Last-Event-ID") or request.query_params.get("last_event_id")
     if last_event_id:

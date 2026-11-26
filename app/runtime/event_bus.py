@@ -189,7 +189,9 @@ class RunEventBus:
         sid = self.subscribe()
         sub = self._sub_map[sid]
         try:
+            cursor_seq = 0
             if last_event_id is not None:
+                cursor_seq = self.parse_cursor(last_event_id)
                 replay_events = self.replay_after(last_event_id)
             else:
                 replay_events = [evt for _, evt in self._buffer]
@@ -198,19 +200,36 @@ class RunEventBus:
                 ):
                     replay_events.append(self.terminal_event)
 
-            last_sent_seq = 0
+            last_sent_seq = cursor_seq
             for evt in replay_events:
                 try:
-                    last_sent_seq = max(last_sent_seq, self.parse_cursor(evt.event_id))
+                    ev_s = self.parse_cursor(evt.event_id)
                 except ValueError:
-                    pass
+                    ev_s = last_sent_seq + 1
+                if ev_s <= last_sent_seq:
+                    continue
+                last_sent_seq = ev_s
                 yield evt.to_sse()
                 if self.terminal_event is not None and evt.event_id == self.terminal_event.event_id:
                     return
 
             if self.terminal_event is not None:
-                # Deliver terminal event if finalized right after replay loop
-                if self._terminal_seq is None or self._terminal_seq > last_sent_seq:
+                # NG-06: Drain any intermediate queued events before terminal_event; never duplicate terminal_event
+                while not sub.queue.empty():
+                    q_evt = sub.queue.get_nowait()
+                    if q_evt is None:
+                        break
+                    try:
+                        q_seq = self.parse_cursor(q_evt.event_id)
+                    except ValueError:
+                        q_seq = last_sent_seq + 1
+                    if q_seq <= last_sent_seq:
+                        continue
+                    last_sent_seq = q_seq
+                    yield q_evt.to_sse()
+                    if q_evt.event_id == self.terminal_event.event_id:
+                        return
+                if self._terminal_seq is not None and self._terminal_seq > last_sent_seq:
                     yield self.terminal_event.to_sse()
                 return
 

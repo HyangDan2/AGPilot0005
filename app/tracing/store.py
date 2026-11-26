@@ -33,6 +33,10 @@ class DuplicateFeedbackError(ValueError):
     """FIX-208: Raised atomically by SQLite UNIQUE index on duplicate/conflicting feedback."""
 
 
+class FeedbackIntegrityError(RuntimeError):
+    """NG-05: Raised when feedback dedup UNIQUE index or NULL-key integrity is unverified (HTTP 503)."""
+
+
 def _feedback_category(feedback_type: str) -> str:
     if feedback_type in ("thumbs_up", "thumbs_down"):
         return "user_rating"
@@ -66,6 +70,7 @@ class TrajectoryEventStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.append_failures: int = 0
+        self.feedback_dedup_integrity_ok: bool = False
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -128,10 +133,20 @@ class TrajectoryEventStore:
                             WHERE event_type = 'FeedbackEvent' AND feedback_dedup_key IS NOT NULL;
                         """
                     )
+                    idx_row = conn.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_trajectory_feedback_dedup'"
+                    ).fetchone()
+                    null_fb_count = conn.execute(
+                        "SELECT COUNT(*) FROM trajectory_events WHERE event_type = 'FeedbackEvent' AND feedback_dedup_key IS NULL"
+                    ).fetchone()[0]
+                    self.feedback_dedup_integrity_ok = bool(
+                        idx_row and "UNIQUE" in (idx_row[0] or "").upper() and int(null_fb_count) == 0
+                    )
                 except sqlite3.IntegrityError:
+                    self.feedback_dedup_integrity_ok = False
                     logger.error(
                         "Cannot create unique feedback index due to pre-existing duplicates; "
-                        "existing rows preserved for manual governance review."
+                        "feedback writes fail-closed (HTTP 503) while existing rows are preserved."
                     )
                 conn.execute(
                     """
@@ -168,6 +183,16 @@ class TrajectoryEventStore:
             finally:
                 conn.close()
 
+    def list_incomplete_trajectories(self) -> set[str]:
+        """NG-08: Returns persistently recorded incomplete trajectory IDs."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute("SELECT trajectory_id FROM incomplete_trajectories").fetchall()
+                return {r[0] for r in rows}
+            finally:
+                conn.close()
+
     def append_feedback_atomic(
         self,
         event: FeedbackEvent,
@@ -175,7 +200,9 @@ class TrajectoryEventStore:
         owner_id: Optional[str] = None,
         service_id: Optional[str] = None,
     ) -> str:
-        """FIX-208 A/B: Direct atomic DB commit with UNIQUE index enforcement (bypasses async queue)."""
+        """FIX-208 / NG-05: Direct atomic DB commit; fails closed (HTTP 503) if dedup integrity is unverified."""
+        if not self.feedback_dedup_integrity_ok:
+            raise FeedbackIntegrityError("feedback_dedup_integrity_unverified")
         payload_json = json.dumps(event.model_dump(), ensure_ascii=False, sort_keys=True)
         dedup_key = make_feedback_dedup_key(
             run_id=event.run_id,
@@ -458,7 +485,19 @@ class TrajectoryEventStore:
             if ro.get("terminal_status"):
                 last_terminal_status = ro["terminal_status"]
 
-        terminal_status = last_terminal_status or ("UNKNOWN" if missing_outcomes > 0 else "UNKNOWN")
+        terminal_status = last_terminal_status or "UNKNOWN"
+        incomplete_set = self.list_incomplete_trajectories()
+        incomplete_reasons: List[str] = []
+        if resolved_tid and resolved_tid in incomplete_set:
+            incomplete_reasons.append("persisted_incomplete_marker")
+        if missing_outcomes > 0:
+            incomplete_reasons.append("missing_action_outcomes")
+        if terminal_status == "UNKNOWN":
+            incomplete_reasons.append("missing_terminal_outcome")
+        step_indices = [s.get("step_index") for s in steps if s.get("step_index") is not None]
+        if step_indices and step_indices != list(range(1, len(step_indices) + 1)):
+            incomplete_reasons.append("non_contiguous_step_sequence")
+        eligible_for_training = len(incomplete_reasons) == 0 and len(steps) > 0
 
         return {
             "trajectory_id": resolved_tid,
@@ -467,12 +506,46 @@ class TrajectoryEventStore:
             "run_outcomes": run_outcomes,
             "feedback": feedback_events,
             "terminal_status": terminal_status,
+            "eligible_for_training": eligible_for_training,
+            "incomplete_reasons": incomplete_reasons,
             "integrity": {
                 "missing_outcomes": missing_outcomes,
                 "event_count": len(events),
                 "has_unconfirmed_actions": missing_outcomes > 0,
             },
         }
+
+    def export_training_jsonl(
+        self,
+        output_path: Union[str, Path],
+        *,
+        dirty_trajectories: Optional[set[str]] = None,
+        dirty_overflow: bool = False,
+    ) -> int:
+        """NG-08 C: Training-safe export strictly excluding incomplete, dirty, or overflow-tainted trajectories."""
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if dirty_overflow:
+            out.write_text("", encoding="utf-8")
+            return 0
+        dirty = set(dirty_trajectories or set())
+        with self._lock:
+            conn = self._connect()
+            try:
+                tids = [r[0] for r in conn.execute("SELECT DISTINCT trajectory_id FROM trajectory_events ORDER BY trajectory_id ASC").fetchall()]
+            finally:
+                conn.close()
+        exported = 0
+        with out.open("w", encoding="utf-8") as fh:
+            for tid in tids:
+                if tid in dirty:
+                    continue
+                rec = self.reconstruct_trajectory(trajectory_id=tid)
+                if not rec.get("eligible_for_training"):
+                    continue
+                fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+                exported += 1
+        return exported
 
     def export_jsonl(self, output_path: Union[str, Path], *, trajectory_id: Optional[str] = None) -> int:
         out = Path(output_path)

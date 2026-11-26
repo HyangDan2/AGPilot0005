@@ -241,10 +241,28 @@ class ToolDispatcher:
             error_json = json.dumps({"error": True, "code": "invalid_arguments", "message": schema_err}, ensure_ascii=False)
             return DispatchResult(call_id, func_name, error_json, trace, is_error=True)
 
-        # 2.5 Apply schema-driven dynamic I/O budget
+        # 2.5 Apply schema-driven dynamic I/O budget & NG-04 pre-handler zero-budget gate
         args, dynamic_max_bytes = _apply_dynamic_tool_budget(
             reg, args, input_budget_tokens, remaining_input_tokens, batch_size
         )
+        if input_budget_tokens is not None and dynamic_max_bytes <= 0:
+            trace.status = "failed"
+            trace.error_code = "tool_budget_exhausted"
+            trace.error_message = "잔여 컨텍스트 예산이 부족하여 도구 실행이 차단되었습니다."
+            error_json = json.dumps(
+                {"error": True, "code": "tool_budget_exhausted", "message": trace.error_message},
+                ensure_ascii=False,
+            )
+            return DispatchResult(call_id, func_name, error_json, trace, is_error=True)
+
+        # NG-04.10: Re-validate adjusted arguments against JSON Schema before invoking handler
+        post_schema_err = _validate_args_against_schema(args, getattr(reg, "parameters", None))
+        if post_schema_err:
+            trace.status = "failed"
+            trace.error_code = "invalid_arguments"
+            trace.error_message = post_schema_err
+            error_json = json.dumps({"error": True, "code": "invalid_arguments", "message": post_schema_err}, ensure_ascii=False)
+            return DispatchResult(call_id, func_name, error_json, trace, is_error=True)
         trace.arguments = args
 
         # 3. Execute with Timeout

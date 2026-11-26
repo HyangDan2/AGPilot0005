@@ -1,4 +1,4 @@
-"""R1-FIX-08: Async Bounded Trajectory Writer with Failure Isolation, Explicit Flush & Graceful Shutdown."""
+"""NG-08 & R1-FIX-08: Async Bounded Trajectory Writer with Dirty Set Persistence (No New Worker/Table)."""
 from __future__ import annotations
 
 import logging
@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set
 
 from app.tracing.store import AnyTrajectoryEvent, DuplicateEventError, TrajectoryEventStore
 
@@ -19,6 +19,7 @@ class FlushResult:
     persisted_count: int
     failed_count: int
     dropped_count: int
+    pending_dirty_count: int = 0
 
 
 class _FlushBarrier:
@@ -31,11 +32,18 @@ class _ShutdownSignal:
 
 
 class AsyncTrajectoryWriter:
-    """Single-worker bounded-queue writer isolating SQLite I/O and failures from Agent Runtime."""
+    """Single-worker bounded-queue writer with Dirty Set persistence into existing incomplete_trajectories table."""
 
-    def __init__(self, store: TrajectoryEventStore, *, queue_capacity: int = 1024):
+    def __init__(
+        self,
+        store: TrajectoryEventStore,
+        *,
+        queue_capacity: int = 1024,
+        max_dirty_trajectories: int = 4096,
+    ):
         self.store = store
         self.queue_capacity = max(1, int(queue_capacity))
+        self.max_dirty_trajectories = max(1, int(max_dirty_trajectories))
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=self.queue_capacity)
         self._lock = threading.Lock()
         self._accepting: bool = True
@@ -44,12 +52,38 @@ class AsyncTrajectoryWriter:
         self.persistence_failure_count: int = 0
         self.persisted_event_count: int = 0
         self.incomplete_trajectories: Set[str] = set()
+        self.dirty_trajectories: Dict[str, str] = {}
+        self.dirty_overflow: bool = False
         self._thread = threading.Thread(
             target=self._run_worker,
             name="agcore-trajectory-writer",
             daemon=True,
         )
         self._thread.start()
+
+    def mark_dirty(self, trajectory_id: str, reason: str) -> None:
+        """NG-08 A: Marks trajectory dirty directly (NEVER enqueues into saturated event queue)."""
+        with self._lock:
+            self.incomplete_trajectories.add(trajectory_id)
+            if trajectory_id not in self.dirty_trajectories:
+                if len(self.dirty_trajectories) >= self.max_dirty_trajectories:
+                    self.dirty_overflow = True
+                    return
+                self.dirty_trajectories[trajectory_id] = reason
+
+    def _drain_dirty_set(self) -> None:
+        """Persists dirty markers into existing incomplete_trajectories table; clears ONLY after DB commit."""
+        with self._lock:
+            snapshot = list(self.dirty_trajectories.items())
+        for tid, reason in snapshot:
+            try:
+                self.store.mark_incomplete(tid, reason)
+                with self._lock:
+                    self.dirty_trajectories.pop(tid, None)
+            except Exception:
+                # Retain dirty marker on failure; avoid busy loop
+                time.sleep(0.02)
+                break
 
     def enqueue(
         self,
@@ -62,7 +96,7 @@ class AsyncTrajectoryWriter:
         with self._lock:
             if not self._accepting:
                 self.dropped_event_count += 1
-                self.incomplete_trajectories.add(event.trajectory_id)
+                self._mark_dirty_locked(event.trajectory_id, "shutdown_rejected")
                 return False
         try:
             self._queue.put_nowait(("event", event, owner_id, service_id))
@@ -70,18 +104,32 @@ class AsyncTrajectoryWriter:
         except queue.Full:
             with self._lock:
                 self.dropped_event_count += 1
-                self.incomplete_trajectories.add(event.trajectory_id)
+                self._mark_dirty_locked(event.trajectory_id, "queue_overflow")
             return False
+
+    def _mark_dirty_locked(self, trajectory_id: str, reason: str) -> None:
+        self.incomplete_trajectories.add(trajectory_id)
+        if trajectory_id not in self.dirty_trajectories:
+            if len(self.dirty_trajectories) >= self.max_dirty_trajectories:
+                self.dirty_overflow = True
+                return
+            self.dirty_trajectories[trajectory_id] = reason
 
     def _run_worker(self) -> None:
         while True:
-            item = self._queue.get()
+            self._drain_dirty_set()
+            try:
+                item = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
             try:
                 if isinstance(item, _ShutdownSignal):
+                    self._drain_dirty_set()
                     with self._lock:
                         self._worker_status = "stopped"
                     return
                 if isinstance(item, _FlushBarrier):
+                    self._drain_dirty_set()
                     item.done.set()
                     continue
                 _, event, owner_id, service_id = item
@@ -90,12 +138,11 @@ class AsyncTrajectoryWriter:
                     with self._lock:
                         self.persisted_event_count += 1
                 except DuplicateEventError:
-                    # Idempotent duplicate rejection — not a persistence failure
                     pass
                 except Exception:
                     with self._lock:
                         self.persistence_failure_count += 1
-                        self.incomplete_trajectories.add(event.trajectory_id)
+                        self._mark_dirty_locked(event.trajectory_id, "persistence_failure")
                     logger.warning(
                         "Trajectory persistence failed for event %s (isolated from runtime)",
                         getattr(event, "event_id", "unknown"),
@@ -104,7 +151,7 @@ class AsyncTrajectoryWriter:
                 self._queue.task_done()
 
     def flush(self, timeout_seconds: float = 5.0) -> FlushResult:
-        """Waits until all previously accepted events have finished persisting (or failed)."""
+        """Waits until accepted events AND dirty markers have finished persisting."""
         barrier = _FlushBarrier()
         try:
             self._queue.put(barrier, timeout=max(0.05, float(timeout_seconds)))
@@ -117,10 +164,11 @@ class AsyncTrajectoryWriter:
                 persisted_count=self.persisted_event_count,
                 failed_count=self.persistence_failure_count,
                 dropped_count=self.dropped_event_count,
+                pending_dirty_count=len(self.dirty_trajectories),
             )
 
     def shutdown(self, timeout_seconds: float = 5.0) -> Dict[str, Any]:
-        """FIX-208 E: Stops accepting new events and enforces a single overall monotonic deadline."""
+        """Single overall monotonic deadline covering queue drain, dirty markers, and thread join."""
         deadline = time.monotonic() + max(0.05, float(timeout_seconds))
         with self._lock:
             self._accepting = False
@@ -134,13 +182,16 @@ class AsyncTrajectoryWriter:
         rem_join = max(0.05, deadline - time.monotonic())
         self._thread.join(timeout=rem_join)
         unsaved = self._queue.qsize()
-        clean = flush_res.completed and not self._thread.is_alive() and unsaved == 0
+        with self._lock:
+            pending_dirty = len(self.dirty_trajectories)
+        clean = flush_res.completed and not self._thread.is_alive() and unsaved == 0 and pending_dirty == 0
         if not clean:
             with self._lock:
                 self._worker_status = "shutdown_timeout"
         return {
             "clean": clean,
             "unsaved_events": unsaved,
+            "unsaved_dirty_markers": pending_dirty,
             "persisted_count": flush_res.persisted_count,
             "failed_count": flush_res.failed_count,
             "dropped_count": flush_res.dropped_count,
@@ -148,12 +199,19 @@ class AsyncTrajectoryWriter:
 
     def health(self) -> Dict[str, Any]:
         with self._lock:
-            degraded = self.dropped_event_count > 0 or self.persistence_failure_count > 0 or self._worker_status != "running"
+            degraded = (
+                self.dropped_event_count > 0
+                or self.persistence_failure_count > 0
+                or self.dirty_overflow
+                or self._worker_status != "running"
+            )
             return {
                 "queue_depth": self._queue.qsize(),
                 "queue_capacity": self.queue_capacity,
                 "dropped_event_count": self.dropped_event_count,
                 "persistence_failure_count": self.persistence_failure_count,
+                "pending_dirty_count": len(self.dirty_trajectories),
+                "dirty_overflow": self.dirty_overflow,
                 "worker_status": self._worker_status,
                 "telemetry_health": "degraded" if degraded else "healthy",
                 "incomplete_trajectory_count": len(self.incomplete_trajectories),

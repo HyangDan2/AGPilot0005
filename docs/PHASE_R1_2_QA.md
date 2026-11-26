@@ -26,3 +26,16 @@
 | Concurrent `1` | 99.48ms / 99.48ms (297.0 KB) | **61.91ms / 61.91ms (270.2 KB)** | **-38% latency** | 12 / 0 / 0 |
 | Concurrent `10` | 341.02ms / 518.96ms (1,150.3 KB) | **176.57ms / 184.90ms (849.1 KB)** | **-64% P99, -26% mem** | 120 / 0 / 0 |
 | Concurrent `50` | 1,676.64ms / 2,538.42ms (5,573.7 KB) | **895.00ms / 930.04ms (4,057.3 KB)** | **-63% P99, -27% mem** | 600 / 0 / 0 |
+
+## 3. Final Release Gate Closure Matrix (`NG-01` ~ `NG-08`)
+
+| ID | Verification | Status | Evidence |
+|---|---|---|---|
+| NG-01 | AGTools auth contract & Disabled path (0 outbound calls) | **PASS** | `tests/test_r1_2_final_cp1.py::test_ng_01_*` + `scripts/ops_precheck_r12.sh` |
+| NG-02 | Real `AIGatewayClient` HTTP Fixture (`_structured=True`, stream & non-stream) | **PASS** | `tests/test_r1_2_final_cp2.py::test_ng_02_*` |
+| NG-03 | Credential Scope binding, BFF delegation, unregistered service 403, run-scoped HTTP tool | **PASS** | `tests/test_r1_2_final_cp1.py::test_ng_03_*` |
+| NG-04 | Pre-handler zero-budget gate (`0` handler calls) & Policy budget propagation | **PASS** | `tests/test_r1_2_final_cp2.py::test_ng_04_*` |
+| NG-05 | SQLite Dedup integrity verification & HTTP 503 fail-closed + Preflight SQL | **PASS** | `tests/test_r1_2_final_cp2.py::test_ng_05_*` + `scripts/check_sqlite_dedup.sql` |
+| NG-06 | SSE terminal-cursor reconnect no-dup & mid-replay drain ordering | **PASS** | `tests/test_r1_2_final_cp2.py::test_ng_06_*` |
+| NG-07 | Bounded session TTL & metadata-only Tombstone (410 owner / 404 other) | **PASS** | `tests/test_r1_2_final_cp2.py::test_ng_07_*` |
+| NG-08 | Dirty Set persistence (no new worker/table) & training export filtering | **PASS** | `tests/test_r1_2_final_cp2.py::test_ng_08_*` |

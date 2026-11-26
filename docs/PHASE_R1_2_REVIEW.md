@@ -22,3 +22,15 @@
 - **FIX-210**: Added `run_agent_runner_replay()` driving production `AgentRunner` under both `legacy` and `langgraph_r1` with identical fixtures and unused-fixture detection.
 - **FIX-211**: Subscribed before replay snapshot in `RunEventBus.stream()` to prevent mid-replay terminal loss, enforced `max_subscribers=32`, verified real API HTTP `410 Gone` (`event_replay_expired`), and preserved disconnect-without-cancel semantics.
 - **FIX-212**: Added `session.fence.is_terminal` guards before/after `model_node` and `tool_node` in legacy `AgentRunner` to block late state mutation and duplicate terminal events.
+
+## Final Release Gate Closure (`NG-01` ~ `NG-08`)
+- **CP1 (`5fe923d`) — `NG-01`, `NG-03`**:
+  - `NG-01`: Aligned `docs/DEPLOYMENT_CHECKLIST.md` to real single-token contract (`AGCORE_AGTOOLS_TOKEN` ↔ `DOCUMENT_SERVICE_TOKEN`, removed unsupported `AGTOOLS_SERVICE_TOKENS`), enforced `AGTOOLS_ENABLED=false` across Adapter/Sync/Registration/Dispatcher (`0` outbound calls), added read-only `scripts/ops_precheck_r12.sh`.
+  - `NG-03`: Added `AGCORE_CREDENTIAL_SCOPES` + `AGCORE_CREDENTIAL_SECRETS` (secret separated from ID, rotation supported, `owner_delegation=false` default), blocked unregistered service fallback to `public-safe` (`unregistered_service`), and wired verified `current_execution_scope` `ContextVar` to dynamic HTTP tools.
+- **CP2 — `NG-02`, `NG-04` ~ `NG-08`**:
+  - `NG-02`: Wired real `AIGatewayClient.execute(_structured=True)` and verified Non-streaming + Streaming + concurrent isolation via `httpx.MockTransport`.
+  - `NG-04`: Enforced pre-handler zero-budget gate (`tool_budget_exhausted`, `0` handler calls), passed Policy-approved budget into `tool_node` / `dispatcher`, and re-validated adjusted arguments.
+  - `NG-05`: Verified `uq_trajectory_feedback_dedup` index + `0` NULL dedup keys at init; fail-closed HTTP `503` (`FeedbackIntegrityError`) when unverified; added read-only `scripts/check_sqlite_dedup.sql`.
+  - `NG-06`: Prevented duplicate terminal event on terminal-cursor reconnect and drained intermediate queued events before terminal delivery.
+  - `NG-07`: Added bounded finished-session TTL + metadata-only `_SessionTombstone` returning HTTP `410` (`SESSION_EXPIRED`) for verified owners and HTTP `404` (`SESSION_NOT_FOUND`) for missing/unauthorized callers while preserving active runs.
+  - `NG-08`: Reused existing `AsyncTrajectoryWriter` + `incomplete_trajectories` table with bounded `dirty_trajectories` set (bypassing saturated event queue, cleared only after DB commit) and strict `eligible_for_training` + `export_training_jsonl()` filtering.

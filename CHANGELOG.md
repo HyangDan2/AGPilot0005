@@ -1,6 +1,16 @@
 # Changelog
 
 ## [1.2.0-r1.2] - 2026-11-26 (feature/runtime-r1-corrective)
+### Final Release Gate Closure (CP1 `5fe923d` & CP2 — `NG-01` ~ `NG-08`)
+- Aligned AGTools deployment contract to single `DOCUMENT_SERVICE_TOKEN` ↔ `AGCORE_AGTOOLS_TOKEN`, enforced `AGTOOLS_ENABLED=false` across all outbound paths, and added read-only `scripts/ops_precheck_r12.sh` (`NG-01`).
+- Added `AGCORE_CREDENTIAL_SCOPES` / `AGCORE_CREDENTIAL_SECRETS` binding, unregistered service fail-closed (`unregistered_service`), and run-scoped `current_execution_scope` for dynamic HTTP tools (`NG-03`).
+- Wired real `AIGatewayClient.execute(_structured=True)` with `httpx.MockTransport` HTTP fixture tests (`NG-02`).
+- Added pre-handler zero-budget gate (`tool_budget_exhausted`), Policy-approved budget propagation, and post-adjustment schema re-validation (`NG-04`).
+- Added SQLite feedback dedup integrity check with HTTP `503` fail-closed and read-only `scripts/check_sqlite_dedup.sql` (`NG-05`).
+- Prevented duplicate terminal emission on terminal-cursor reconnect and drained intermediate replay events in order (`NG-06`).
+- Added bounded finished-session TTL and metadata-only Tombstone (`410 SESSION_EXPIRED` / `404 SESSION_NOT_FOUND`) preserving active runs (`NG-07`).
+- Added bounded Dirty Set persistence into existing `incomplete_trajectories` table via existing `AsyncTrajectoryWriter` and strict `export_training_jsonl()` filtering (`NG-08`).
+
 ### Stage A — Security & Authentication Closure (`6da21a1`)
 - Unified `require_authenticated_caller` across Agent, Document Analysis, Demo, and Config APIs (`FIX-201`).
 - Split `ADMIN_SERVICE_TOKENS` vs `SERVICE_TOKENS` preventing role escalation via headers, with multi-key rotation and `TRUSTED_PROXY_SECRET` (`FIX-201`).

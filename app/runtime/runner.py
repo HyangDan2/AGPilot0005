@@ -7,7 +7,8 @@ from app.gateway.client import GatewayStreamError
 import time
 import uuid
 import re
-from typing import Any, AsyncGenerator, Dict, Optional, Set
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
 from app.config import settings
 from app.core.runtime_config import get_runtime_config
 from app.runtime.state import AgentState
@@ -39,13 +40,112 @@ class AgentRunSession:
             return
         self.event_bus.publish(event_name, self.state.status, data)
 
+@dataclass(frozen=True)
+class _SessionTombstone:
+    """NG-07: Minimal metadata-only tombstone (no prompt, answer, or tool results)."""
+
+    run_id: str
+    owner_id: str
+    service_id: str
+    expired_at: float
+
+
 class AgentRunner:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        finished_session_ttl_seconds: float = 3600.0,
+        max_finished_sessions: int = 256,
+        tombstone_ttl_seconds: float = 86400.0,
+        max_tombstones: int = 1024,
+    ):
         self.sessions: Dict[str, AgentRunSession] = {}
+        self._tombstones: Dict[str, _SessionTombstone] = {}
+        self.finished_session_ttl_seconds = float(finished_session_ttl_seconds)
+        self.max_finished_sessions = max(1, int(max_finished_sessions))
+        self.tombstone_ttl_seconds = float(tombstone_ttl_seconds)
+        self.max_tombstones = max(1, int(max_tombstones))
         self._lock = asyncio.Lock()
 
     def get_session(self, run_id: str) -> Optional[AgentRunSession]:
         return self.sessions.get(run_id)
+
+    def evict_expired_sessions(self, *, now: Optional[float] = None) -> int:
+        """NG-07: Evicts ONLY finished sessions past TTL or over max_finished_sessions; never evicts active runs."""
+        ts = float(now if now is not None else time.time())
+        evicted = 0
+
+        # 1. Evict expired tombstones first
+        for rid in [k for k, tb in self._tombstones.items() if ts - tb.expired_at > self.tombstone_ttl_seconds]:
+            self._tombstones.pop(rid, None)
+
+        # 2. Identify finished sessions eligible for eviction (NEVER queued/running)
+        finished = [
+            (rid, sess)
+            for rid, sess in self.sessions.items()
+            if sess.state.status not in ("queued", "running")
+        ]
+        finished.sort(key=lambda pair: pair[1].finished_at or pair[1].created_at)
+
+        to_evict: list[tuple[str, AgentRunSession]] = []
+        remaining_finished = 0
+        for rid, sess in finished:
+            fin_ts = sess.finished_at or sess.created_at
+            if ts - fin_ts > self.finished_session_ttl_seconds:
+                to_evict.append((rid, sess))
+            else:
+                remaining_finished += 1
+
+        # Enforce max_finished_sessions cap (oldest first)
+        overflow = remaining_finished - self.max_finished_sessions
+        if overflow > 0:
+            evict_ids = {rid for rid, _ in to_evict}
+            for rid, sess in finished:
+                if overflow <= 0:
+                    break
+                if rid not in evict_ids:
+                    to_evict.append((rid, sess))
+                    evict_ids.add(rid)
+                    overflow -= 1
+
+        for rid, sess in to_evict:
+            self.sessions.pop(rid, None)
+            self._tombstones[rid] = _SessionTombstone(
+                run_id=rid,
+                owner_id=sess.state.owner_id,
+                service_id=sess.state.service_id or "",
+                expired_at=ts,
+            )
+            evicted += 1
+
+        # Cap tombstone map size (oldest first)
+        if len(self._tombstones) > self.max_tombstones:
+            ordered = sorted(self._tombstones.items(), key=lambda kv: kv[1].expired_at)
+            for rid, _ in ordered[: len(self._tombstones) - self.max_tombstones]:
+                self._tombstones.pop(rid, None)
+
+        return evicted
+
+    def lookup_session(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        service_id: str,
+        is_admin: bool = False,
+    ) -> Tuple[Optional[AgentRunSession], Optional[str]]:
+        """NG-07 API Contract: returns (session, None) | (None, 'SESSION_EXPIRED') | (None, 'SESSION_NOT_FOUND')."""
+        self.evict_expired_sessions()
+        sess = self.sessions.get(run_id)
+        if sess is not None:
+            if not is_admin and (sess.state.owner_id != owner_id or sess.state.service_id != service_id):
+                return None, "SESSION_NOT_FOUND"
+            return sess, None
+        tb = self._tombstones.get(run_id)
+        if tb is not None:
+            if is_admin or (tb.owner_id == owner_id and tb.service_id == service_id):
+                return None, "SESSION_EXPIRED"
+        return None, "SESSION_NOT_FOUND"
 
     async def create_run(
         self,

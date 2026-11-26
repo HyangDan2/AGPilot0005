@@ -1,6 +1,6 @@
 """LangGraph StateGraph Engine for AGCore."""
 import json
-from typing import Any, Dict, Literal
+from typing import Any, Dict, Literal, Optional
 from langgraph.graph import StateGraph, END
 from app.gateway.client import AIGatewayClient, gateway_client, gateway_for_service
 from app.runtime.context import context_manager, is_context_overflow_error
@@ -94,14 +94,18 @@ async def model_node(
     import inspect
     from app.schemas.gateway import ModelReply
 
-    def _supports_return_reply(c) -> bool:
+    def _structured_kwarg_name(c) -> Optional[str]:
         try:
-            sig = inspect.signature(c.execute)
-            return "return_reply" in sig.parameters
+            params = inspect.signature(c.execute).parameters
+            if "_structured" in params:
+                return "_structured"
+            if "return_reply" in params:
+                return "return_reply"
+            return None
         except Exception:
-            return False
+            return None
 
-    use_reply = _supports_return_reply(client)
+    structured_kw = _structured_kwarg_name(client)
     accumulated_usage: Dict[str, int] = {}
     streamed_any_delta = False
 
@@ -127,8 +131,8 @@ async def model_node(
 
     async def _invoke_client(msgs, *, tools_arg, choice_arg, delta_cb):
         kw = dict(label_options)
-        if use_reply:
-            kw["return_reply"] = True
+        if structured_kw:
+            kw[structured_kw] = True
         raw = await client.execute(
             messages=msgs,
             tools=tools_arg,
@@ -215,6 +219,7 @@ async def tool_node(
     validated_calls=None,
     constraints=None,
     timeout_override=None,
+    approved_context_budget=None,
 ) -> Dict[str, Any]:
     """Executes pending (or strictly ValidatedAction-approved) tool calls and updates message state."""
     calls = list(validated_calls) if validated_calls is not None else list(state.pending_tool_calls)
@@ -245,6 +250,10 @@ async def tool_node(
         tool_count=max(1, len(calls)),
     )
     route_input_budget = active_budget.input_budget_tokens if active_budget else context_manager.budget_tokens
+    if approved_context_budget is not None:
+        route_input_budget = min(route_input_budget, int(approved_context_budget))
+    elif constraints is not None:
+        route_input_budget = min(route_input_budget, int(constraints.context_budget_tokens))
     est_used_tokens = max(0, sum(len((m.content or "")) for m in state.messages) // 4)
     remaining_input_tokens = max(0, route_input_budget - est_used_tokens)
     from app.core.auth import ExecutionScope, current_execution_scope
