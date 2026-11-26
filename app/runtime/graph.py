@@ -11,7 +11,15 @@ from app.tools.dispatcher import dispatcher
 from app.tools.registry import registry
 from app.adapters.document import document_owner_id, tool_token_budget
 
-async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) -> Dict[str, Any]:
+async def model_node(
+    state: AgentState,
+    on_delta=None,
+    on_reasoning_delta=None,
+    *,
+    context_budget_override=None,
+    reasoning_effort_override=None,
+    disable_tools: bool = False,
+) -> Dict[str, Any]:
     """Invokes AI Gateway with current messages and tools."""
     state.step_count += 1
 
@@ -48,6 +56,12 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
     client = state.custom_client or gateway_for_service(state.service_id, gateway_client)
     route_budget, has_contract = await get_effective_route_budget(client, state.service_id)
     effective_input_budget = route_budget.input_budget_tokens if has_contract else None
+    if context_budget_override is not None:
+        effective_input_budget = (
+            min(effective_input_budget, int(context_budget_override))
+            if effective_input_budget is not None
+            else int(context_budget_override)
+        )
     pruned_msgs, _report = context_manager.compact_with_report(
         state.messages,
         budget_tokens=effective_input_budget,
@@ -72,15 +86,17 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
         model_label = label
 
     label_options = {'on_model_label': capture_label} if isinstance(client, AIGatewayClient) else {}
-    call_tools = tools if not public_grounding and state.tool_call_count < state.max_tool_calls else None
-    call_choice = ("required" if first_document_step else "auto") if not public_grounding and state.tool_call_count < state.max_tool_calls else "none"
+    allow_tools = (not disable_tools) and (not public_grounding) and state.tool_call_count < state.max_tool_calls
+    call_tools = tools if allow_tools else None
+    call_choice = ("required" if first_document_step else "auto") if allow_tools else "none"
+    effective_effort = reasoning_effort_override if reasoning_effort_override is not None else state.reasoning_effort
     try:
         content, tool_calls, finish_reason = await client.execute(
             messages=pruned_msgs,
             tools=call_tools,
             tool_choice=call_choice,
             stream=state.stream,
-            reasoning_effort=state.reasoning_effort,
+            reasoning_effort=effective_effort,
             on_reasoning_delta=on_reasoning_delta,
             on_content_delta=on_delta,
             **label_options,

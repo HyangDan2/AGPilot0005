@@ -2,10 +2,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, Dict, FrozenSet, Mapping, Optional, Protocol, Tuple
 
 from app.runtime.policy.constraints import ActionType, ConstraintSpec
+
+
+class DecisionType(str, Enum):
+    """R1-FIX-06: Typed Policy Decision Contract."""
+
+    NEXT_NODE = "NEXT_NODE"
+    TOOL_SELECTION = "TOOL_SELECTION"
+    CONTEXT_ALLOCATION = "CONTEXT_ALLOCATION"
+    MODEL_PREFERENCE = "MODEL_PREFERENCE"
+    REASONING_CONFIG = "REASONING_CONFIG"
+    # Reserved contracts for follow-up phases (NOT active in Phase R1.1)
+    RETRIEVAL_CONFIG = "RETRIEVAL_CONFIG"
+    VERIFICATION = "VERIFICATION"
+    REPLANNING = "REPLANNING"
+    TERMINATION = "TERMINATION"
+
+
+RESERVED_DECISION_TYPES: FrozenSet[str] = frozenset(
+    {
+        DecisionType.RETRIEVAL_CONFIG.value,
+        DecisionType.VERIFICATION.value,
+        DecisionType.REPLANNING.value,
+    }
+)
 
 
 @dataclass(frozen=True)

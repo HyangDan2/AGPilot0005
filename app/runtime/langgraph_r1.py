@@ -263,6 +263,7 @@ class LangGraphR1Runtime:
 
             outcome = "success"
             terminal_status: Optional[str] = None
+            collected_token_usage: Dict[str, int] = {}
             context_compacted = bool(gstate.get("context_compacted", False))
             last_tool_meta = gstate.get("last_tool_meta")
             attempted_sigs = list(gstate.get("attempted_tool_sigs", []))
@@ -274,21 +275,20 @@ class LangGraphR1Runtime:
                     if run_deadline.is_expired():
                         raise TimeoutError("run_deadline_exceeded")
 
-                    if action == ActionType.DEFAULT_CONFIG.value:
-                        st.reasoning_effort = params.get("reasoning_effort", constraints_spec.default_reasoning_effort)
-                    elif action == ActionType.CALL_MODEL.value and "reasoning_effort" in params:
-                        st.reasoning_effort = params["reasoning_effort"]
-
-                    # R1-FIX-07: SAFE_RESPOND disables tools cleanly without mutating actual tool_call_count
-                    prev_max_tools = st.max_tool_calls
-                    if action == ActionType.SAFE_RESPOND.value:
+                    effective_effort = (
+                        params.get("reasoning_effort", constraints_spec.default_reasoning_effort)
+                        if action in (ActionType.DEFAULT_CONFIG.value, ActionType.CALL_MODEL.value)
+                        else st.reasoning_effort
+                    )
+                    effective_ctx_budget = params.get("context_budget_tokens")
+                    is_safe_respond = action == ActionType.SAFE_RESPOND.value
+                    if is_safe_respond:
                         st.pending_tool_calls = []
-                        st.max_tool_calls = st.tool_call_count
 
                     await _emit("step.started", {"step": st.step_count + 1})
                     await _emit(
                         "model.started",
-                        {"step": st.step_count + 1, "reasoning_effort": st.reasoning_effort or "default"},
+                        {"step": st.step_count + 1, "reasoning_effort": effective_effort or "default"},
                     )
 
                     async def on_delta(chunk: str):
@@ -297,12 +297,23 @@ class LangGraphR1Runtime:
                     async def on_reasoning_delta(chunk: str):
                         await _emit("reasoning.delta", {"delta": chunk, "step": st.step_count})
 
-                    try:
-                        async with asyncio.timeout(run_deadline.remaining_seconds()):
-                            res = await model_node(st, on_delta=on_delta, on_reasoning_delta=on_reasoning_delta)
-                    finally:
-                        if action == ActionType.SAFE_RESPOND.value:
-                            st.max_tool_calls = prev_max_tools
+                    async with asyncio.timeout(run_deadline.remaining_seconds()):
+                        res = await model_node(
+                            st,
+                            on_delta=on_delta,
+                            on_reasoning_delta=on_reasoning_delta,
+                            context_budget_override=effective_ctx_budget,
+                            reasoning_effort_override=effective_effort,
+                            disable_tools=is_safe_respond,
+                        )
+
+                    # R1-FIX-09: Collect actual provider token usage if reported (never fabricate)
+                    raw_usage = getattr(st.custom_client, "last_usage", None) if st.custom_client is not None else None
+                    if isinstance(raw_usage, dict):
+                        for k in ("input_tokens", "output_tokens", "total_tokens"):
+                            v = raw_usage.get(k)
+                            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                                collected_token_usage[k] = v
 
                     if run_fence.is_terminal:
                         run_fence.record_late_result()
@@ -514,6 +525,7 @@ class LangGraphR1Runtime:
                     outcome=outcome,
                     next_state_features=next_sv.to_features_dict(),
                     execution_latency=latency,
+                    token_usage=collected_token_usage,
                     terminal_status=terminal_status,
                     owner_id=constraints_spec.owner_id,
                     service_id=constraints_spec.service_id,

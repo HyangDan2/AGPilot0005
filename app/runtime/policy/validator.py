@@ -580,6 +580,16 @@ class ActionValidator:
                         reason_code=RejectionCategory.STEP_BUDGET_EXCEEDED.value,
                     ),
                 )
+            if state_view.estimated_context_tokens > constraints.context_budget_tokens:
+                return self._reject(
+                    RejectionCategory.CONTEXT_BUDGET_INSUFFICIENT,
+                    ["context_budget_tokens"],
+                    FallbackAction(
+                        action=ActionType.TERMINATE.value,
+                        parameters=MappingProxyType({"terminal_status": "failed"}),
+                        reason_code=RejectionCategory.CONTEXT_BUDGET_INSUFFICIENT.value,
+                    ),
+                )
 
         if fallback.action == ActionType.CALL_TOOLS.value:
             for tname in fallback.parameters.get("tool_names", ()):

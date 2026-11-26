@@ -27,7 +27,11 @@ BASE_PATH = Path(__file__).resolve().parent.parent
 async def lifespan(_app: FastAPI):
     await sync_contracts_from_gateway(gateway_client, [gateway_client.route, "hd2ai-admin", "hd2ai-public"])
     await tool_policy.sync_all(registry)
-    yield
+    try:
+        yield
+    finally:
+        from app.tracing.store import shutdown_default_trajectory_logger
+        shutdown_default_trajectory_logger(timeout_seconds=5.0)
 
 
 app = FastAPI(

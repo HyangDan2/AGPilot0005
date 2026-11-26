@@ -372,9 +372,22 @@ class TrajectoryEventStore:
 class TrajectoryLogger:
     """High-level sanitized logger writing Decision/Action/Outcome/Feedback events."""
 
-    def __init__(self, store: TrajectoryEventStore, clock: Clock = system_clock):
+    def __init__(self, store: TrajectoryEventStore, clock: Clock = system_clock, async_writer: Optional[Any] = None):
         self.store = store
         self.clock = clock
+        self.async_writer = async_writer
+
+    def _emit_event(
+        self,
+        event: AnyTrajectoryEvent,
+        *,
+        owner_id: Optional[str] = None,
+        service_id: Optional[str] = None,
+    ) -> None:
+        if self.async_writer is not None:
+            self.async_writer.enqueue(event, owner_id=owner_id, service_id=service_id)
+        else:
+            self.store.append(event, owner_id=owner_id, service_id=service_id)
 
     @staticmethod
     def new_id(prefix: str) -> str:
@@ -420,7 +433,7 @@ class TrajectoryLogger:
             validator_result=sanitize_mapping(validator_result),
             timestamp=self.clock.now_epoch(),
         )
-        self.store.append(ev, owner_id=owner_id, service_id=service_id)
+        self._emit_event(ev, owner_id=owner_id, service_id=service_id)
         return ev
 
     def log_action(
@@ -449,7 +462,7 @@ class TrajectoryLogger:
             fallback_applied=bool(fallback_applied),
             timestamp=self.clock.now_epoch(),
         )
-        self.store.append(ev, owner_id=owner_id, service_id=service_id)
+        self._emit_event(ev, owner_id=owner_id, service_id=service_id)
         return ev
 
     def log_outcome(
@@ -484,7 +497,7 @@ class TrajectoryLogger:
             terminal_status=terminal_status,
             timestamp=self.clock.now_epoch(),
         )
-        self.store.append(ev, owner_id=owner_id, service_id=service_id)
+        self._emit_event(ev, owner_id=owner_id, service_id=service_id)
         return ev
 
     def log_feedback(
@@ -509,7 +522,7 @@ class TrajectoryLogger:
             reward_signal=float(reward_signal),
             timestamp=self.clock.now_epoch(),
         )
-        self.store.append(ev, owner_id=owner_id, service_id=service_id)
+        self._emit_event(ev, owner_id=owner_id, service_id=service_id)
         return ev
 
 
@@ -524,3 +537,11 @@ def get_trajectory_logger() -> TrajectoryLogger:
             store = TrajectoryEventStore(settings.TRAJECTORY_DB_PATH)
             _default_logger = TrajectoryLogger(store, clock=system_clock)
         return _default_logger
+
+
+def shutdown_default_trajectory_logger(timeout_seconds: float = 5.0) -> Optional[Dict[str, Any]]:
+    global _default_logger
+    with _default_logger_lock:
+        if _default_logger is not None and _default_logger.async_writer is not None:
+            return _default_logger.async_writer.shutdown(timeout_seconds=timeout_seconds)
+    return None
