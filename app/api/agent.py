@@ -93,7 +93,11 @@ async def get_agent_run(run_id: str, request: Request):
             usage={'job_id':job_id,'model_calls':job['model_calls'],'document_calls':job.get('document_calls',0)},
             created_at=job['created_at'], error={'code':job['error_code'],'message':job['error_code']} if job['error_code'] else None)
     session, lookup_err = runner.lookup_session(
-        run_id, owner_id=scope.owner_id, service_id=scope.service_id, is_admin=scope.is_admin
+        run_id,
+        owner_id=scope.owner_id,
+        service_id=scope.service_id,
+        tenant_id=scope.tenant_id,
+        is_admin=scope.is_admin,
     )
     if lookup_err == "SESSION_EXPIRED":
         return JSONResponse(status_code=410, content={"error_code": "SESSION_EXPIRED", "detail": "Session has expired."})
@@ -131,7 +135,11 @@ async def get_agent_events(run_id: str, request: Request):
             yield 'event: run.deferred\ndata: ' + json.dumps({'run_id':run_id,'job_id':job_id,'status':job['status']}) + '\n\n'
         return StreamingResponse(snapshot(), media_type='text/event-stream', headers={'Cache-Control':'no-store'})
     session, lookup_err = runner.lookup_session(
-        run_id, owner_id=scope.owner_id, service_id=scope.service_id, is_admin=scope.is_admin
+        run_id,
+        owner_id=scope.owner_id,
+        service_id=scope.service_id,
+        tenant_id=scope.tenant_id,
+        is_admin=scope.is_admin,
     )
     if lookup_err == "SESSION_EXPIRED":
         return JSONResponse(status_code=410, content={"error_code": "SESSION_EXPIRED", "detail": "Session has expired."})

@@ -256,19 +256,12 @@ async def tool_node(
         route_input_budget = min(route_input_budget, int(constraints.context_budget_tokens))
     est_used_tokens = max(0, sum(len((m.content or "")) for m in state.messages) // 4)
     remaining_input_tokens = max(0, route_input_budget - est_used_tokens)
-    from app.core.auth import ExecutionScope, current_execution_scope
+    from app.core.auth import current_execution_scope
 
     owner_token = document_owner_id.set(state.owner_id)
     budget_token = tool_token_budget.set(per_tool_budget)
-    run_scope = ExecutionScope(
-        tenant_id="public_tenant" if state.service_id == "hd2ai-public" else "default_tenant",
-        owner_id=state.owner_id,
-        service_id=state.service_id or "",
-        role="user",
-        authenticated=bool(state.authenticated),
-        auth_source="run_state",
-    )
-    scope_token = current_execution_scope.set(run_scope)
+    # CR-02: Propagate the exact verified ExecutionScope instance (NEVER reconstruct with hardcoded default_tenant/user!)
+    scope_token = current_execution_scope.set(state.execution_scope) if state.execution_scope is not None else None
     try:
         results = await dispatcher.execute_batch(
             calls=calls,
@@ -281,7 +274,8 @@ async def tool_node(
             constraints=constraints,
         )
     finally:
-        current_execution_scope.reset(scope_token)
+        if scope_token is not None:
+            current_execution_scope.reset(scope_token)
         tool_token_budget.reset(budget_token)
         document_owner_id.reset(owner_token)
     

@@ -42,9 +42,10 @@ class AgentRunSession:
 
 @dataclass(frozen=True)
 class _SessionTombstone:
-    """NG-07: Minimal metadata-only tombstone (no prompt, answer, or tool results)."""
+    """NG-07 & CR-02: Minimal metadata-only tombstone with Tenant, Owner, Service."""
 
     run_id: str
+    tenant_id: str
     owner_id: str
     service_id: str
     expired_at: float
@@ -112,6 +113,7 @@ class AgentRunner:
             self.sessions.pop(rid, None)
             self._tombstones[rid] = _SessionTombstone(
                 run_id=rid,
+                tenant_id=sess.state.tenant_id,
                 owner_id=sess.state.owner_id,
                 service_id=sess.state.service_id or "",
                 expired_at=ts,
@@ -132,18 +134,26 @@ class AgentRunner:
         *,
         owner_id: str,
         service_id: str,
+        tenant_id: Optional[str] = None,
         is_admin: bool = False,
     ) -> Tuple[Optional[AgentRunSession], Optional[str]]:
-        """NG-07 API Contract: returns (session, None) | (None, 'SESSION_EXPIRED') | (None, 'SESSION_NOT_FOUND')."""
+        """NG-07 & CR-02: Enforces Tenant + Owner + Service isolation on active sessions and tombstones."""
         self.evict_expired_sessions()
         sess = self.sessions.get(run_id)
         if sess is not None:
-            if not is_admin and (sess.state.owner_id != owner_id or sess.state.service_id != service_id):
-                return None, "SESSION_NOT_FOUND"
+            if not is_admin:
+                if sess.state.owner_id != owner_id or sess.state.service_id != service_id:
+                    return None, "SESSION_NOT_FOUND"
+                if tenant_id is not None and sess.state.tenant_id != tenant_id:
+                    return None, "SESSION_NOT_FOUND"
             return sess, None
         tb = self._tombstones.get(run_id)
         if tb is not None:
-            if is_admin or (tb.owner_id == owner_id and tb.service_id == service_id):
+            if is_admin or (
+                tb.owner_id == owner_id
+                and tb.service_id == service_id
+                and (tenant_id is None or tb.tenant_id == tenant_id)
+            ):
                 return None, "SESSION_EXPIRED"
         return None, "SESSION_NOT_FOUND"
 
@@ -155,16 +165,18 @@ class AgentRunner:
         owner_id: str = "default_user",
         caller_scope: Optional[Any] = None,
     ) -> AgentRunSession:
-        # FIX-202: Fail-closed authentication check on runtime entry
+        # FIX-202 & CR-02: Fail-closed authentication check & immutable ExecutionScope propagation
         if caller_scope is not None:
             if not getattr(caller_scope, "authenticated", False):
                 raise PermissionError("unauthenticated_runtime_entry")
             service_id = caller_scope.service_id or service_id
             owner_id = caller_scope.owner_id or owner_id
+            tenant_id = caller_scope.tenant_id or settings.AGTOOLS_TENANT
             is_authenticated = True
         else:
             if settings.ENVIRONMENT.lower() == "production":
                 raise PermissionError("caller_scope_required_in_production")
+            tenant_id = "public_tenant" if service_id == "hd2ai-public" else settings.AGTOOLS_TENANT
             is_authenticated = True
 
         run_id = f"run-{uuid.uuid4().hex[:16]}"
@@ -204,7 +216,9 @@ class AgentRunner:
             session_id=req.session_id,
             service_id=service_id,
             owner_id=owner_id,
+            tenant_id=tenant_id,
             authenticated=is_authenticated,
+            execution_scope=caller_scope,
             context_refs=refs,
             document_titles=titles,
             messages=messages,

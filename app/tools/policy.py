@@ -196,7 +196,9 @@ class ToolPolicyStore:
                 if tool_name in ("document.get_outline", "document.search", "document.read_chunk") and tool_name not in synced_names:
                     return False, "tool_globally_disabled"
         else:
-            if not settings.AGTOOLS_ENABLED:
+            # CR-01.5: Only block tools belonging to agtools when AGTOOLS_ENABLED=False (never block independent providers)
+            agtools_names = {t.get("name") for t in (providers.get("agtools", {}).get("tools") or [])}
+            if not settings.AGTOOLS_ENABLED and tool_name in agtools_names:
                 return False, "agtools_disabled"
         if not service_id:
             return True, None
@@ -271,27 +273,24 @@ class ToolPolicyStore:
             prov["last_sync_ok"] = True
             prov["last_error"] = None
             self._register_http_tools(prov, tool_registry)
-            self.save(policy)
+            try:
+                self.save(policy)
+            except OSError:
+                self._cache = policy
             return prov
         except Exception as exc:
             prov["last_sync_at"] = time.time()
             prov["last_sync_ok"] = False
             prov["last_error"] = str(exc)
-            self.save(policy)
-            return prov
-
-    def _register_http_tools(self, prov: Dict[str, Any], tool_registry: Any) -> None:
-        if provider_id == "agtools" and not settings.AGTOOLS_ENABLED:
-            prov["tools"] = []
-            prov["last_sync_at"] = time.time()
-            prov["last_sync_ok"] = True
-            prov["last_error"] = "agtools_disabled"
             try:
                 self.save(policy)
             except OSError:
-                pass
+                self._cache = policy
             return prov
 
+    def _register_http_tools(self, prov: Dict[str, Any], tool_registry: Any) -> None:
+        if prov.get("id") == "agtools" and not settings.AGTOOLS_ENABLED:
+            return
         if not prov.get("enabled", True):
             return
         base_url = prov.get("base_url") or ""

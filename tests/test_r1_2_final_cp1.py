@@ -46,7 +46,7 @@ async def test_ng_01_agtools_disabled_blocks_all_outbound_paths(tmp_path, monkey
     assert reason == "agtools_disabled"
 
     # 5) Deployment checklist MUST NOT mention unsupported AGTOOLS_SERVICE_TOKENS
-    checklist = Path("/Users/jaehyukshim/AGWS/AGPilot0005/docs/DEPLOYMENT_CHECKLIST.md").read_text(encoding="utf-8")
+    checklist = (Path(__file__).resolve().parents[1] / "docs" / "DEPLOYMENT_CHECKLIST.md").read_text(encoding="utf-8")
     assert "AGTOOLS_SERVICE_TOKENS" not in checklist
     assert "DOCUMENT_SERVICE_TOKEN" in checklist
 

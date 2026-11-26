@@ -106,10 +106,20 @@ def validate_boot_configuration() -> None:
         try:
             scopes = _json.loads(settings.CREDENTIAL_SCOPES_JSON)
             secrets = _json.loads(settings.CREDENTIAL_SECRETS_JSON or "{}")
-            for cid in scopes:
-                vals = secrets.get(cid)
-                if not isinstance(vals, list) or not vals or not all(is_agtools_token_valid(v) for v in vals):
-                    missing.append(f"AGCORE_CREDENTIAL_SECRETS[{cid}]")
+            if not isinstance(scopes, dict) or not isinstance(secrets, dict):
+                missing.append("AGCORE_CREDENTIAL_SCOPES_INVALID_TYPE")
+            else:
+                seen_secrets: dict[str, str] = {}
+                for cid in scopes:
+                    vals = secrets.get(cid)
+                    if not isinstance(vals, list) or not vals or not all(is_agtools_token_valid(v) for v in vals):
+                        missing.append(f"AGCORE_CREDENTIAL_SECRETS[{cid}]")
+                        continue
+                    for v in vals:
+                        norm_v = v.strip()
+                        if norm_v in seen_secrets and seen_secrets[norm_v] != cid:
+                            missing.append(f"duplicate_credential_secret:{seen_secrets[norm_v]}:{cid}")
+                        seen_secrets[norm_v] = cid
         except Exception:
             missing.append("AGCORE_CREDENTIAL_SCOPES_INVALID_JSON")
     if missing:

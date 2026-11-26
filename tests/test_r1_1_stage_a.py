@@ -341,7 +341,7 @@ async def test_qa_r1_09_auth_and_secret_fail_closed(monkeypatch):
     assert c_default.authenticated is False
 
     # 2) No hardcoded production AGTools token in app/config.py
-    cfg_src = Path("/Users/jaehyukshim/AGWS/AGPilot0005/app/config.py").read_text(encoding="utf-8")
+    cfg_src = (Path(__file__).resolve().parents[1] / "app" / "config.py").read_text(encoding="utf-8")
     assert "hd2-doc-secret-token-key-2026" not in cfg_src
 
     # 3) Empty/whitespace token rejected fail-closed by auth helper
