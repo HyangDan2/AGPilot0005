@@ -98,6 +98,7 @@ class TrajectoryEventStore:
                         action_id TEXT,
                         owner_id TEXT,
                         service_id TEXT,
+                        tenant_id TEXT,
                         timestamp REAL NOT NULL,
                         payload_json TEXT NOT NULL
                     );
@@ -117,12 +118,14 @@ class TrajectoryEventStore:
                     END;
                     """
                 )
-                # Backward-compatible idempotent schema migration (FIX-208 D)
+                # Backward-compatible idempotent schema migration (FIX-208 D / HF-02)
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(trajectory_events)").fetchall()}
                 if "owner_id" not in cols:
                     conn.execute("ALTER TABLE trajectory_events ADD COLUMN owner_id TEXT;")
                 if "service_id" not in cols:
                     conn.execute("ALTER TABLE trajectory_events ADD COLUMN service_id TEXT;")
+                if "tenant_id" not in cols:
+                    conn.execute("ALTER TABLE trajectory_events ADD COLUMN tenant_id TEXT;")
                 if "feedback_dedup_key" not in cols:
                     conn.execute("ALTER TABLE trajectory_events ADD COLUMN feedback_dedup_key TEXT;")
                 try:
@@ -154,7 +157,8 @@ class TrajectoryEventStore:
 
     @staticmethod
     def _verify_feedback_dedup_integrity(conn: sqlite3.Connection) -> bool:
-        """CR-05: Verifies unique attribute, exact column, partial WHERE clause, and 0 NULL dedup keys via PRAGMA."""
+        """CR-05 / HF-04: Verifies unique/partial attributes, exact column, exact WHERE predicate,
+        0 NULL dedup keys, and active SAVEPOINT runtime dedup enforcement."""
         idx_list = conn.execute("PRAGMA index_list('trajectory_events')").fetchall()
         # PRAGMA index_list columns: (seq, name, unique, origin, partial)
         match = next((r for r in idx_list if r[1] == "uq_trajectory_feedback_dedup"), None)
@@ -166,13 +170,64 @@ class TrajectoryEventStore:
         sql_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_trajectory_feedback_dedup'"
         ).fetchone()
-        sql_txt = (sql_row[0] if sql_row and sql_row[0] else "").lower()
-        if "feedbackevent" not in sql_txt or "feedback_dedup_key is not null" not in sql_txt:
+        raw_sql = (sql_row[0] if sql_row and sql_row[0] else "").strip()
+        # HF-04: Strictly normalize and verify the exact WHERE predicate (rejects tampered clauses like AND 1 = 0)
+        import re as _re
+
+        m_where = _re.search(r"\bwhere\b(.*)$", raw_sql, flags=_re.IGNORECASE | _re.DOTALL)
+        if not m_where:
+            return False
+        norm_where = _re.sub(r"\s+", " ", m_where.group(1)).strip().rstrip(";").strip().lower()
+        norm_where = norm_where.strip("()")
+        allowed_predicates = {
+            "event_type = 'feedbackevent' and feedback_dedup_key is not null",
+            "feedback_dedup_key is not null and event_type = 'feedbackevent'",
+        }
+        if norm_where not in allowed_predicates:
             return False
         null_fb = conn.execute(
             "SELECT COUNT(*) FROM trajectory_events WHERE event_type = 'FeedbackEvent' AND feedback_dedup_key IS NULL"
         ).fetchone()[0]
-        return int(null_fb) == 0
+        if int(null_fb) != 0:
+            return False
+
+        # HF-04: Active SAVEPOINT probe proving duplicate FeedbackEvent raises sqlite3.IntegrityError (rolled back)
+        probe_key = f"__dedup_probe_{uuid.uuid4().hex}__"
+        probe_ev1 = f"__probe_ev1_{uuid.uuid4().hex}__"
+        probe_ev2 = f"__probe_ev2_{uuid.uuid4().hex}__"
+        dedup_enforced = False
+        try:
+            conn.execute("SAVEPOINT sp_dedup_verify;")
+            conn.execute(
+                """
+                INSERT INTO trajectory_events (
+                    event_id, event_type, schema_version, trajectory_id, run_id,
+                    feedback_dedup_key, timestamp, payload_json
+                ) VALUES (?, 'FeedbackEvent', '1.0', '__probe__', '__probe__', ?, 0.0, '{}')
+                """,
+                (probe_ev1, probe_key),
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO trajectory_events (
+                        event_id, event_type, schema_version, trajectory_id, run_id,
+                        feedback_dedup_key, timestamp, payload_json
+                    ) VALUES (?, 'FeedbackEvent', '1.0', '__probe__', '__probe__', ?, 0.0, '{}')
+                    """,
+                    (probe_ev2, probe_key),
+                )
+            except sqlite3.IntegrityError:
+                dedup_enforced = True
+        except Exception:
+            dedup_enforced = False
+        finally:
+            try:
+                conn.execute("ROLLBACK TO SAVEPOINT sp_dedup_verify;")
+                conn.execute("RELEASE SAVEPOINT sp_dedup_verify;")
+            except Exception:
+                pass
+        return dedup_enforced
 
     def mark_incomplete(self, trajectory_id: str, reason: str, recorded_at: Optional[float] = None) -> None:
         """CR-08: Persistently records incomplete trajectory; propagates DB failures so Dirty Set is preserved."""
@@ -214,8 +269,9 @@ class TrajectoryEventStore:
         *,
         owner_id: Optional[str] = None,
         service_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> str:
-        """FIX-208 / NG-05: Direct atomic DB commit; fails closed (HTTP 503) if dedup integrity is unverified."""
+        """FIX-208 / NG-05 / HF-02: Direct atomic DB commit; fails closed (HTTP 503) if dedup integrity is unverified."""
         if not self.feedback_dedup_integrity_ok:
             raise FeedbackIntegrityError("feedback_dedup_integrity_unverified")
         payload_json = json.dumps(event.model_dump(), ensure_ascii=False, sort_keys=True)
@@ -234,8 +290,8 @@ class TrajectoryEventStore:
                     INSERT INTO trajectory_events (
                         event_id, event_type, schema_version,
                         trajectory_id, run_id, decision_id, action_id,
-                        owner_id, service_id, feedback_dedup_key, timestamp, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                        owner_id, service_id, tenant_id, feedback_dedup_key, timestamp, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.event_id,
@@ -246,6 +302,7 @@ class TrajectoryEventStore:
                         event.decision_id,
                         owner_id,
                         service_id,
+                        tenant_id,
                         dedup_key,
                         float(event.timestamp),
                         payload_json,
@@ -274,6 +331,7 @@ class TrajectoryEventStore:
         *,
         owner_id: Optional[str] = None,
         service_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> str:
         payload = event.model_dump()
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -289,8 +347,8 @@ class TrajectoryEventStore:
                     INSERT INTO trajectory_events (
                         event_id, event_type, schema_version,
                         trajectory_id, run_id, decision_id, action_id,
-                        owner_id, service_id, timestamp, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        owner_id, service_id, tenant_id, timestamp, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.event_id,
@@ -302,6 +360,7 @@ class TrajectoryEventStore:
                         action_id,
                         owner_id,
                         service_id,
+                        tenant_id,
                         float(event.timestamp),
                         payload_json,
                     ),
@@ -323,13 +382,13 @@ class TrajectoryEventStore:
                 conn.close()
 
     def get_run_metadata(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """Returns authoritative ownership & referential integrity metadata for a stored run (R1-FIX-02)."""
+        """Returns authoritative ownership & tenant metadata for a stored run (R1-FIX-02 / HF-02)."""
         with self._lock:
             conn = self._connect()
             try:
                 rows = conn.execute(
                     """
-                    SELECT trajectory_id, owner_id, service_id, event_type, decision_id
+                    SELECT trajectory_id, owner_id, service_id, tenant_id, event_type, decision_id
                     FROM trajectory_events
                     WHERE run_id = ?
                     ORDER BY seq ASC
@@ -343,12 +402,14 @@ class TrajectoryEventStore:
         trajectory_id = rows[0][0]
         owner_id = next((r[1] for r in rows if r[1]), None)
         service_id = next((r[2] for r in rows if r[2]), None)
-        decision_ids = {r[4] for r in rows if r[3] == "DecisionEvent" and r[4]}
+        tenant_id = next((r[3] for r in rows if r[3]), None)
+        decision_ids = {r[5] for r in rows if r[4] == "DecisionEvent" and r[5]}
         return {
             "run_id": run_id,
             "trajectory_id": trajectory_id,
             "owner_id": owner_id,
             "service_id": service_id,
+            "tenant_id": tenant_id,
             "decision_ids": decision_ids,
         }
 
@@ -643,11 +704,12 @@ class TrajectoryLogger:
         *,
         owner_id: Optional[str] = None,
         service_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> None:
         if self.async_writer is not None:
-            self.async_writer.enqueue(event, owner_id=owner_id, service_id=service_id)
+            self.async_writer.enqueue(event, owner_id=owner_id, service_id=service_id, tenant_id=tenant_id)
         else:
-            self.store.append(event, owner_id=owner_id, service_id=service_id)
+            self.store.append(event, owner_id=owner_id, service_id=service_id, tenant_id=tenant_id)
 
     @staticmethod
     def new_id(prefix: str) -> str:
@@ -673,6 +735,7 @@ class TrajectoryLogger:
         event_id: Optional[str] = None,
         owner_id: Optional[str] = None,
         service_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> DecisionEvent:
         ev = DecisionEvent(
             event_id=event_id or self.new_id("dec-evt"),
@@ -693,7 +756,7 @@ class TrajectoryLogger:
             validator_result=sanitize_mapping(validator_result),
             timestamp=self.clock.now_epoch(),
         )
-        self._emit_event(ev, owner_id=owner_id, service_id=service_id)
+        self._emit_event(ev, owner_id=owner_id, service_id=service_id, tenant_id=tenant_id)
         return ev
 
     def log_action(
@@ -709,6 +772,7 @@ class TrajectoryLogger:
         event_id: Optional[str] = None,
         owner_id: Optional[str] = None,
         service_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> ActionEvent:
         ev = ActionEvent(
             event_id=event_id or self.new_id("act-evt"),
@@ -722,7 +786,7 @@ class TrajectoryLogger:
             fallback_applied=bool(fallback_applied),
             timestamp=self.clock.now_epoch(),
         )
-        self._emit_event(ev, owner_id=owner_id, service_id=service_id)
+        self._emit_event(ev, owner_id=owner_id, service_id=service_id, tenant_id=tenant_id)
         return ev
 
     def log_outcome(
@@ -741,6 +805,7 @@ class TrajectoryLogger:
         event_id: Optional[str] = None,
         owner_id: Optional[str] = None,
         service_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> OutcomeEvent:
         ev = OutcomeEvent(
             event_id=event_id or self.new_id("out-evt"),
@@ -757,7 +822,7 @@ class TrajectoryLogger:
             terminal_status=terminal_status,
             timestamp=self.clock.now_epoch(),
         )
-        self._emit_event(ev, owner_id=owner_id, service_id=service_id)
+        self._emit_event(ev, owner_id=owner_id, service_id=service_id, tenant_id=tenant_id)
         return ev
 
     def log_feedback(
@@ -771,6 +836,7 @@ class TrajectoryLogger:
         event_id: Optional[str] = None,
         owner_id: Optional[str] = None,
         service_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> FeedbackEvent:
         ev = FeedbackEvent(
             event_id=event_id or self.new_id("fb-evt"),
@@ -782,7 +848,7 @@ class TrajectoryLogger:
             reward_signal=float(reward_signal),
             timestamp=self.clock.now_epoch(),
         )
-        self._emit_event(ev, owner_id=owner_id, service_id=service_id)
+        self._emit_event(ev, owner_id=owner_id, service_id=service_id, tenant_id=tenant_id)
         return ev
 
 

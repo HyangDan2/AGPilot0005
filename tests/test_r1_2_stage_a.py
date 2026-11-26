@@ -20,9 +20,39 @@ from app.tracing.store import TrajectoryEventStore, TrajectoryLogger
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_fix_201_complete_auth_and_role_escalation_block(monkeypatch):
+    import json
+
     monkeypatch.setattr(settings, "ENVIRONMENT", "production")
-    monkeypatch.setattr(settings, "SERVICE_TOKENS", "curr-user-tok,prev-user-tok")
-    monkeypatch.setattr(settings, "ADMIN_SERVICE_TOKENS", "admin-only-tok")
+    monkeypatch.setattr(
+        settings,
+        "CREDENTIAL_SCOPES_JSON",
+        json.dumps(
+            {
+                "svc-user": {
+                    "allowed_services": ["hd2ai-admin"],
+                    "allowed_roles": ["service"],
+                    "allowed_tenants": ["default_tenant"],
+                    "owner_delegation": True,
+                },
+                "svc-admin": {
+                    "allowed_services": ["hd2ai-admin"],
+                    "allowed_roles": ["admiral"],
+                    "allowed_tenants": ["default_tenant"],
+                    "owner_delegation": True,
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        settings,
+        "CREDENTIAL_SECRETS_JSON",
+        json.dumps(
+            {
+                "svc-user": ["curr-user-tok", "prev-user-tok"],
+                "svc-admin": ["admin-only-tok"],
+            }
+        ),
+    )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         # 1) Unauthenticated access to protected endpoints MUST fail with 401

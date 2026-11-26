@@ -291,7 +291,7 @@ async def test_reg_pol_18_delayed_feedback_linkage(tmp_path, monkeypatch):
         constraints={}, chosen_action="CALL_MODEL", proposed_parameters={},
         behavior_policy_version="agpolicy-r1-v1", config_digest="1122",
         action_probability=None, validator_result={"accepted": True},
-        owner_id="default_user", service_id="hd2ai-admin",
+        owner_id="default_user", service_id="hd2ai-admin", tenant_id="default_tenant",
     )
     monkeypatch.setattr("app.api.agent.get_trajectory_logger", lambda: tlogger)
 

@@ -238,18 +238,21 @@ class AGToolsHttpAdapter(DocumentAdapter):
         self.timeout = timeout or settings.AGTOOLS_TIMEOUT_SECONDS
 
     def _headers(self) -> Dict[str, str]:
-        from app.core.auth import is_agtools_token_valid
+        from app.core.auth import current_execution_scope, is_agtools_token_valid
 
         if not settings.AGTOOLS_ENABLED:
             raise RuntimeError("agtools_disabled")
         if not is_agtools_token_valid(self.token):
             raise RuntimeError("agtools_token_missing_or_invalid")
+        scope = current_execution_scope.get()
+        resolved_owner = scope.owner_id if scope is not None else document_owner_id.get()
+        resolved_tenant = scope.tenant_id if scope is not None else settings.AGTOOLS_TENANT
         headers = {
             "Accept": "application/json",
             "User-Agent": "HD2Lab-AGCore/1.1",
             "Authorization": f"Bearer {self.token.strip()}",
-            "X-Owner-Id": document_owner_id.get(),
-            "X-Tenant-Id": settings.AGTOOLS_TENANT,
+            "X-Owner-Id": resolved_owner,
+            "X-Tenant-Id": resolved_tenant,
         }
         return headers
 

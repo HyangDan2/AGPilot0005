@@ -3,7 +3,11 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Literal, Optional
-from app.core.auth import require_authenticated_caller
+from app.core.auth import (
+    current_execution_scope,
+    require_authenticated_caller,
+    scoped_analysis_owner,
+)
 from app.runtime.event_bus import EventReplayExpiredError
 from app.runtime.runner import runner, DocumentReferenceError
 from app.schemas.agent import AgentRunRequest, AgentRunResponse
@@ -40,11 +44,23 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
     if any(m.get('role') not in ('user', 'assistant') or set(m) - {'role', 'content'} for m in req.history) or len(json.dumps(req.history, ensure_ascii=False).encode()) > 24000:
         raise HTTPException(422, 'invalid_task_history')
     if service_id in ('hd2ai-admin', 'hd2ai-beta', 'hd2ai-public') and (req.context_refs or req.analysis_refs):
+        tok = current_execution_scope.set(scope)
         try:
-            job = await services(request.app).create(owner, service_id, req.message, req.context_refs, req.history, req.analysis_refs,
-                session_id=req.session_id, reasoning_effort=(req.options.reasoning_effort if req.options else None) or 'off')
+            job = await services(request.app).create(
+                owner,
+                service_id,
+                req.message,
+                req.context_refs,
+                req.history,
+                req.analysis_refs,
+                session_id=req.session_id,
+                reasoning_effort=(req.options.reasoning_effort if req.options else None) or 'off',
+                tenant_id=scope.tenant_id,
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        finally:
+            current_execution_scope.reset(tok)
         run_id = 'run-' + job['job_id'][4:]
         if req.stream:
             async def deferred():
@@ -91,7 +107,7 @@ async def get_agent_run(run_id: str, request: Request):
     scope = require_authenticated_caller(request)
     job_id = durable_job(run_id)
     if job_id:
-        job = services(request.app).get(job_id, scope.owner_id, scope.service_id)
+        job = services(request.app).get(job_id, scope.owner_id, scope.service_id, tenant_id=scope.tenant_id)
         if job is None: raise HTTPException(404, 'Run not found')
         return AgentRunResponse(run_id=run_id, agent_id='general-agent', status=job['status'], answer=job['answer'], model_label=job.get('model_label'),
             usage={'job_id':job_id,'model_calls':job['model_calls'],'document_calls':job.get('document_calls',0)},
@@ -102,6 +118,7 @@ async def get_agent_run(run_id: str, request: Request):
         service_id=scope.service_id,
         tenant_id=scope.tenant_id,
         is_admin=scope.is_admin,
+        caller_scope=scope,
     )
     if lookup_err == "SESSION_EXPIRED":
         return JSONResponse(status_code=410, content={"error_code": "SESSION_EXPIRED", "detail": "Session has expired."})
@@ -133,7 +150,7 @@ async def get_agent_events(run_id: str, request: Request):
     scope = require_authenticated_caller(request)
     job_id = durable_job(run_id)
     if job_id:
-        job = services(request.app).get(job_id, scope.owner_id, scope.service_id)
+        job = services(request.app).get(job_id, scope.owner_id, scope.service_id, tenant_id=scope.tenant_id)
         if job is None: raise HTTPException(404, 'Run not found')
         async def snapshot():
             yield 'event: run.deferred\ndata: ' + json.dumps({'run_id':run_id,'job_id':job_id,'status':job['status']}) + '\n\n'
@@ -144,6 +161,7 @@ async def get_agent_events(run_id: str, request: Request):
         service_id=scope.service_id,
         tenant_id=scope.tenant_id,
         is_admin=scope.is_admin,
+        caller_scope=scope,
     )
     if lookup_err == "SESSION_EXPIRED":
         return JSONResponse(status_code=410, content={"error_code": "SESSION_EXPIRED", "detail": "Session has expired."})
@@ -151,19 +169,19 @@ async def get_agent_events(run_id: str, request: Request):
         raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
 
     last_event_id = request.headers.get("Last-Event-ID") or request.query_params.get("last_event_id")
-    if last_event_id:
-        try:
-            session.event_bus.validate_cursor(last_event_id)
-        except EventReplayExpiredError:
-            return JSONResponse(
-                status_code=410,
-                content={"error_code": "event_replay_expired", "detail": "Requested event cursor is no longer retained."},
-            )
-        except ValueError:
-            raise HTTPException(status_code=400, detail="invalid_event_cursor")
+    # HF-05: Atomically validate cursor + snapshot replay + register subscriber BEFORE StreamingResponse!
+    try:
+        stream_gen = runner.open_event_stream(run_id, last_event_id=last_event_id)
+    except EventReplayExpiredError:
+        return JSONResponse(
+            status_code=410,
+            content={"error_code": "event_replay_expired", "detail": "Requested event cursor is no longer retained."},
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_event_cursor")
 
     return StreamingResponse(
-        runner.stream_events(run_id, last_event_id=last_event_id),
+        stream_gen,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-store",
@@ -177,7 +195,7 @@ async def cancel_agent_run(run_id: str, request: Request):
     scope = require_authenticated_caller(request)
     job_id = durable_job(run_id)
     if job_id:
-        job = services(request.app).cancel(job_id, scope.owner_id, scope.service_id)
+        job = services(request.app).cancel(job_id, scope.owner_id, scope.service_id, tenant_id=scope.tenant_id)
         if job is None: raise HTTPException(404, 'Run not found')
         return {'run_id':run_id,'status':job['status']}
     session, lookup_err = runner.lookup_session(
@@ -186,6 +204,7 @@ async def cancel_agent_run(run_id: str, request: Request):
         service_id=scope.service_id,
         tenant_id=scope.tenant_id,
         is_admin=scope.is_admin,
+        caller_scope=scope,
     )
     if lookup_err == "SESSION_EXPIRED":
         return JSONResponse(status_code=410, content={"error_code": "SESSION_EXPIRED", "detail": "Session has expired."})
@@ -214,10 +233,13 @@ async def submit_run_feedback(run_id: str, body: RunFeedbackRequest, request: Re
 
     run_owner = (meta or {}).get("owner_id") or (session.state.owner_id if session else None)
     run_service = (meta or {}).get("service_id") or (session.state.service_id if session else None)
+    run_tenant = (meta or {}).get("tenant_id") or (session.state.tenant_id if session else None)
     actual_trajectory_id = (meta or {}).get("trajectory_id") or f"traj-{run_id}"
     known_decisions = (meta or {}).get("decision_ids") or set()
 
-    # 2. Ownership & scope verification (FIX-204: unowned legacy records are strictly admin-only!)
+    # 2. Ownership & tenant scope verification (FIX-204 / HF-02: never guess missing tenant!)
+    if not scope.can_access_tenant(run_tenant):
+        raise HTTPException(status_code=403, detail="forbidden")
     if not scope.is_admin:
         if not run_owner or not run_service:
             raise HTTPException(status_code=403, detail="unowned_run_admin_only")
@@ -261,6 +283,7 @@ async def submit_run_feedback(run_id: str, body: RunFeedbackRequest, request: Re
             ev,
             owner_id=scope.owner_id,
             service_id=scope.service_id,
+            tenant_id=scope.tenant_id,
         )
     except DuplicateFeedbackError:
         raise HTTPException(status_code=409, detail="duplicate_feedback")
@@ -280,7 +303,7 @@ async def submit_run_feedback(run_id: str, body: RunFeedbackRequest, request: Re
 
 @router.get("/runs/{run_id}/trajectory")
 async def get_run_trajectory(run_id: str, request: Request):
-    """R1-FIX-02: Owner-isolated trajectory reconstruction for offline evaluation / admin diagnostics."""
+    """R1-FIX-02 / HF-02: Tenant + Owner isolated trajectory reconstruction with explicit Admin tenant scope."""
     scope = require_authenticated_caller(request)
     if not re.fullmatch(r"run-[A-Za-z0-9_-]{4,64}", run_id):
         raise HTTPException(status_code=422, detail="invalid_run_id")
@@ -290,6 +313,8 @@ async def get_run_trajectory(run_id: str, request: Request):
     if meta is None:
         raise HTTPException(status_code=404, detail="trajectory_not_found")
 
+    if not scope.can_access_tenant(meta.get("tenant_id")):
+        raise HTTPException(status_code=403, detail="forbidden")
     if not scope.is_admin:
         if not meta.get("owner_id") or not meta.get("service_id"):
             raise HTTPException(status_code=403, detail="unowned_trajectory_admin_only")

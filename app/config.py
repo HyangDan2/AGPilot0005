@@ -93,14 +93,10 @@ def validate_boot_configuration() -> None:
     missing = []
     if settings.AGTOOLS_ENABLED and not is_agtools_token_valid(settings.AGTOOLS_TOKEN):
         missing.append("AGCORE_AGTOOLS_TOKEN")
-    has_service_auth = bool(
-        (settings.SERVICE_TOKENS or "").strip()
-        or (settings.ADMIN_SERVICE_TOKENS or "").strip()
-        or (settings.CREDENTIAL_SCOPES_JSON or "").strip()
-    )
+    has_service_auth = bool((settings.CREDENTIAL_SCOPES_JSON or "").strip())
     has_proxy_auth = bool((settings.TRUSTED_PROXY_SECRET or "").strip())
     if not has_service_auth and not has_proxy_auth:
-        missing.append("AGCORE_SERVICE_TOKENS_OR_AGCORE_CREDENTIAL_SCOPES_OR_AGCORE_TRUSTED_PROXY_SECRET")
+        missing.append("AGCORE_CREDENTIAL_SCOPES_OR_AGCORE_TRUSTED_PROXY_SECRET")
     if (settings.CREDENTIAL_SCOPES_JSON or "").strip():
         import json as _json
         try:

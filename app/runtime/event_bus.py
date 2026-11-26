@@ -178,14 +178,13 @@ class RunEventBus:
         if sub is not None:
             sub.closed = True
 
-    async def stream(
+    def open_stream(
         self,
         *,
         last_event_id: Optional[str] = None,
         heartbeat_seconds: float = 2.0,
     ) -> AsyncGenerator[str, None]:
-        """FIX-211: Subscribe BEFORE snapshotting replay so mid-replay terminal events are never lost."""
-        # Subscribe first so any event published during snapshot is captured in sub.queue
+        """HF-05: Atomically subscribes, validates cursor, and snapshots replay BEFORE returning generator."""
         sid = self.subscribe()
         sub = self._sub_map[sid]
         try:
@@ -199,68 +198,83 @@ class RunEventBus:
                     not replay_events or replay_events[-1].event_id != self.terminal_event.event_id
                 ):
                     replay_events.append(self.terminal_event)
+        except Exception:
+            self.unsubscribe(sid)
+            raise
 
-            last_sent_seq = cursor_seq
-            for evt in replay_events:
-                try:
-                    ev_s = self.parse_cursor(evt.event_id)
-                except ValueError:
-                    ev_s = last_sent_seq + 1
-                if ev_s <= last_sent_seq:
-                    continue
-                last_sent_seq = ev_s
-                yield evt.to_sse()
-                if self.terminal_event is not None and evt.event_id == self.terminal_event.event_id:
+        async def _gen() -> AsyncGenerator[str, None]:
+            try:
+                last_sent_seq = cursor_seq
+                for evt in replay_events:
+                    try:
+                        ev_s = self.parse_cursor(evt.event_id)
+                    except ValueError:
+                        ev_s = last_sent_seq + 1
+                    if ev_s <= last_sent_seq:
+                        continue
+                    last_sent_seq = ev_s
+                    yield evt.to_sse()
+                    if self.terminal_event is not None and evt.event_id == self.terminal_event.event_id:
+                        return
+
+                if self.terminal_event is not None:
+                    while not sub.queue.empty():
+                        q_evt = sub.queue.get_nowait()
+                        if q_evt is None:
+                            break
+                        try:
+                            q_seq = self.parse_cursor(q_evt.event_id)
+                        except ValueError:
+                            q_seq = last_sent_seq + 1
+                        if q_seq <= last_sent_seq:
+                            continue
+                        last_sent_seq = q_seq
+                        yield q_evt.to_sse()
+                        if q_evt.event_id == self.terminal_event.event_id:
+                            return
+                    if not sub.overflowed and self._terminal_seq is not None and self._terminal_seq > last_sent_seq:
+                        yield self.terminal_event.to_sse()
                     return
 
-            if self.terminal_event is not None:
-                # NG-06: Drain any intermediate queued events before terminal_event; never duplicate terminal_event
-                while not sub.queue.empty():
-                    q_evt = sub.queue.get_nowait()
-                    if q_evt is None:
-                        break
+                while True:
                     try:
-                        q_seq = self.parse_cursor(q_evt.event_id)
-                    except ValueError:
-                        q_seq = last_sent_seq + 1
-                    if q_seq <= last_sent_seq:
+                        evt = await asyncio.wait_for(sub.queue.get(), timeout=heartbeat_seconds)
+                    except TimeoutError:
+                        if self.terminal_event is not None:
+                            if not sub.overflowed and (self._terminal_seq is None or self._terminal_seq > last_sent_seq):
+                                yield self.terminal_event.to_sse()
+                            break
+                        yield ": heartbeat\n\n"
                         continue
-                    last_sent_seq = q_seq
-                    yield q_evt.to_sse()
-                    if q_evt.event_id == self.terminal_event.event_id:
-                        return
-                if not sub.overflowed and self._terminal_seq is not None and self._terminal_seq > last_sent_seq:
-                    yield self.terminal_event.to_sse()
-                return
 
-            while True:
-                try:
-                    evt = await asyncio.wait_for(sub.queue.get(), timeout=heartbeat_seconds)
-                except TimeoutError:
-                    if self.terminal_event is not None:
-                        if not sub.overflowed and (self._terminal_seq is None or self._terminal_seq > last_sent_seq):
+                    if evt is None:
+                        if not sub.overflowed and self.terminal_event is not None and (
+                            self._terminal_seq is None or self._terminal_seq > last_sent_seq
+                        ):
                             yield self.terminal_event.to_sse()
                         break
-                    yield ": heartbeat\n\n"
-                    continue
+                    try:
+                        ev_seq = self.parse_cursor(evt.event_id)
+                    except ValueError:
+                        ev_seq = last_sent_seq + 1
+                    if ev_seq <= last_sent_seq:
+                        continue
+                    last_sent_seq = ev_seq
+                    yield evt.to_sse()
+                    if self.terminal_event is not None and evt.event_id == self.terminal_event.event_id:
+                        break
+            finally:
+                self.unsubscribe(sid)
 
-                if evt is None:
-                    # CR-06: On slow-subscriber overflow, do NOT skip straight to terminal_event pretending continuity!
-                    if not sub.overflowed and self.terminal_event is not None and (
-                        self._terminal_seq is None or self._terminal_seq > last_sent_seq
-                    ):
-                        yield self.terminal_event.to_sse()
-                    break
-                try:
-                    ev_seq = self.parse_cursor(evt.event_id)
-                except ValueError:
-                    ev_seq = last_sent_seq + 1
-                if ev_seq <= last_sent_seq:
-                    continue
-                last_sent_seq = ev_seq
-                yield evt.to_sse()
-                if self.terminal_event is not None and evt.event_id == self.terminal_event.event_id:
-                    break
-        finally:
-            # Disconnect policy (FIX-211): only detach subscriber; NEVER cancel the Agent Run!
-            self.unsubscribe(sid)
+        return _gen()
+
+    async def stream(
+        self,
+        *,
+        last_event_id: Optional[str] = None,
+        heartbeat_seconds: float = 2.0,
+    ) -> AsyncGenerator[str, None]:
+        """Delegates to atomic open_stream() for backward compatibility."""
+        gen = self.open_stream(last_event_id=last_event_id, heartbeat_seconds=heartbeat_seconds)
+        async for frame in gen:
+            yield frame

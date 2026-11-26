@@ -86,6 +86,7 @@ class AsyncTrajectoryWriter:
         *,
         owner_id: Optional[str] = None,
         service_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> bool:
         """Non-blocking enqueue. Never raises or stalls Runtime on queue saturation."""
         with self._lock:
@@ -94,7 +95,7 @@ class AsyncTrajectoryWriter:
                 self._mark_dirty_locked(event.trajectory_id, "shutdown_rejected")
                 return False
         try:
-            self._queue.put_nowait(("event", event, owner_id, service_id))
+            self._queue.put_nowait(("event", event, owner_id, service_id, tenant_id))
             return True
         except queue.Full:
             with self._lock:
@@ -131,9 +132,9 @@ class AsyncTrajectoryWriter:
                     self._drain_dirty_set()
                     item.done.set()
                     continue
-                _, event, owner_id, service_id = item
+                _, event, owner_id, service_id, tenant_id = item
                 try:
-                    self.store.append(event, owner_id=owner_id, service_id=service_id)
+                    self.store.append(event, owner_id=owner_id, service_id=service_id, tenant_id=tenant_id)
                     with self._lock:
                         self.persisted_event_count += 1
                 except DuplicateEventError:
@@ -149,14 +150,25 @@ class AsyncTrajectoryWriter:
             finally:
                 self._queue.task_done()
 
-    def flush(self, timeout_seconds: float = 5.0) -> FlushResult:
-        """Waits until accepted events AND dirty markers have finished persisting."""
+    def flush(self, timeout_seconds: float = 5.0, *, _deadline: Optional[float] = None) -> FlushResult:
+        """HF-07: Waits under ONE single monotonic deadline covering both barrier enqueue and drain wait."""
+        deadline = _deadline if _deadline is not None else (time.monotonic() + max(0.0, float(timeout_seconds)))
         barrier = _FlushBarrier()
-        try:
-            self._queue.put(barrier, timeout=max(0.05, float(timeout_seconds)))
-            completed = barrier.done.wait(timeout=max(0.05, float(timeout_seconds)))
-        except queue.Full:
-            completed = False
+        completed = False
+        put_rem = max(0.0, deadline - time.monotonic())
+        if put_rem > 0.0:
+            try:
+                self._queue.put(barrier, timeout=put_rem)
+                wait_rem = max(0.0, deadline - time.monotonic())
+                completed = barrier.done.wait(timeout=wait_rem)
+            except queue.Full:
+                completed = False
+        else:
+            try:
+                self._queue.put_nowait(barrier)
+                completed = barrier.done.wait(timeout=0.0)
+            except queue.Full:
+                completed = False
         with self._lock:
             return FlushResult(
                 completed=completed,
@@ -167,18 +179,20 @@ class AsyncTrajectoryWriter:
             )
 
     def shutdown(self, timeout_seconds: float = 5.0) -> Dict[str, Any]:
-        """Single overall monotonic deadline covering queue drain, dirty markers, and thread join."""
-        deadline = time.monotonic() + max(0.05, float(timeout_seconds))
+        """HF-07: Single overall monotonic deadline covering flush, shutdown signal, and thread join."""
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         with self._lock:
             self._accepting = False
-        rem = max(0.05, deadline - time.monotonic())
-        flush_res = self.flush(timeout_seconds=rem)
-        rem_sig = max(0.05, deadline - time.monotonic())
+        flush_res = self.flush(timeout_seconds=timeout_seconds, _deadline=deadline)
+        rem_sig = max(0.0, deadline - time.monotonic())
         try:
-            self._queue.put(_ShutdownSignal(), timeout=min(0.5, rem_sig))
+            if rem_sig > 0.0:
+                self._queue.put(_ShutdownSignal(), timeout=min(0.5, rem_sig))
+            else:
+                self._queue.put_nowait(_ShutdownSignal())
         except queue.Full:
             pass
-        rem_join = max(0.05, deadline - time.monotonic())
+        rem_join = max(0.0, deadline - time.monotonic())
         self._thread.join(timeout=rem_join)
         unsaved = self._queue.qsize()
         with self._lock:

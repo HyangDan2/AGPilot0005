@@ -63,6 +63,7 @@ class AgentRunner:
     ):
         self.sessions: Dict[str, AgentRunSession] = {}
         self._tombstones: Dict[str, _SessionTombstone] = {}
+        self._reserved_run_ids: Set[str] = set()
         self.finished_session_ttl_seconds = float(finished_session_ttl_seconds)
         self.max_finished_sessions = max(1, int(max_finished_sessions))
         self.max_active_runs = max(1, int(max_active_runs))
@@ -138,12 +139,20 @@ class AgentRunner:
         service_id: str,
         tenant_id: Optional[str] = None,
         is_admin: bool = False,
+        caller_scope: Optional[Any] = None,
     ) -> Tuple[Optional[AgentRunSession], Optional[str]]:
-        """NG-07 & CR-02: Enforces Tenant + Owner + Service isolation on active sessions and tombstones."""
+        """NG-07 / CR-02 / HF-02: Enforces Tenant + Owner + Service isolation (including explicit Admin tenant scope)."""
         self.evict_expired_sessions()
         sess = self.sessions.get(run_id)
         if sess is not None:
-            if not is_admin:
+            if caller_scope is not None:
+                if not caller_scope.can_access_tenant(sess.state.tenant_id):
+                    return None, "SESSION_NOT_FOUND"
+                if not caller_scope.is_admin and (
+                    sess.state.owner_id != caller_scope.owner_id or sess.state.service_id != caller_scope.service_id
+                ):
+                    return None, "SESSION_NOT_FOUND"
+            elif not is_admin:
                 if sess.state.owner_id != owner_id or sess.state.service_id != service_id:
                     return None, "SESSION_NOT_FOUND"
                 if tenant_id is not None and sess.state.tenant_id != tenant_id:
@@ -151,7 +160,13 @@ class AgentRunner:
             return sess, None
         tb = self._tombstones.get(run_id)
         if tb is not None:
-            if is_admin or (
+            if caller_scope is not None:
+                if caller_scope.can_access_tenant(tb.tenant_id) and (
+                    caller_scope.is_admin
+                    or (tb.owner_id == caller_scope.owner_id and tb.service_id == caller_scope.service_id)
+                ):
+                    return None, "SESSION_EXPIRED"
+            elif is_admin or (
                 tb.owner_id == owner_id
                 and tb.service_id == service_id
                 and (tenant_id is None or tb.tenant_id == tenant_id)
@@ -181,65 +196,85 @@ class AgentRunner:
             tenant_id = "public_tenant" if service_id == "hd2ai-public" else settings.AGTOOLS_TENANT
             is_authenticated = True
 
-        # CR-07: Evict expired finished sessions on create & enforce Active Run Admission Control
-        self.evict_expired_sessions()
-        active_count = sum(1 for s in self.sessions.values() if s.state.status in ("queued", "running"))
-        if active_count >= self.max_active_runs:
-            raise RuntimeError("active_run_limit_exceeded")
+        # HF-06: Atomic synchronous admission check & placeholder reservation inside lock (ZERO await inside lock!)
+        async with self._lock:
+            self.evict_expired_sessions()
+            active_count = (
+                sum(1 for s in self.sessions.values() if s.state.status in ("queued", "running"))
+                + len(self._reserved_run_ids)
+            )
+            if active_count >= self.max_active_runs:
+                raise RuntimeError("active_run_limit_exceeded")
+            run_id = f"run-{uuid.uuid4().hex[:16]}"
+            self._reserved_run_ids.add(run_id)
 
-        run_id = f"run-{uuid.uuid4().hex[:16]}"
-        opts = req.options
-        refs = list(dict.fromkeys(req.context_refs))
-        if len(refs) > 10 or any(not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", ref) for ref in refs):
-            raise DocumentReferenceError("Invalid document references")
-        if service_id == "hd2ai-public" and len(refs) > 2:
-            raise DocumentReferenceError("Too many public document references")
-        owner_token = document_owner_id.set(owner_id)
-        titles = {}
+        committed = False
         try:
-            for ref in refs:
-                outline = await document_adapter.get_outline(ref)
-                if outline.get("error") or outline.get("status") != "completed":
-                    raise DocumentReferenceError(f"Document '{ref}' is unavailable or not yet parsed")
-                titles[ref] = outline.get('document_name') or '첨부 문서'
-        finally:
-            document_owner_id.reset(owner_token)
+            opts = req.options
+            refs = list(dict.fromkeys(req.context_refs))
+            if len(refs) > 10 or any(not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", ref) for ref in refs):
+                raise DocumentReferenceError("Invalid document references")
+            if service_id == "hd2ai-public" and len(refs) > 2:
+                raise DocumentReferenceError("Too many public document references")
 
-        active_tool_names = [t.name for t in registry.list_tools(service=service_id)]
-        messages = [GatewayMessage(role="system", content=ContextAdapter.build_system_message(active_tool_names))]
-        if refs:
-            messages.append(GatewayMessage(
-                role="system",
-                content=("사용자가 참조한 AGTools 문서 ID: " + ", ".join(refs) +
-                         ". 문서 내용을 추측하지 말고 document.search, document.read_section 등으로 확인한 후 답하세요. "
-                         "문서 도구에는 이 목록의 doc_id만 사용하세요."),
-            ))
-        for message in req.history:
-            if message.get("role") in ("user", "assistant"):
-                messages.append(GatewayMessage(role=message["role"], content=message.get("content", "")))
-        messages.append(GatewayMessage(role="user", content=req.message))
-        
-        initial_state = AgentState(
-            run_id=run_id,
-            session_id=req.session_id,
-            service_id=service_id,
-            owner_id=owner_id,
-            tenant_id=tenant_id,
-            authenticated=is_authenticated,
-            execution_scope=caller_scope,
-            context_refs=refs,
-            document_titles=titles,
-            messages=messages,
-            max_steps=min(opts.max_steps, get_runtime_config().max_agent_steps) if opts and opts.max_steps else get_runtime_config().max_agent_steps,
-            max_tool_calls=min(opts.max_tool_calls, get_runtime_config().max_tool_calls) if opts and opts.max_tool_calls else get_runtime_config().max_tool_calls,
-            stream=req.stream,
-            reasoning_effort=opts.reasoning_effort if opts else None,
-            status="queued",
-            custom_client=custom_client,
-        )
-        session = AgentRunSession(initial_state)
-        self.sessions[run_id] = session
-        return session
+            # HF-02: Propagate verified ExecutionScope into Document Reference pre-validation (OUTSIDE lock!)
+            from app.core.auth import current_execution_scope
+
+            owner_token = document_owner_id.set(owner_id)
+            scope_token = current_execution_scope.set(caller_scope) if caller_scope is not None else None
+            titles = {}
+            try:
+                for ref in refs:
+                    outline = await document_adapter.get_outline(ref)
+                    if outline.get("error") or outline.get("status") != "completed":
+                        raise DocumentReferenceError(f"Document '{ref}' is unavailable or not yet parsed")
+                    titles[ref] = outline.get('document_name') or '첨부 문서'
+            finally:
+                if scope_token is not None:
+                    current_execution_scope.reset(scope_token)
+                document_owner_id.reset(owner_token)
+
+            active_tool_names = [t.name for t in registry.list_tools(service=service_id)]
+            messages = [GatewayMessage(role="system", content=ContextAdapter.build_system_message(active_tool_names))]
+            if refs:
+                messages.append(GatewayMessage(
+                    role="system",
+                    content=("사용자가 참조한 AGTools 문서 ID: " + ", ".join(refs) +
+                             ". 문서 내용을 추측하지 말고 document.search, document.read_section 등으로 확인한 후 답하세요. "
+                             "문서 도구에는 이 목록의 doc_id만 사용하세요."),
+                ))
+            for message in req.history:
+                if message.get("role") in ("user", "assistant"):
+                    messages.append(GatewayMessage(role=message["role"], content=message.get("content", "")))
+            messages.append(GatewayMessage(role="user", content=req.message))
+
+            initial_state = AgentState(
+                run_id=run_id,
+                session_id=req.session_id,
+                service_id=service_id,
+                owner_id=owner_id,
+                tenant_id=tenant_id,
+                authenticated=is_authenticated,
+                execution_scope=caller_scope,
+                context_refs=refs,
+                document_titles=titles,
+                messages=messages,
+                max_steps=min(opts.max_steps, get_runtime_config().max_agent_steps) if opts and opts.max_steps else get_runtime_config().max_agent_steps,
+                max_tool_calls=min(opts.max_tool_calls, get_runtime_config().max_tool_calls) if opts and opts.max_tool_calls else get_runtime_config().max_tool_calls,
+                stream=req.stream,
+                reasoning_effort=opts.reasoning_effort if opts else None,
+                status="queued",
+                custom_client=custom_client,
+            )
+            session = AgentRunSession(initial_state)
+            async with self._lock:
+                self.sessions[run_id] = session
+                self._reserved_run_ids.discard(run_id)
+                committed = True
+            return session
+        finally:
+            if not committed:
+                self._reserved_run_ids.discard(run_id)
 
     async def start_run(self, session: AgentRunSession):
         """Spawns the LangGraph execution task in the background."""
@@ -504,6 +539,16 @@ class AgentRunner:
             if not session.event_bus.is_finalized:
                 session.event_bus.publish_terminal("run.failed", state.status, state.error or {"code": "terminated", "message": "실행이 종료되었습니다."})
             self.evict_expired_sessions()
+
+    def open_event_stream(self, run_id: str, *, last_event_id: Optional[str] = None) -> AsyncGenerator[str, None]:
+        """HF-05: Atomically validates cursor & registers subscriber synchronously before StreamingResponse."""
+        session = self.get_session(run_id)
+        if not session:
+            async def _empty() -> AsyncGenerator[str, None]:
+                if False:
+                    yield ""
+            return _empty()
+        return session.event_bus.open_stream(last_event_id=last_event_id)
 
     async def stream_events(self, run_id: str, *, last_event_id: Optional[str] = None) -> AsyncGenerator[str, None]:
         session = self.get_session(run_id)

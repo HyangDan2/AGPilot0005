@@ -143,7 +143,7 @@ async def test_ng_05_feedback_fail_closed_503_when_dedup_index_missing(tmp_path,
         constraints={}, chosen_action="CALL_MODEL", proposed_parameters={},
         behavior_policy_version="agpolicy-r1-v1", config_digest="1111",
         action_probability=None, validator_result={"accepted": True},
-        owner_id="alice", service_id="hd2ai-admin",
+        owner_id="alice", service_id="hd2ai-admin", tenant_id="default_tenant",
     )
     monkeypatch.setattr("app.api.agent.get_trajectory_logger", lambda: tlogger)
 

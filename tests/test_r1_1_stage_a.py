@@ -183,6 +183,7 @@ async def test_qa_r1_03_and_04_trajectory_isolation_and_feedback_integrity(tmp_p
         validator_result={"accepted": True},
         owner_id="alice",
         service_id="hd2ai-admin",
+        tenant_id="default_tenant",
     )
     monkeypatch.setattr("app.api.agent.get_trajectory_logger", lambda: tlogger)
 

@@ -214,11 +214,21 @@ class ToolPolicyStore:
             return False, f"disallowed_by_profile:{profile_id}"
         return True, None
 
+    def is_registered_service(self, service_id: Optional[str]) -> bool:
+        """HF-01: Returns True iff service_id is explicitly registered in service_bindings."""
+        if not service_id:
+            return False
+        policy = self.load()
+        return bool((policy.get("service_bindings") or {}).get(service_id))
+
     def allowed_tools_for_service(self, service_id: Optional[str]) -> List[str]:
         policy = self.load()
         if not service_id:
             return []
-        profile_id = policy.get("service_bindings", {}).get(service_id, "public-safe")
+        profile_id = policy.get("service_bindings", {}).get(service_id)
+        if not profile_id:
+            # HF-01: Never fall back to public-safe for unregistered services
+            return []
         profile = policy.get("profiles", {}).get(profile_id, {})
         return list(profile.get("tools") or [])
 

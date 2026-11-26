@@ -243,12 +243,6 @@ async def tool_node(
     # Execute batch of calls concurrently with dynamic per-tool token_budget
     from app.core.runtime_config import resolve_route_budget
     active_budget = resolve_route_budget(state.service_id)
-    per_tool_budget = context_manager.compute_tool_token_budget(
-        state.messages,
-        budget_tokens=active_budget.input_budget_tokens if active_budget else None,
-        route=state.service_id,
-        tool_count=max(1, len(calls)),
-    )
     route_input_budget = active_budget.input_budget_tokens if active_budget else context_manager.budget_tokens
     if approved_context_budget is not None:
         route_input_budget = min(route_input_budget, int(approved_context_budget))
@@ -256,6 +250,15 @@ async def tool_node(
         route_input_budget = min(route_input_budget, int(constraints.context_budget_tokens))
     est_used_tokens = max(0, sum(len((m.content or "")) for m in state.messages) // 4)
     remaining_input_tokens = max(0, route_input_budget - est_used_tokens)
+    # HF-03: Compute Document Tool's own tool_token_budget from the clamped route_input_budget!
+    per_tool_budget = context_manager.compute_tool_token_budget(
+        state.messages,
+        budget_tokens=route_input_budget,
+        route=state.service_id,
+        tool_count=max(1, len(calls)),
+    )
+    if per_tool_budget is not None:
+        per_tool_budget = min(int(per_tool_budget), remaining_input_tokens // max(1, len(calls)))
     from app.core.auth import current_execution_scope
 
     owner_token = document_owner_id.set(state.owner_id)

@@ -209,6 +209,7 @@ async def _validate_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[s
             validator_result=vres.to_dict(),
             owner_id=constraints_spec.owner_id,
             service_id=constraints_spec.service_id,
+            tenant_id=st.tenant_id,
         )
         emitted_count += 1
 
@@ -266,6 +267,7 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
             fallback_applied=fallback_applied,
             owner_id=constraints_spec.owner_id,
             service_id=constraints_spec.service_id,
+            tenant_id=st.tenant_id,
         )
         emitted_count += 1
 
@@ -562,6 +564,7 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
             terminal_status=terminal_status,
             owner_id=constraints_spec.owner_id,
             service_id=constraints_spec.service_id,
+            tenant_id=st.tenant_id,
         )
 
     return {
