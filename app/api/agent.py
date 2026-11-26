@@ -212,24 +212,33 @@ async def submit_run_feedback(run_id: str, body: RunFeedbackRequest, request: Re
             raise HTTPException(status_code=422, detail="reward_signal_required")
         normalized_reward = float(body.reward_signal)
 
-    # 5. Duplicate submission prevention
-    if tlogger.store.has_duplicate_feedback(
-        run_id=run_id,
-        owner_id=scope.owner_id,
-        decision_id=body.decision_id,
-        feedback_type=body.feedback_type,
-    ):
-        raise HTTPException(status_code=409, detail="duplicate_feedback")
+    # 5. FIX-208 A/B: Direct atomic DB commit in worker thread (bypasses async queue, enforces DB UNIQUE index)
+    import asyncio
+    from app.tracing.events import FeedbackEvent, TRAJECTORY_SCHEMA_VERSION
+    from app.tracing.store import DuplicateFeedbackError
 
-    ev = tlogger.log_feedback(
+    ev = FeedbackEvent(
+        event_id=tlogger.new_id("fb-evt"),
+        schema_version=TRAJECTORY_SCHEMA_VERSION,
         trajectory_id=actual_trajectory_id,
         run_id=run_id,
         decision_id=body.decision_id,
         feedback_type=body.feedback_type,
         reward_signal=normalized_reward,
-        owner_id=scope.owner_id,
-        service_id=scope.service_id,
+        timestamp=tlogger.clock.now_epoch(),
     )
+    try:
+        await asyncio.to_thread(
+            tlogger.store.append_feedback_atomic,
+            ev,
+            owner_id=scope.owner_id,
+            service_id=scope.service_id,
+        )
+    except DuplicateFeedbackError:
+        raise HTTPException(status_code=409, detail="duplicate_feedback")
+    except Exception:
+        raise HTTPException(status_code=503, detail="feedback_persistence_unavailable")
+
     return {
         "event_id": ev.event_id,
         "trajectory_id": ev.trajectory_id,

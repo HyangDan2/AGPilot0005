@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -119,15 +120,19 @@ class AsyncTrajectoryWriter:
             )
 
     def shutdown(self, timeout_seconds: float = 5.0) -> Dict[str, Any]:
-        """Stops accepting new events and flushes remaining items within timeout."""
+        """FIX-208 E: Stops accepting new events and enforces a single overall monotonic deadline."""
+        deadline = time.monotonic() + max(0.05, float(timeout_seconds))
         with self._lock:
             self._accepting = False
-        flush_res = self.flush(timeout_seconds=timeout_seconds)
+        rem = max(0.05, deadline - time.monotonic())
+        flush_res = self.flush(timeout_seconds=rem)
+        rem_sig = max(0.05, deadline - time.monotonic())
         try:
-            self._queue.put(_ShutdownSignal(), timeout=0.5)
+            self._queue.put(_ShutdownSignal(), timeout=min(0.5, rem_sig))
         except queue.Full:
             pass
-        self._thread.join(timeout=max(0.1, float(timeout_seconds)))
+        rem_join = max(0.05, deadline - time.monotonic())
+        self._thread.join(timeout=rem_join)
         unsaved = self._queue.qsize()
         clean = flush_res.completed and not self._thread.is_alive() and unsaved == 0
         if not clean:

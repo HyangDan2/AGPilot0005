@@ -43,6 +43,10 @@ def _validate_args_against_schema(args: Any, schema: Optional[Dict[str, Any]]) -
         if req_key not in args or args[req_key] is None:
             return f"Missing required argument: '{req_key}'"
     props = schema.get("properties") or {}
+    if schema.get("additionalProperties") is False:
+        extra_keys = [k for k in args.keys() if k not in props]
+        if extra_keys:
+            return f"Unexpected argument(s): {', '.join(sorted(extra_keys))}"
     for k, v in args.items():
         if k not in props or v is None:
             continue
@@ -89,16 +93,17 @@ def _apply_dynamic_tool_budget(
         remaining = int(input_budget_tokens)
 
     effective_batch = max(1, int(batch_size))
-    if remaining == 0:
-        per_tool_tokens = 256
-    else:
-        # Ensure multi-tool batch sum stays within remaining budget and <= 40% of route budget per tool
-        per_tool_tokens = min(
-            max(256, remaining // max(1, effective_batch)),
-            max(256, int(input_budget_tokens * 0.4)),
-        )
-    dynamic_max_chars = max(500, min(80000, int(per_tool_tokens * 2.0)))
-    dynamic_max_bytes = max(1024, per_tool_tokens * 4)
+    if remaining <= 0:
+        # FIX-206: Zero remaining budget -> allocate 0 new tool result bytes (no fixed floor!)
+        return dict(args), 0
+
+    # Strict batch bound: sum of per-tool allocations NEVER exceeds remaining budget
+    per_tool_tokens = min(
+        remaining // effective_batch,
+        max(1, int(input_budget_tokens * 0.4)),
+    )
+    dynamic_max_chars = max(0, min(80000, int(per_tool_tokens * 2.0)))
+    dynamic_max_bytes = per_tool_tokens * 4
 
     params = {}
     try:
@@ -261,10 +266,19 @@ class ToolDispatcher:
                 return DispatchResult(call_id, func_name, json.dumps(result, ensure_ascii=False), trace, is_error=True)
             res_str = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
             
-            # Check result size (dynamic per-tool budget ceiling) — preserve valid JSON structure (R1-FIX-12 B.6)
+            # Check result size (dynamic per-tool budget ceiling) — preserve valid JSON structure (FIX-206)
             raw_bytes = len(res_str.encode("utf-8"))
-            if raw_bytes > dynamic_max_bytes:
-                preview_limit = max(256, dynamic_max_bytes - 180)
+            if dynamic_max_bytes <= 0:
+                res_str = json.dumps(
+                    {
+                        "truncated": True,
+                        "budget_exhausted": True,
+                        "original_bytes": raw_bytes,
+                    },
+                    ensure_ascii=False,
+                )
+            elif raw_bytes > dynamic_max_bytes:
+                preview_limit = max(64, dynamic_max_bytes - 180)
                 res_str = json.dumps(
                     {
                         "truncated": True,

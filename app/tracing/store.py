@@ -29,6 +29,27 @@ class DuplicateEventError(ValueError):
     """Raised when attempting to append an event with an already-recorded event_id."""
 
 
+class DuplicateFeedbackError(ValueError):
+    """FIX-208: Raised atomically by SQLite UNIQUE index on duplicate/conflicting feedback."""
+
+
+def _feedback_category(feedback_type: str) -> str:
+    if feedback_type in ("thumbs_up", "thumbs_down"):
+        return "user_rating"
+    return feedback_type
+
+
+def make_feedback_dedup_key(
+    *,
+    run_id: str,
+    owner_id: Optional[str],
+    decision_id: Optional[str],
+    feedback_type: str,
+) -> str:
+    norm_dec = decision_id if decision_id else "__RUN__"
+    return f"{run_id}|{owner_id or ''}|{norm_dec}|{_feedback_category(feedback_type)}"
+
+
 class TrajectoryEventStore:
     """Append-only SQLite WAL event store with engine-level immutability triggers.
 
@@ -48,7 +69,9 @@ class TrajectoryEventStore:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=10.0, isolation_level=None)
+        busy_ms = max(100, int(settings.SQLITE_BUSY_TIMEOUT_MS))
+        conn = sqlite3.connect(str(self.db_path), timeout=busy_ms / 1000.0, isolation_level=None)
+        conn.execute(f"PRAGMA busy_timeout={busy_ms};")
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=FULL;")
         return conn
@@ -89,12 +112,117 @@ class TrajectoryEventStore:
                     END;
                     """
                 )
-                # Backward-compatible schema migration for existing DBs missing owner_id/service_id
+                # Backward-compatible idempotent schema migration (FIX-208 D)
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(trajectory_events)").fetchall()}
                 if "owner_id" not in cols:
                     conn.execute("ALTER TABLE trajectory_events ADD COLUMN owner_id TEXT;")
                 if "service_id" not in cols:
                     conn.execute("ALTER TABLE trajectory_events ADD COLUMN service_id TEXT;")
+                if "feedback_dedup_key" not in cols:
+                    conn.execute("ALTER TABLE trajectory_events ADD COLUMN feedback_dedup_key TEXT;")
+                try:
+                    conn.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS uq_trajectory_feedback_dedup
+                            ON trajectory_events(feedback_dedup_key)
+                            WHERE event_type = 'FeedbackEvent' AND feedback_dedup_key IS NOT NULL;
+                        """
+                    )
+                except sqlite3.IntegrityError:
+                    logger.error(
+                        "Cannot create unique feedback index due to pre-existing duplicates; "
+                        "existing rows preserved for manual governance review."
+                    )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS incomplete_trajectories (
+                        trajectory_id TEXT PRIMARY KEY,
+                        reason TEXT NOT NULL,
+                        recorded_at REAL NOT NULL
+                    );
+                    """
+                )
+            finally:
+                conn.close()
+
+    def mark_incomplete(self, trajectory_id: str, reason: str, recorded_at: Optional[float] = None) -> None:
+        """FIX-208 E: Persistently records incomplete trajectory status across restarts."""
+        ts = float(recorded_at if recorded_at is not None else system_clock.now_epoch())
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO incomplete_trajectories (trajectory_id, reason, recorded_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (trajectory_id, reason, ts),
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
+            finally:
+                conn.close()
+
+    def append_feedback_atomic(
+        self,
+        event: FeedbackEvent,
+        *,
+        owner_id: Optional[str] = None,
+        service_id: Optional[str] = None,
+    ) -> str:
+        """FIX-208 A/B: Direct atomic DB commit with UNIQUE index enforcement (bypasses async queue)."""
+        payload_json = json.dumps(event.model_dump(), ensure_ascii=False, sort_keys=True)
+        dedup_key = make_feedback_dedup_key(
+            run_id=event.run_id,
+            owner_id=owner_id,
+            decision_id=event.decision_id,
+            feedback_type=event.feedback_type,
+        )
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                conn.execute(
+                    """
+                    INSERT INTO trajectory_events (
+                        event_id, event_type, schema_version,
+                        trajectory_id, run_id, decision_id, action_id,
+                        owner_id, service_id, feedback_dedup_key, timestamp, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.event_id,
+                        event.event_type,
+                        event.schema_version,
+                        event.trajectory_id,
+                        event.run_id,
+                        event.decision_id,
+                        owner_id,
+                        service_id,
+                        dedup_key,
+                        float(event.timestamp),
+                        payload_json,
+                    ),
+                )
+                conn.execute("COMMIT;")
+                return event.event_id
+            except sqlite3.IntegrityError as exc:
+                conn.execute("ROLLBACK;")
+                if "feedback_dedup_key" in str(exc) or "uq_trajectory_feedback_dedup" in str(exc):
+                    raise DuplicateFeedbackError(f"Duplicate feedback for key: {dedup_key}") from exc
+                raise DuplicateEventError(f"Duplicate trajectory event_id: {event.event_id}") from exc
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                self.append_failures += 1
+                raise
             finally:
                 conn.close()
 

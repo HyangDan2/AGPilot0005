@@ -90,16 +90,68 @@ async def model_node(
     call_tools = tools if allow_tools else None
     call_choice = ("required" if first_document_step else "auto") if allow_tools else "none"
     effective_effort = reasoning_effort_override if reasoning_effort_override is not None else state.reasoning_effort
-    try:
-        content, tool_calls, finish_reason = await client.execute(
-            messages=pruned_msgs,
-            tools=call_tools,
-            tool_choice=call_choice,
+
+    import inspect
+    from app.schemas.gateway import ModelReply
+
+    def _supports_return_reply(c) -> bool:
+        try:
+            sig = inspect.signature(c.execute)
+            return "return_reply" in sig.parameters
+        except Exception:
+            return False
+
+    use_reply = _supports_return_reply(client)
+    accumulated_usage: Dict[str, int] = {}
+    streamed_any_delta = False
+
+    async def _guarded_on_delta(chunk: str):
+        nonlocal streamed_any_delta
+        streamed_any_delta = True
+        if on_delta is not None:
+            await on_delta(chunk)
+
+    def _merge_usage(raw_u: Any) -> None:
+        if raw_u is None:
+            return
+        if hasattr(raw_u, "model_dump"):
+            raw_u = raw_u.model_dump()
+        if not isinstance(raw_u, dict):
+            return
+        in_tok = raw_u.get("input_tokens") if raw_u.get("input_tokens") is not None else raw_u.get("prompt_tokens")
+        out_tok = raw_u.get("output_tokens") if raw_u.get("output_tokens") is not None else raw_u.get("completion_tokens")
+        tot_tok = raw_u.get("total_tokens")
+        for key, val in (("input_tokens", in_tok), ("output_tokens", out_tok), ("total_tokens", tot_tok)):
+            if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+                accumulated_usage[key] = accumulated_usage.get(key, 0) + val
+
+    async def _invoke_client(msgs, *, tools_arg, choice_arg, delta_cb):
+        kw = dict(label_options)
+        if use_reply:
+            kw["return_reply"] = True
+        raw = await client.execute(
+            messages=msgs,
+            tools=tools_arg,
+            tool_choice=choice_arg,
             stream=state.stream,
             reasoning_effort=effective_effort,
             on_reasoning_delta=on_reasoning_delta,
-            on_content_delta=on_delta,
-            **label_options,
+            on_content_delta=delta_cb,
+            **kw,
+        )
+        if isinstance(raw, ModelReply):
+            _merge_usage(raw.usage)
+            if raw.model_label:
+                capture_label(raw.model_label)
+            return raw.content, raw.tool_calls, raw.finish_reason
+        return raw
+
+    try:
+        content, tool_calls, finish_reason = await _invoke_client(
+            pruned_msgs,
+            tools_arg=call_tools,
+            choice_arg=call_choice,
+            delta_cb=_guarded_on_delta if on_delta is not None else None,
         )
     except Exception as exc:
         if not is_context_overflow_error(exc):
@@ -112,27 +164,22 @@ async def model_node(
             force_ratio=0.72,
         )
         model_label = None
-        content, tool_calls, finish_reason = await client.execute(
-            messages=pruned_msgs,
-            tools=call_tools,
-            tool_choice=call_choice,
-            stream=state.stream,
-            reasoning_effort=state.reasoning_effort,
-            on_reasoning_delta=on_reasoning_delta,
-            on_content_delta=on_delta,
-            **label_options,
+        # FIX-207: Preserve effective_effort on retry and prevent duplicate streaming deltas
+        retry_delta_cb = None if streamed_any_delta else (_guarded_on_delta if on_delta is not None else None)
+        content, tool_calls, finish_reason = await _invoke_client(
+            pruned_msgs,
+            tools_arg=call_tools,
+            choice_arg=call_choice,
+            delta_cb=retry_delta_cb,
         )
     if public_grounding and not content and not tool_calls:
         model_label = None
-        content, tool_calls, finish_reason = await client.execute(
-            messages=pruned_msgs,
-            tools=None,
-            tool_choice="none",
-            stream=state.stream,
-            reasoning_effort=state.reasoning_effort,
-            on_reasoning_delta=on_reasoning_delta,
-            on_content_delta=on_delta,
-            **label_options,
+        retry_delta_cb = None if streamed_any_delta else (_guarded_on_delta if on_delta is not None else None)
+        content, tool_calls, finish_reason = await _invoke_client(
+            pruned_msgs,
+            tools_arg=None,
+            choice_arg="none",
+            delta_cb=retry_delta_cb,
         )
     if public_grounding and not content and not tool_calls:
         raise RuntimeError("Public document answer was empty")
@@ -149,6 +196,7 @@ async def model_node(
         "messages": new_messages,
         "step_count": state.step_count,
         "pending_tool_calls": tool_calls or [],
+        "usage": accumulated_usage,
     }
     
     if tool_calls:

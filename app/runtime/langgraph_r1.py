@@ -312,8 +312,10 @@ class LangGraphR1Runtime:
                             disable_tools=is_safe_respond,
                         )
 
-                    # R1-FIX-09: Collect actual provider token usage if reported (never fabricate)
-                    raw_usage = getattr(st.custom_client, "last_usage", None) if st.custom_client is not None else None
+                    # FIX-207: Prefer per-invocation ModelReply usage from model_node; fall back to custom_client.last_usage only if unreported
+                    raw_usage = res.get("usage") or (
+                        getattr(st.custom_client, "last_usage", None) if st.custom_client is not None else None
+                    )
                     if isinstance(raw_usage, dict):
                         for k in ("input_tokens", "output_tokens", "total_tokens"):
                             v = raw_usage.get(k)
@@ -414,10 +416,14 @@ class LangGraphR1Runtime:
 
                     recent_traces = st.traces[-len(validated_tc_objs):]
                     any_tool_err = False
+                    any_tool_unknown = False
                     for tr in recent_traces:
-                        is_err = tr.status != "success"
+                        # FIX-205: ToolExecutionTrace.status SSoT is "completed" | "failed" | "running"
+                        is_err = tr.status == "failed"
                         if is_err:
                             any_tool_err = True
+                        elif tr.status != "completed":
+                            any_tool_unknown = True
                         await _emit(
                             "tool.completed",
                             {
@@ -425,11 +431,16 @@ class LangGraphR1Runtime:
                                 "tool_name": tr.tool_name,
                                 "tool_call_id": tr.tool_call_id,
                                 "is_error": is_err,
+                                "status": tr.status,
                                 "duration_ms": tr.duration_ms,
                             },
                         )
                     if any_tool_err:
                         outcome = "failed"
+                    elif any_tool_unknown:
+                        outcome = "UNKNOWN"
+                    else:
+                        outcome = "success"
                     for msg in reversed(st.messages):
                         if msg.role == "tool":
                             last_tool_meta = PostCallAdapter.inspect(

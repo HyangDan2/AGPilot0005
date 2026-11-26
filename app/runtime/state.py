@@ -32,6 +32,7 @@ class AgentState(BaseModel):
     
     # Traces & Events
     traces: List[ToolExecutionTrace] = Field(default_factory=list)
+    usage: Dict[str, int] = Field(default_factory=dict)
     
     # Stream flag
     stream: bool = False
