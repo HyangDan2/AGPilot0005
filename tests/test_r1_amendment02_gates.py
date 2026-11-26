@@ -428,16 +428,15 @@ def test_reg_pol_20_telemetry_redacts_secrets_and_raw_user_text(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Feature Flag verification (default legacy, opt-in langgraph_r1)
+# R1.3 Single Runtime verification (default langgraph_r1, legacy retired)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_feature_flag_default_legacy_and_r1_opt_in(tmp_path, monkeypatch):
-    assert settings.RUNTIME_ENGINE == "legacy"
+    assert settings.RUNTIME_ENGINE == "langgraph_r1"
 
     db_file = tmp_path / "flag_r1.db"
     store = TrajectoryEventStore(db_file)
     tlogger = TrajectoryLogger(store, clock=MockClock())
-    monkeypatch.setattr(settings, "RUNTIME_ENGINE", "langgraph_r1")
     monkeypatch.setattr("app.tracing.store.get_trajectory_logger", lambda: tlogger)
 
     req = AgentRunRequest(message="오늘 날짜 알려줘", stream=True)

@@ -101,6 +101,7 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "hd2ai-admin": "admin-full",
         "hd2ai-beta": "admin-full",
         "hd2ai-public": "public-safe",
+        "demo-console": "public-safe",
     },
 }
 

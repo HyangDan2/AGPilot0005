@@ -1,7 +1,15 @@
 """AGCore Configuration and Environment Settings."""
+import logging
 import os
 from pathlib import Path
+from typing import Optional, Set
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+_DEPRECATED_ENV_WARNED: Set[str] = set()
+_SUPPORTED_RUNTIME_ENGINES = {"", "langgraph_r1", "langgraph"}
+# AM-06: Legacy-only tuning env vars (currently none exist in AGCore; hook retained for one-time deprecation warning)
+_DEPRECATED_LEGACY_ENV_VARS: tuple[str, ...] = ()
 
 def gateway_token() -> str:
     token = os.environ.get("AGCORE_GATEWAY_TOKEN", "")
@@ -71,8 +79,8 @@ class Settings(BaseModel):
     TASK_MAX_REPLANS: int = int(os.environ.get("AGCORE_TASK_MAX_REPLANS", "2"))
     TASK_MAX_ANSWER_REPAIRS: int = int(os.environ.get("AGCORE_TASK_MAX_ANSWER_REPAIRS", "2"))
 
-    # Phase R1 Amendment 02: Feature-flagged LangGraph R1 runtime & Append-only Trajectory store
-    RUNTIME_ENGINE: str = os.environ.get("AGCORE_RUNTIME_ENGINE", "legacy")  # "legacy" | "langgraph_r1"
+    # Phase R1.3 (AM-06): Single LangGraph R1 runtime & Append-only Trajectory store
+    RUNTIME_ENGINE: str = os.environ.get("AGCORE_RUNTIME_ENGINE", "langgraph_r1")  # "langgraph_r1" (legacy retired)
     TRAJECTORY_DB_PATH: str = os.environ.get(
         "AGCORE_TRAJECTORY_DB_PATH",
         "/var/lib/hd2lab-agcore/trajectory.db"
@@ -84,8 +92,34 @@ class Settings(BaseModel):
 settings = Settings()
 
 
+def validate_runtime_engine_config(engine: Optional[str] = None) -> str:
+    """AM-06: Boot fail-fast on retired 'legacy' engine; accept unset, 'langgraph_r1', or 'langgraph'."""
+    raw = settings.RUNTIME_ENGINE if engine is None else engine
+    normalized = (raw or "").strip().lower()
+    if normalized == "legacy":
+        raise RuntimeError(
+            "Boot fail-fast (AM-06): AGCORE_RUNTIME_ENGINE=legacy has been retired in R1.3. "
+            "Unset AGCORE_RUNTIME_ENGINE or set it to 'langgraph_r1'."
+        )
+    if normalized not in _SUPPORTED_RUNTIME_ENGINES:
+        raise RuntimeError(
+            f"Boot fail-fast (AM-06): unsupported AGCORE_RUNTIME_ENGINE='{raw}'. "
+            "Allowed values: unset, 'langgraph_r1', 'langgraph'."
+        )
+    for dep_var in _DEPRECATED_LEGACY_ENV_VARS:
+        if os.environ.get(dep_var) and dep_var not in _DEPRECATED_ENV_WARNED:
+            _DEPRECATED_ENV_WARNED.add(dep_var)
+            logger.warning(
+                "Deprecated legacy runtime environment variable '%s' is ignored in R1.3.",
+                dep_var,
+            )
+    return "langgraph_r1"
+
+
 def validate_boot_configuration() -> None:
-    """FIX-203: Fail-fast production boot validation. Logs only missing env var names, never secrets."""
+    """FIX-203 & AM-06: Fail-fast boot validation. Logs only missing env var names, never secrets."""
+    # AM-06: Enforce retired legacy runtime fail-fast across ALL environments
+    validate_runtime_engine_config()
     if settings.ENVIRONMENT.lower() != "production":
         return
     from app.core.auth import is_agtools_token_valid

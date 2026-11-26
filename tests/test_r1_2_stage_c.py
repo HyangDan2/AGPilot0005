@@ -81,16 +81,16 @@ async def test_fix_210_full_agent_runner_cross_runtime_replay(tmp_path, monkeypa
         ),
         RecordedGatewayStep(content="풀 런타임 리플레이 완료", tool_calls=None, finish_reason="stop", advance_seconds=0.5),
     ]
-    leg = await run_agent_runner_replay(
-        engine="legacy", message="full replay", recorded_steps=steps, db_path=str(tmp_path / "leg.db"), monkeypatch=monkeypatch
+    run_a = await run_agent_runner_replay(
+        engine="langgraph_r1", message="full replay", recorded_steps=steps, db_path=str(tmp_path / "r1_a.db"), monkeypatch=monkeypatch
     )
-    r1 = await run_agent_runner_replay(
-        engine="langgraph_r1", message="full replay", recorded_steps=steps, db_path=str(tmp_path / "r1.db"), monkeypatch=monkeypatch
+    run_b = await run_agent_runner_replay(
+        engine="langgraph_r1", message="full replay", recorded_steps=steps, db_path=str(tmp_path / "r1_b.db"), monkeypatch=monkeypatch
     )
-    assert leg["status"] == "completed" and r1["status"] == "completed"
-    assert leg["final_answer"] == r1["final_answer"]
-    assert leg["tool_selection"] == r1["tool_selection"] == ["system.get_datetime"]
-    assert leg["unused_fixtures"] == 0 and r1["unused_fixtures"] == 0
+    assert run_a["status"] == "completed" and run_b["status"] == "completed"
+    assert run_a["final_answer"] == run_b["final_answer"]
+    assert run_a["tool_selection"] == run_b["tool_selection"] == ["system.get_datetime"]
+    assert run_a["unused_fixtures"] == 0 and run_b["unused_fixtures"] == 0
 
 
 # ---------------------------------------------------------------------------

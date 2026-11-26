@@ -1,7 +1,7 @@
-"""WO-05-B1 (AM-05): Legacy vs LangGraph (langgraph_r1) 14-Scenario Runtime Parity Suite.
+"""WO-05-B1 / WO-05-B3 (AM-05 & AM-06): 14-Scenario Single-Runtime Contract & Legacy Retirement Suite.
 
-Verifies functional equivalence across API contracts, state transitions, scope/permission
-enforcement, tool execution, SSE ordering & replay, trajectory/feedback, and admission control.
+Verifies all 14 core runtime scenarios on the single LangGraph R1 runtime after Legacy retirement,
+plus AM-06 boot fail-fast and single-runtime architecture invariants.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from app.tools.registry import registry
 from app.tracing.store import TrajectoryEventStore, TrajectoryLogger
 
 
-ENGINES = ["legacy", "langgraph_r1"]
+ENGINES = ["langgraph_r1"]
 
 
 # ---------------------------------------------------------------------------
@@ -994,3 +994,67 @@ async def test_parity_14_concurrent_run_admission(engine, monkeypatch, tmp_path)
         assert r4.status_code == 202
         fin4 = await _wait_for_terminal(client, r4.json()["run_id"], headers)
         assert fin4["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# WO-05-B3 / AM-06: Legacy Retirement, Boot Fail-Fast & Single-Runtime Invariants
+# ---------------------------------------------------------------------------
+def test_b3_am06_legacy_env_boot_fail_fast(monkeypatch):
+    """AM-06: Explicit AGCORE_RUNTIME_ENGINE=legacy MUST fail fast in ALL environments."""
+    from app.config import validate_boot_configuration, validate_runtime_engine_config
+
+    for env_name in ("development", "production"):
+        monkeypatch.setattr(settings, "ENVIRONMENT", env_name)
+        monkeypatch.setattr(settings, "RUNTIME_ENGINE", "legacy")
+        with pytest.raises(RuntimeError, match="AGCORE_RUNTIME_ENGINE=legacy"):
+            validate_boot_configuration()
+
+    for bad_val in ("LEGACY", " legacy ", "unknown_engine"):
+        with pytest.raises(RuntimeError, match="Boot fail-fast"):
+            validate_runtime_engine_config(bad_val)
+
+
+def test_b3_am06_supported_runtime_engine_values(monkeypatch):
+    """AM-06: Unset, 'langgraph_r1', and 'langgraph' all resolve cleanly to 'langgraph_r1'."""
+    from app.config import validate_boot_configuration, validate_runtime_engine_config
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "development")
+    for allowed in ("", "langgraph_r1", "langgraph", "LANGGRAPH_R1", " LangGraph "):
+        assert validate_runtime_engine_config(allowed) == "langgraph_r1"
+        monkeypatch.setattr(settings, "RUNTIME_ENGINE", allowed)
+        validate_boot_configuration()
+
+
+@pytest.mark.asyncio
+async def test_b3_am06_lifespan_blocks_legacy_boot(monkeypatch):
+    """AM-06: FastAPI lifespan startup fails fast when RUNTIME_ENGINE='legacy'."""
+    from app.main import lifespan
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "development")
+    monkeypatch.setattr(settings, "RUNTIME_ENGINE", "legacy")
+    with pytest.raises(RuntimeError, match="AGCORE_RUNTIME_ENGINE=legacy"):
+        async with lifespan(app):
+            pass
+
+
+def test_b3_single_runtime_architecture_and_durable_preserved():
+    """Verify legacy graph builder & dual routing are removed while shared/durable paths remain intact."""
+    import inspect
+    from app.runtime import graph as graph_mod
+    from app.runtime.runner import AgentRunner
+    from app.runtime.tasks.orchestrator import TaskOrchestrator
+
+    # Removed legacy graph builder symbols
+    assert not hasattr(graph_mod, "build_agent_graph")
+    assert not hasattr(graph_mod, "agent_executor")
+    assert not hasattr(graph_mod, "should_continue")
+
+    # Preserved shared execution nodes & Durable TaskOrchestrator
+    assert callable(graph_mod.model_node)
+    assert callable(graph_mod.tool_node)
+    assert TaskOrchestrator is not None
+
+    # AgentRunner._run_loop has no legacy dual branch
+    src = inspect.getsource(AgentRunner._run_loop)
+    assert "settings.RUNTIME_ENGINE" not in src
+    assert "LangGraphR1Runtime" in src

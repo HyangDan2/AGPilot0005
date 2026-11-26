@@ -382,30 +382,41 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                         escalated = True
                 if not escalated:
                     answer = st.final_answer or "".join(answer_parts)
-                    if st.citations and answer:
-                        from app.runtime.tasks.presentation import legacy_citations
-
-                        answer, _ = legacy_citations(
-                            {
-                                "answer": answer,
-                                "document_titles": st.document_titles,
-                                "entries": [
-                                    {"doc_id": c["doc_id"], "chunk_id": c["chunk_id"], "source": {"page": c.get("page")}}
-                                    for c in st.citations
-                                ],
+                    if answer and re.search(r"<\s*(?:tool_call|function\b)", answer, re.I):
+                        if run_fence.try_finalize("failed"):
+                            st.status = "failed"
+                            st.final_answer = None
+                            st.error = {
+                                "code": "model_tool_syntax_in_answer",
+                                "message": "도구 예산 또는 답변 검증으로 작업을 완료하지 못했습니다.",
                             }
-                        )
-                        st.final_answer = answer
-                    if answer:
-                        if not has_streamed_delta:
-                            await _emit_with_fence(ctx, "answer.delta", {"delta": answer, "step": st.step_count})
-                        else:
-                            citation_tail = answer[len("".join(answer_parts)):]
-                            if citation_tail:
-                                await _emit_with_fence(ctx, "answer.delta", {"delta": citation_tail, "step": st.step_count})
+                            terminal_status = "failed"
+                            outcome = "failed"
+                    else:
+                        if st.citations and answer:
+                            from app.runtime.tasks.presentation import legacy_citations
+
+                            answer, _ = legacy_citations(
+                                {
+                                    "answer": answer,
+                                    "document_titles": st.document_titles,
+                                    "entries": [
+                                        {"doc_id": c["doc_id"], "chunk_id": c["chunk_id"], "source": {"page": c.get("page")}}
+                                        for c in st.citations
+                                    ],
+                                }
+                            )
+                            st.final_answer = answer
+                        if answer:
+                            if not has_streamed_delta:
+                                await _emit_with_fence(ctx, "answer.delta", {"delta": answer, "step": st.step_count})
+                            else:
+                                citation_tail = answer[len("".join(answer_parts)):]
+                                if citation_tail:
+                                    await _emit_with_fence(ctx, "answer.delta", {"delta": citation_tail, "step": st.step_count})
             await _emit_with_fence(ctx, "step.completed", {"step": st.step_count})
 
-            if action == ActionType.SAFE_RESPOND.value:
+            if action == ActionType.SAFE_RESPOND.value and terminal_status is None:
                 if (st.final_answer or "").strip():
                     if run_fence.try_finalize("completed"):
                         st.status = "completed"
@@ -413,7 +424,10 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                 else:
                     if run_fence.try_finalize("failed"):
                         st.status = "failed"
-                        st.error = {"code": "empty_safe_response", "message": "안전 응답 생성 결과가 비어 있습니다."}
+                        st.error = {
+                            "code": gstate.get("last_fallback_reason") or "empty_safe_response",
+                            "message": "안전 응답 생성 결과가 비어 있습니다.",
+                        }
                         terminal_status = "failed"
                         outcome = "failed"
 

@@ -1,7 +1,6 @@
-"""LangGraph StateGraph Engine for AGCore."""
+"""Shared Model and Tool Execution Nodes for AGCore LangGraph R1 Runtime."""
 import json
-from typing import Any, Dict, Literal, Optional
-from langgraph.graph import StateGraph, END
+from typing import Any, Dict, Optional
 from app.gateway.client import AIGatewayClient, gateway_client, gateway_for_service
 from app.runtime.context import context_manager, is_context_overflow_error
 from app.runtime.state import AgentState
@@ -328,44 +327,3 @@ async def tool_node(
         "status": "running",
     }
 
-def should_continue(state: AgentState) -> Literal["tool_node", "end"]:
-    # 1. Error state
-    if state.error:
-        return "end"
-    
-    # 2. Check limits
-    if state.step_count >= state.max_steps:
-        return "end"
-    
-    # 3. Check tool calls
-    if state.pending_tool_calls and state.tool_call_count < state.max_tool_calls:
-        return "tool_node"
-        
-    return "end"
-
-def build_agent_graph():
-    graph = StateGraph(AgentState)
-    
-    # Add nodes
-    graph.add_node("model_node", model_node)
-    graph.add_node("tool_node", tool_node)
-    
-    # Set entry point
-    graph.set_entry_point("model_node")
-    
-    # Add conditional edge from model_node
-    graph.add_conditional_edges(
-        "model_node",
-        should_continue,
-        {
-            "tool_node": "tool_node",
-            "end": END,
-        },
-    )
-    
-    # Tool node always loops back to model_node
-    graph.add_edge("tool_node", "model_node")
-    
-    return graph.compile()
-
-agent_executor = build_agent_graph()
