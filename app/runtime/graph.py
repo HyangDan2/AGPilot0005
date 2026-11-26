@@ -196,6 +196,9 @@ async def tool_node(
         route=state.service_id,
         tool_count=max(1, len(calls)),
     )
+    route_input_budget = active_budget.input_budget_tokens if active_budget else context_manager.budget_tokens
+    est_used_tokens = max(0, sum(len((m.content or "")) for m in state.messages) // 4)
+    remaining_input_tokens = max(0, route_input_budget - est_used_tokens)
     owner_token = document_owner_id.set(state.owner_id)
     budget_token = tool_token_budget.set(per_tool_budget)
     try:
@@ -204,7 +207,9 @@ async def tool_node(
             step=state.step_count,
             service=state.service_id,
             timeout=timeout_override,
-            allowed_document_ids=state.context_refs or None,
+            allowed_document_ids=list(state.context_refs),
+            input_budget_tokens=route_input_budget,
+            remaining_input_tokens=remaining_input_tokens,
             constraints=constraints,
         )
     finally:

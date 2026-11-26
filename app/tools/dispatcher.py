@@ -32,6 +32,44 @@ def _truncate_utf8_bytes(text: str, max_bytes: int) -> str:
     return raw[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def _validate_args_against_schema(args: Any, schema: Optional[Dict[str, Any]]) -> Optional[str]:
+    """R1-FIX-12 B: JSON Schema validation for tool arguments (object, required, types, bounds, enum)."""
+    if not isinstance(args, dict):
+        return "Tool arguments must be a JSON object."
+    if not isinstance(schema, dict):
+        return None
+    required = schema.get("required") or []
+    for req_key in required:
+        if req_key not in args or args[req_key] is None:
+            return f"Missing required argument: '{req_key}'"
+    props = schema.get("properties") or {}
+    for k, v in args.items():
+        if k not in props or v is None:
+            continue
+        spec = props[k] or {}
+        expected = spec.get("type")
+        if expected == "string" and not isinstance(v, str):
+            return f"Argument '{k}' must be a string."
+        if expected == "integer" and (isinstance(v, bool) or not isinstance(v, int)):
+            return f"Argument '{k}' must be an integer."
+        if expected == "number" and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            return f"Argument '{k}' must be a number."
+        if expected == "boolean" and not isinstance(v, bool):
+            return f"Argument '{k}' must be a boolean."
+        if expected == "array" and not isinstance(v, list):
+            return f"Argument '{k}' must be an array."
+        if expected == "object" and not isinstance(v, dict):
+            return f"Argument '{k}' must be an object."
+        if "enum" in spec and v not in spec["enum"]:
+            return f"Argument '{k}' must be one of {spec['enum']}."
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if "minimum" in spec and v < spec["minimum"]:
+                return f"Argument '{k}' must be >= {spec['minimum']}."
+            if "maximum" in spec and v > spec["maximum"]:
+                return f"Argument '{k}' must be <= {spec['maximum']}."
+    return None
+
+
 def _apply_dynamic_tool_budget(
     reg: Any,
     args: Dict[str, Any],
@@ -39,21 +77,34 @@ def _apply_dynamic_tool_budget(
     remaining_input_tokens: Optional[int],
     batch_size: int,
 ) -> Tuple[Dict[str, Any], int]:
-    """Schema-driven dynamic tool I/O budget allocation (no tool-name hardcoding)."""
+    """R1-FIX-12 A: Schema-driven dynamic tool I/O budget using reg.parameters and strict remaining budget."""
     default_max_bytes = settings.MAX_TOOL_RESULT_TOKENS * 4
     if not input_budget_tokens or input_budget_tokens <= 0:
         return args, default_max_bytes
 
-    remaining = remaining_input_tokens if (remaining_input_tokens and remaining_input_tokens > 0) else input_budget_tokens
-    per_tool_tokens = max(2048, remaining // max(2, batch_size + 1))
-    # Cap per-tool payload to at most 40% of total route input budget to preserve synthesis headroom
-    per_tool_tokens = min(per_tool_tokens, max(2048, int(input_budget_tokens * 0.4)))
-    dynamic_max_chars = max(2000, min(80000, int(per_tool_tokens * 2.0)))
-    dynamic_max_bytes = max(default_max_bytes, per_tool_tokens * 4)
+    # Never restore full input_budget_tokens when remaining_input_tokens == 0!
+    if remaining_input_tokens is not None:
+        remaining = max(0, int(remaining_input_tokens))
+    else:
+        remaining = int(input_budget_tokens)
+
+    effective_batch = max(1, int(batch_size))
+    if remaining == 0:
+        per_tool_tokens = 256
+    else:
+        # Ensure multi-tool batch sum stays within remaining budget and <= 40% of route budget per tool
+        per_tool_tokens = min(
+            max(256, remaining // max(1, effective_batch)),
+            max(256, int(input_budget_tokens * 0.4)),
+        )
+    dynamic_max_chars = max(500, min(80000, int(per_tool_tokens * 2.0)))
+    dynamic_max_bytes = max(1024, per_tool_tokens * 4)
 
     params = {}
     try:
-        params = (reg.definition.function.parameters or {}).get("properties") or {}
+        schema = getattr(reg, "parameters", None)
+        if isinstance(schema, dict):
+            params = schema.get("properties") or {}
     except Exception:
         params = {}
 
@@ -121,10 +172,12 @@ class ToolDispatcher:
         call_id = call.id
         timeout_sec = timeout or settings.TOOL_TIMEOUT_SECONDS
         
-        # 1. Parse arguments
+        # 1. Parse arguments (must be JSON object per R1-FIX-12 B)
         try:
             raw_args = call.function.arguments
-            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args if raw_args is not None else {})
+            if not isinstance(args, dict):
+                raise ValueError("Tool arguments must be a JSON object.")
         except Exception as e:
             trace = ToolExecutionTrace(
                 step=step,
@@ -174,6 +227,15 @@ class ToolDispatcher:
             error_json = json.dumps({"error": True, "code": "permission_denied", "message": trace.error_message}, ensure_ascii=False)
             return DispatchResult(call_id, func_name, error_json, trace, is_error=True)
 
+        # 2.2 Validate arguments against JSON Schema (R1-FIX-12 B)
+        schema_err = _validate_args_against_schema(args, getattr(reg, "parameters", None))
+        if schema_err:
+            trace.status = "failed"
+            trace.error_code = "invalid_arguments"
+            trace.error_message = schema_err
+            error_json = json.dumps({"error": True, "code": "invalid_arguments", "message": schema_err}, ensure_ascii=False)
+            return DispatchResult(call_id, func_name, error_json, trace, is_error=True)
+
         # 2.5 Apply schema-driven dynamic I/O budget
         args, dynamic_max_bytes = _apply_dynamic_tool_budget(
             reg, args, input_budget_tokens, remaining_input_tokens, batch_size
@@ -199,9 +261,18 @@ class ToolDispatcher:
                 return DispatchResult(call_id, func_name, json.dumps(result, ensure_ascii=False), trace, is_error=True)
             res_str = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
             
-            # Check result size (dynamic per-tool budget ceiling)
-            if len(res_str.encode("utf-8")) > dynamic_max_bytes:
-                res_str = _truncate_utf8_bytes(res_str, dynamic_max_bytes) + "\n...[도구 출력 결과가 컨텍스트 예산 상한을 초과하여 잘렸습니다.]"
+            # Check result size (dynamic per-tool budget ceiling) — preserve valid JSON structure (R1-FIX-12 B.6)
+            raw_bytes = len(res_str.encode("utf-8"))
+            if raw_bytes > dynamic_max_bytes:
+                preview_limit = max(256, dynamic_max_bytes - 180)
+                res_str = json.dumps(
+                    {
+                        "truncated": True,
+                        "original_bytes": raw_bytes,
+                        "content_preview": _truncate_utf8_bytes(res_str, preview_limit),
+                    },
+                    ensure_ascii=False,
+                )
 
             trace.status = "completed"
             trace.duration_ms = duration_ms
@@ -237,11 +308,40 @@ class ToolDispatcher:
         remaining_input_tokens: Optional[int] = None,
         constraints: Optional[Any] = None,
     ) -> List[DispatchResult]:
-        """Executes multiple tool calls concurrently if they are read-only."""
+        """Executes read-only tool calls concurrently and side-effect calls sequentially (R1-FIX-12 C)."""
         batch_size = max(1, len(calls))
-        tasks = [
-            self.execute_tool_call(
-                call,
+        read_only_indices: List[int] = []
+        side_effect_indices: List[int] = []
+        for idx, call in enumerate(calls):
+            reg = self.registry.get_registration(call.function.name)
+            if reg is None or reg.is_read_only:
+                read_only_indices.append(idx)
+            else:
+                side_effect_indices.append(idx)
+
+        results: List[Optional[DispatchResult]] = [None] * len(calls)
+        if read_only_indices:
+            ro_tasks = [
+                self.execute_tool_call(
+                    calls[i],
+                    step=step,
+                    service=service,
+                    timeout=timeout,
+                    allowed_document_ids=allowed_document_ids,
+                    input_budget_tokens=input_budget_tokens,
+                    remaining_input_tokens=remaining_input_tokens,
+                    batch_size=batch_size,
+                    constraints=constraints,
+                )
+                for i in read_only_indices
+            ]
+            ro_res = await asyncio.gather(*ro_tasks)
+            for i, r in zip(read_only_indices, ro_res):
+                results[i] = r
+
+        for i in side_effect_indices:
+            results[i] = await self.execute_tool_call(
+                calls[i],
                 step=step,
                 service=service,
                 timeout=timeout,
@@ -251,8 +351,7 @@ class ToolDispatcher:
                 batch_size=batch_size,
                 constraints=constraints,
             )
-            for call in calls
-        ]
-        return await asyncio.gather(*tasks)
+
+        return [r for r in results if r is not None]
 
 dispatcher = ToolDispatcher()

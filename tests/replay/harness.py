@@ -44,7 +44,11 @@ class RecordedGatewayClient:
         on_content_delta: Optional[Callable] = None,
         **kwargs: Any,
     ) -> Tuple[Optional[str], Optional[List[ToolCall]], str]:
-        step = self._steps[min(self._idx, len(self._steps) - 1)]
+        if self._idx >= len(self._steps):
+            raise AssertionError(
+                f"RecordedGatewayClient fixture exhausted after {len(self._steps)} call(s)"
+            )
+        step = self._steps[self._idx]
         self._idx += 1
         self._clock.advance(step.advance_seconds)
         if step.content and on_content_delta:
@@ -126,4 +130,62 @@ async def run_deterministic_replay(
             }
             for f in res.get("fallback_records", [])
         ],
+    }
+
+
+async def run_legacy_replay(
+    *,
+    message: str,
+    recorded_steps: List[RecordedGatewayStep],
+    constraints: ConstraintSpec,
+    seed: int = 42,
+    start_epoch: float = 1795600000.0,
+    run_id: str = "run-legacy-0001",
+) -> Dict[str, Any]:
+    """Executes the legacy model_node/tool_node loop with the exact same RecordedGatewayClient & MockClock."""
+    from app.runtime.graph import model_node, tool_node
+
+    random.seed(seed)
+    clock = MockClock(start_epoch=start_epoch, start_monotonic=1000.0)
+    client = RecordedGatewayClient(recorded_steps, clock=clock)
+    state = AgentState(
+        run_id=run_id,
+        session_id="sess-replay",
+        service_id=constraints.service_id,
+        owner_id=constraints.owner_id,
+        messages=[GatewayMessage(role="user", content=message)],
+        max_steps=constraints.max_steps,
+        max_tool_calls=constraints.max_tool_calls,
+        status="running",
+        stream=False,
+        reasoning_effort=constraints.default_reasoning_effort,
+        custom_client=client,
+    )
+
+    while state.step_count < state.max_steps and state.status == "running":
+        m_res = await model_node(state)
+        for k, v in m_res.items():
+            setattr(state, k, v)
+        if state.pending_tool_calls and state.tool_call_count < state.max_tool_calls:
+            t_res = await tool_node(state, constraints=constraints)
+            for k, v in t_res.items():
+                setattr(state, k, v)
+        else:
+            break
+
+    if state.status == "running" and state.final_answer is not None and not state.pending_tool_calls:
+        state.status = "completed"
+
+    remaining_time = round(max(0.0, constraints.time_budget_seconds - (clock.monotonic() - 1000.0)), 4)
+    return {
+        "tool_selection": [tr.tool_name for tr in state.traces],
+        "tool_arguments": [tr.arguments for tr in state.traces],
+        "budget_consumption": {
+            "steps": state.step_count,
+            "tool_calls": state.tool_call_count,
+            "remaining_time_budget_seconds": remaining_time,
+        },
+        "citations": state.citations,
+        "terminal_state": state.status,
+        "final_answer": state.final_answer,
     }

@@ -291,8 +291,13 @@ class LangGraphR1Runtime:
                         {"step": st.step_count + 1, "reasoning_effort": effective_effort or "default"},
                     )
 
+                    is_pseudo_tool = False
                     async def on_delta(chunk: str):
-                        await _emit("answer.delta", {"delta": chunk, "step": st.step_count})
+                        nonlocal is_pseudo_tool
+                        if "<tool_call" in chunk or "<function" in chunk:
+                            is_pseudo_tool = True
+                        if not is_pseudo_tool:
+                            await _emit("answer.delta", {"delta": chunk, "step": st.step_count})
 
                     async def on_reasoning_delta(chunk: str):
                         await _emit("reasoning.delta", {"delta": chunk, "step": st.step_count})
