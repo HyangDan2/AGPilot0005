@@ -340,6 +340,10 @@ class AgentRunner:
                         deadline=run_deadline,
                         fence=session.fence,
                     )
+                if state.status == "cancelled" or session.fence.terminal_state == "cancelled":
+                    if session.finished_at is None:
+                        session.finished_at = time.time()
+                    return
                 session.finished_at = time.time()
                 if state.status == "completed":
                     session.fence.try_finalize("completed")

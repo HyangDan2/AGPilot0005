@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict
@@ -150,7 +152,6 @@ async def _validate_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[s
     va: Optional[ValidatedAction] = vres.validated_action
 
     if not vres.accepted or va is None:
-        rejected_sigs.append(proposal.signature())
         fb: FallbackAction = vres.fallback_action or FallbackAction(
             action=ActionType.TERMINATE.value,
             reason_code=vres.reason_code or "validation_rejected",
@@ -172,6 +173,10 @@ async def _validate_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[s
             va = term_res.validated_action
         else:
             va = fb_vres.validated_action
+        # Only record rejected signature when fallback is NOT a state-mutating context compaction;
+        # context_compacted=True already bounds COMPACT_CONTEXT to a single attempt (REG-POL-14).
+        if va is None or va.action != ActionType.COMPACT_CONTEXT.value:
+            rejected_sigs.append(proposal.signature())
         last_fb_reason = (va.reason_code if va else None) or fb.reason_code or vres.reason_code
 
     assert va is not None, "ActionValidator must always produce a ValidatedAction"
@@ -302,13 +307,17 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                 {"step": st.step_count + 1, "reasoning_effort": effective_effort or "default"},
             )
 
+            answer_parts: List[str] = []
+            has_streamed_delta = False
             is_pseudo_tool = False
 
             async def on_delta(chunk: str):
-                nonlocal is_pseudo_tool
-                if "<tool_call" in chunk or "<function" in chunk:
+                nonlocal has_streamed_delta, is_pseudo_tool
+                answer_parts.append(chunk)
+                if "<tool_call" in chunk or "<function" in chunk or re.search(r"<\s*(?:tool_call|function\b)", "".join(answer_parts), re.I):
                     is_pseudo_tool = True
                 if not is_pseudo_tool:
+                    has_streamed_delta = True
                     await _emit_with_fence(ctx, "answer.delta", {"delta": chunk, "step": st.step_count})
 
             async def on_reasoning_delta(chunk: str):
@@ -355,19 +364,45 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                 },
             )
 
-            if not st.pending_tool_calls and action != ActionType.SAFE_RESPOND.value:
-                should_esc, esc_prompt = EscalationGate.evaluate(
-                    last_tool_meta,
-                    set(attempted_sigs),
-                    set(constraints_spec.allowed_tools),
-                    escalations_used,
-                    budget=1,
-                )
-                if should_esc and esc_prompt and st.step_count + 1 < constraints_spec.max_steps:
-                    escalations_used += 1
-                    last_tool_meta = None
-                    st.final_answer = None
-                    st.messages.append(GatewayMessage(role="user", content=esc_prompt))
+            if not st.pending_tool_calls:
+                escalated = False
+                if action != ActionType.SAFE_RESPOND.value:
+                    should_esc, esc_prompt = EscalationGate.evaluate(
+                        last_tool_meta,
+                        set(attempted_sigs),
+                        set(constraints_spec.allowed_tools),
+                        escalations_used,
+                        budget=1,
+                    )
+                    if should_esc and esc_prompt and st.step_count + 1 < constraints_spec.max_steps:
+                        escalations_used += 1
+                        last_tool_meta = None
+                        st.final_answer = None
+                        st.messages.append(GatewayMessage(role="user", content=esc_prompt))
+                        escalated = True
+                if not escalated:
+                    answer = st.final_answer or "".join(answer_parts)
+                    if st.citations and answer:
+                        from app.runtime.tasks.presentation import legacy_citations
+
+                        answer, _ = legacy_citations(
+                            {
+                                "answer": answer,
+                                "document_titles": st.document_titles,
+                                "entries": [
+                                    {"doc_id": c["doc_id"], "chunk_id": c["chunk_id"], "source": {"page": c.get("page")}}
+                                    for c in st.citations
+                                ],
+                            }
+                        )
+                        st.final_answer = answer
+                    if answer:
+                        if not has_streamed_delta:
+                            await _emit_with_fence(ctx, "answer.delta", {"delta": answer, "step": st.step_count})
+                        else:
+                            citation_tail = answer[len("".join(answer_parts)):]
+                            if citation_tail:
+                                await _emit_with_fence(ctx, "answer.delta", {"delta": citation_tail, "step": st.step_count})
             await _emit_with_fence(ctx, "step.completed", {"step": st.step_count})
 
             if action == ActionType.SAFE_RESPOND.value:
@@ -404,6 +439,7 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                         "step": st.step_count,
                         "tool_name": tc.function.name,
                         "tool_call_id": tc.id,
+                        "arguments": tc.function.arguments,
                     },
                 )
 
@@ -436,6 +472,9 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                     any_tool_err = True
                 elif tr.status != "completed":
                     any_tool_unknown = True
+                sig = f"{tr.tool_name}:{json.dumps(tr.arguments or {}, sort_keys=True, ensure_ascii=False)}"
+                if sig not in attempted_sigs:
+                    attempted_sigs.append(sig)
                 await _emit_with_fence(
                     ctx,
                     "tool.completed",
@@ -446,6 +485,7 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                         "is_error": is_err,
                         "status": tr.status,
                         "duration_ms": tr.duration_ms,
+                        "result_size_bytes": tr.result_size_bytes,
                     },
                 )
             if any_tool_err:
@@ -516,7 +556,10 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
         terminal_status = "failed"
         if run_fence.try_finalize("failed"):
             st.status = "failed"
-            st.error = {"code": f"gateway_{gse.code}", "message": gse.message}
+            st.error = {
+                "code": f"gateway_{gse.code}",
+                "message": f"모델 게이트웨이 요청을 완료하지 못했습니다 ({gse.code}).",
+            }
     except Exception as exc:
         outcome = "failed"
         terminal_status = "failed"
