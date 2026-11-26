@@ -70,6 +70,7 @@ SAFE_EXACT_KEYS = frozenset(
         "limit",
         "top_k",
         "doc_id",
+        "expected_event_count",
     }
 )
 
@@ -92,10 +93,11 @@ def _looks_like_secret(value: str) -> bool:
 
 
 def _is_sensitive_key(key: str) -> bool:
+    """R1-FIX-13 C: Strict explicit Field Allowlist (any key outside SAFE_EXACT_KEYS is redacted)."""
     lower = key.lower().strip()
     if lower in SAFE_EXACT_KEYS:
         return False
-    return any(part in lower for part in SENSITIVE_KEY_PARTS)
+    return True
 
 
 def sanitize_value(value: Any, *, key_hint: str = "") -> Any:

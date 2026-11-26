@@ -1,6 +1,6 @@
 """LangGraph StateGraph Engine for AGCore."""
 import json
-from typing import Any, Dict, Literal
+from typing import Any, Dict, Literal, Optional
 from langgraph.graph import StateGraph, END
 from app.gateway.client import AIGatewayClient, gateway_client, gateway_for_service
 from app.runtime.context import context_manager, is_context_overflow_error
@@ -11,7 +11,15 @@ from app.tools.dispatcher import dispatcher
 from app.tools.registry import registry
 from app.adapters.document import document_owner_id, tool_token_budget
 
-async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) -> Dict[str, Any]:
+async def model_node(
+    state: AgentState,
+    on_delta=None,
+    on_reasoning_delta=None,
+    *,
+    context_budget_override=None,
+    reasoning_effort_override=None,
+    disable_tools: bool = False,
+) -> Dict[str, Any]:
     """Invokes AI Gateway with current messages and tools."""
     state.step_count += 1
 
@@ -48,6 +56,12 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
     client = state.custom_client or gateway_for_service(state.service_id, gateway_client)
     route_budget, has_contract = await get_effective_route_budget(client, state.service_id)
     effective_input_budget = route_budget.input_budget_tokens if has_contract else None
+    if context_budget_override is not None:
+        effective_input_budget = (
+            min(effective_input_budget, int(context_budget_override))
+            if effective_input_budget is not None
+            else int(context_budget_override)
+        )
     pruned_msgs, _report = context_manager.compact_with_report(
         state.messages,
         budget_tokens=effective_input_budget,
@@ -72,18 +86,76 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
         model_label = label
 
     label_options = {'on_model_label': capture_label} if isinstance(client, AIGatewayClient) else {}
-    call_tools = tools if not public_grounding and state.tool_call_count < state.max_tool_calls else None
-    call_choice = ("required" if first_document_step else "auto") if not public_grounding and state.tool_call_count < state.max_tool_calls else "none"
-    try:
-        content, tool_calls, finish_reason = await client.execute(
-            messages=pruned_msgs,
-            tools=call_tools,
-            tool_choice=call_choice,
+    allow_tools = (not disable_tools) and (not public_grounding) and state.tool_call_count < state.max_tool_calls
+    call_tools = tools if allow_tools else None
+    call_choice = ("required" if first_document_step else "auto") if allow_tools else "none"
+    effective_effort = reasoning_effort_override if reasoning_effort_override is not None else state.reasoning_effort
+
+    import inspect
+    from app.schemas.gateway import ModelReply
+
+    def _structured_kwarg_name(c) -> Optional[str]:
+        try:
+            params = inspect.signature(c.execute).parameters
+            if "_structured" in params:
+                return "_structured"
+            if "return_reply" in params:
+                return "return_reply"
+            return None
+        except Exception:
+            return None
+
+    structured_kw = _structured_kwarg_name(client)
+    accumulated_usage: Dict[str, int] = {}
+    streamed_any_delta = False
+
+    async def _guarded_on_delta(chunk: str):
+        nonlocal streamed_any_delta
+        streamed_any_delta = True
+        if on_delta is not None:
+            await on_delta(chunk)
+
+    def _merge_usage(raw_u: Any) -> None:
+        if raw_u is None:
+            return
+        if hasattr(raw_u, "model_dump"):
+            raw_u = raw_u.model_dump()
+        if not isinstance(raw_u, dict):
+            return
+        in_tok = raw_u.get("input_tokens") if raw_u.get("input_tokens") is not None else raw_u.get("prompt_tokens")
+        out_tok = raw_u.get("output_tokens") if raw_u.get("output_tokens") is not None else raw_u.get("completion_tokens")
+        tot_tok = raw_u.get("total_tokens")
+        for key, val in (("input_tokens", in_tok), ("output_tokens", out_tok), ("total_tokens", tot_tok)):
+            if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+                accumulated_usage[key] = accumulated_usage.get(key, 0) + val
+
+    async def _invoke_client(msgs, *, tools_arg, choice_arg, delta_cb):
+        kw = dict(label_options)
+        if structured_kw:
+            kw[structured_kw] = True
+        raw = await client.execute(
+            messages=msgs,
+            tools=tools_arg,
+            tool_choice=choice_arg,
             stream=state.stream,
-            reasoning_effort=state.reasoning_effort,
+            reasoning_effort=effective_effort,
             on_reasoning_delta=on_reasoning_delta,
-            on_content_delta=on_delta,
-            **label_options,
+            on_content_delta=delta_cb,
+            **kw,
+        )
+        if isinstance(raw, ModelReply):
+            _merge_usage(raw.usage)
+            if raw.model_label:
+                capture_label(raw.model_label)
+            return raw.content, raw.tool_calls, raw.finish_reason
+        return raw
+
+    try:
+        content, tool_calls, finish_reason = await _invoke_client(
+            pruned_msgs,
+            tools_arg=call_tools,
+            choice_arg=call_choice,
+            delta_cb=_guarded_on_delta if on_delta is not None else None,
         )
     except Exception as exc:
         if not is_context_overflow_error(exc):
@@ -96,27 +168,22 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
             force_ratio=0.72,
         )
         model_label = None
-        content, tool_calls, finish_reason = await client.execute(
-            messages=pruned_msgs,
-            tools=call_tools,
-            tool_choice=call_choice,
-            stream=state.stream,
-            reasoning_effort=state.reasoning_effort,
-            on_reasoning_delta=on_reasoning_delta,
-            on_content_delta=on_delta,
-            **label_options,
+        # FIX-207: Preserve effective_effort on retry and prevent duplicate streaming deltas
+        retry_delta_cb = None if streamed_any_delta else (_guarded_on_delta if on_delta is not None else None)
+        content, tool_calls, finish_reason = await _invoke_client(
+            pruned_msgs,
+            tools_arg=call_tools,
+            choice_arg=call_choice,
+            delta_cb=retry_delta_cb,
         )
     if public_grounding and not content and not tool_calls:
         model_label = None
-        content, tool_calls, finish_reason = await client.execute(
-            messages=pruned_msgs,
-            tools=None,
-            tool_choice="none",
-            stream=state.stream,
-            reasoning_effort=state.reasoning_effort,
-            on_reasoning_delta=on_reasoning_delta,
-            on_content_delta=on_delta,
-            **label_options,
+        retry_delta_cb = None if streamed_any_delta else (_guarded_on_delta if on_delta is not None else None)
+        content, tool_calls, finish_reason = await _invoke_client(
+            pruned_msgs,
+            tools_arg=None,
+            choice_arg="none",
+            delta_cb=retry_delta_cb,
         )
     if public_grounding and not content and not tool_calls:
         raise RuntimeError("Public document answer was empty")
@@ -133,6 +200,7 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
         "messages": new_messages,
         "step_count": state.step_count,
         "pending_tool_calls": tool_calls or [],
+        "usage": accumulated_usage,
     }
     
     if tool_calls:
@@ -144,13 +212,23 @@ async def model_node(state: AgentState, on_delta=None, on_reasoning_delta=None) 
         
     return updates
 
-async def tool_node(state: AgentState, on_tool_event=None) -> Dict[str, Any]:
-    """Executes pending tool calls and updates message state."""
-    calls = state.pending_tool_calls
+async def tool_node(
+    state: AgentState,
+    on_tool_event=None,
+    *,
+    validated_calls=None,
+    constraints=None,
+    timeout_override=None,
+    approved_context_budget=None,
+) -> Dict[str, Any]:
+    """Executes pending (or strictly ValidatedAction-approved) tool calls and updates message state."""
+    calls = list(validated_calls) if validated_calls is not None else list(state.pending_tool_calls)
+    approved_ids = {c.id for c in calls}
+    unapproved_calls = [c for c in state.pending_tool_calls if c.id not in approved_ids] if validated_calls is not None else []
     new_traces = list(state.traces)
     new_messages = list(state.messages)
     citations = list(state.citations)
-    if state.context_refs and state.tool_call_count == 0:
+    if validated_calls is None and state.context_refs and state.tool_call_count == 0:
         for index, call in enumerate(calls):
             if call.function.name == "document.get_outline":
                 call.function.arguments = json.dumps({"doc_id": state.context_refs[min(index, len(state.context_refs) - 1)]})
@@ -165,22 +243,42 @@ async def tool_node(state: AgentState, on_tool_event=None) -> Dict[str, Any]:
     # Execute batch of calls concurrently with dynamic per-tool token_budget
     from app.core.runtime_config import resolve_route_budget
     active_budget = resolve_route_budget(state.service_id)
+    route_input_budget = active_budget.input_budget_tokens if active_budget else context_manager.budget_tokens
+    if approved_context_budget is not None:
+        route_input_budget = min(route_input_budget, int(approved_context_budget))
+    elif constraints is not None:
+        route_input_budget = min(route_input_budget, int(constraints.context_budget_tokens))
+    est_used_tokens = max(0, sum(len((m.content or "")) for m in state.messages) // 4)
+    remaining_input_tokens = max(0, route_input_budget - est_used_tokens)
+    # HF-03: Compute Document Tool's own tool_token_budget from the clamped route_input_budget!
     per_tool_budget = context_manager.compute_tool_token_budget(
         state.messages,
-        budget_tokens=active_budget.input_budget_tokens if active_budget else None,
+        budget_tokens=route_input_budget,
         route=state.service_id,
         tool_count=max(1, len(calls)),
     )
+    if per_tool_budget is not None:
+        per_tool_budget = min(int(per_tool_budget), remaining_input_tokens // max(1, len(calls)))
+    from app.core.auth import current_execution_scope
+
     owner_token = document_owner_id.set(state.owner_id)
     budget_token = tool_token_budget.set(per_tool_budget)
+    # CR-02: Propagate the exact verified ExecutionScope instance (NEVER reconstruct with hardcoded default_tenant/user!)
+    scope_token = current_execution_scope.set(state.execution_scope) if state.execution_scope is not None else None
     try:
         results = await dispatcher.execute_batch(
             calls=calls,
             step=state.step_count,
             service=state.service_id,
-            allowed_document_ids=state.context_refs or None,
+            timeout=timeout_override,
+            allowed_document_ids=list(state.context_refs),
+            input_budget_tokens=route_input_budget,
+            remaining_input_tokens=remaining_input_tokens,
+            constraints=constraints,
         )
     finally:
+        if scope_token is not None:
+            current_execution_scope.reset(scope_token)
         tool_token_budget.reset(budget_token)
         document_owner_id.reset(owner_token)
     
@@ -209,7 +307,18 @@ async def tool_node(state: AgentState, on_tool_event=None) -> Dict[str, Any]:
         )
         if on_tool_event:
             await on_tool_event("completed", res, state.step_count)
-            
+
+    # R1-FIX-01.12: Record explicit rejected tool messages for any pending calls excluded from ValidatedAction
+    for rej in unapproved_calls:
+        new_messages.append(
+            GatewayMessage(
+                role="tool",
+                content=json.dumps({"error": True, "code": "tool_call_not_approved"}, ensure_ascii=False),
+                tool_call_id=rej.id,
+                name=rej.function.name,
+            )
+        )
+
     return {
         "messages": new_messages,
         "tool_call_count": new_tool_count,

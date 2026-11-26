@@ -32,18 +32,34 @@ class Settings(BaseModel):
     TOOL_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_TOOL_TIMEOUT_SECONDS", "30.0"))
     RUN_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_RUN_TIMEOUT_SECONDS", "180.0"))
     
-    # Service Auth Tokens (Callers allowed to invoke AGCore)
+    # Service Auth Tokens, Credential Scopes & Trusted Proxy (NG-01 / NG-03 Fail-closed)
     SERVICE_TOKENS: str = os.environ.get("AGCORE_SERVICE_TOKENS", "")
+    ADMIN_SERVICE_TOKENS: str = os.environ.get("AGCORE_ADMIN_SERVICE_TOKENS", "")
+    CREDENTIAL_SCOPES_JSON: str = os.environ.get("AGCORE_CREDENTIAL_SCOPES", "")
+    CREDENTIAL_SECRETS_JSON: str = os.environ.get("AGCORE_CREDENTIAL_SECRETS", "")
+    TRUSTED_PROXY_IPS: str = os.environ.get("AGCORE_TRUSTED_PROXY_IPS", "127.0.0.1,::1")
+    TRUSTED_PROXY_SECRET: str = os.environ.get("AGCORE_TRUSTED_PROXY_SECRET", "")
+    CORS_ALLOW_ORIGINS: str = os.environ.get(
+        "AGCORE_CORS_ALLOW_ORIGINS",
+        "https://hd2lab.duckdns.org" if os.environ.get("AGCORE_ENV", "development").lower() == "production" else "*",
+    )
+    MAX_REQUEST_BODY_BYTES: int = int(os.environ.get("AGCORE_MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
 
-    # Environment & Mock Policy
+    # Environment & Mock Policy (production blocks mock fallback fail-closed)
     ENVIRONMENT: str = os.environ.get("AGCORE_ENV", "development")
-    ALLOW_MOCK_FALLBACK: bool = os.environ.get("AGCORE_ALLOW_MOCK_FALLBACK", "true").lower() in ("true", "1", "yes")
+    ALLOW_MOCK_FALLBACK: bool = (
+        False
+        if os.environ.get("AGCORE_ENV", "development").lower() == "production"
+        else os.environ.get("AGCORE_ALLOW_MOCK_FALLBACK", "true").lower() in ("true", "1", "yes")
+    )
 
-    # AGPilot0006 (Document Intelligence) Service Integration
+    # AGPilot0006 (Document Intelligence) Service Integration — NO hardcoded default secret (FIX-203)
+    AGTOOLS_ENABLED: bool = os.environ.get("AGCORE_AGTOOLS_ENABLED", "true").lower() in ("true", "1", "yes")
     AGTOOLS_URL: str = os.environ.get("AGCORE_AGTOOLS_URL", "http://127.0.0.1:8006/api/v1")
     AGTOOLS_TENANT: str = os.environ.get("AGCORE_AGTOOLS_TENANT", "default_tenant")
-    AGTOOLS_TOKEN: str = os.environ.get("AGCORE_AGTOOLS_TOKEN", "hd2-doc-secret-token-key-2026")
+    AGTOOLS_TOKEN: str = os.environ.get("AGCORE_AGTOOLS_TOKEN", "")
     AGTOOLS_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_AGTOOLS_TIMEOUT_SECONDS", "10.0"))
+    SQLITE_BUSY_TIMEOUT_MS: int = int(os.environ.get("AGCORE_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 
     # Persistent, bounded full-document analysis (separate from general Agent limits).
     ANALYSIS_DIR: str = os.environ.get("AGCORE_ANALYSIS_DIR", "/var/lib/hd2lab-agcore/analysis")
@@ -66,3 +82,51 @@ class Settings(BaseModel):
     TRAJECTORY_ENABLED: bool = os.environ.get("AGCORE_TRAJECTORY_ENABLED", "true").lower() in ("true", "1", "yes")
 
 settings = Settings()
+
+
+def validate_boot_configuration() -> None:
+    """FIX-203: Fail-fast production boot validation. Logs only missing env var names, never secrets."""
+    if settings.ENVIRONMENT.lower() != "production":
+        return
+    from app.core.auth import is_agtools_token_valid
+
+    missing = []
+    if settings.AGTOOLS_ENABLED and not is_agtools_token_valid(settings.AGTOOLS_TOKEN):
+        missing.append("AGCORE_AGTOOLS_TOKEN")
+    has_service_auth = bool((settings.CREDENTIAL_SCOPES_JSON or "").strip())
+    has_proxy_auth = bool((settings.TRUSTED_PROXY_SECRET or "").strip())
+    if not has_service_auth and not has_proxy_auth:
+        missing.append("AGCORE_CREDENTIAL_SCOPES_OR_AGCORE_TRUSTED_PROXY_SECRET")
+    if (settings.CREDENTIAL_SCOPES_JSON or "").strip():
+        import json as _json
+        try:
+            scopes = _json.loads(settings.CREDENTIAL_SCOPES_JSON)
+            secrets = _json.loads(settings.CREDENTIAL_SECRETS_JSON or "{}")
+            if not isinstance(scopes, dict) or not isinstance(secrets, dict):
+                missing.append("AGCORE_CREDENTIAL_SCOPES_INVALID_TYPE")
+            else:
+                seen_secrets: dict[str, str] = {}
+                for cid in scopes:
+                    vals = secrets.get(cid)
+                    if not isinstance(vals, list) or not vals or not all(is_agtools_token_valid(v) for v in vals):
+                        missing.append(f"AGCORE_CREDENTIAL_SECRETS[{cid}]")
+                        continue
+                    for v in vals:
+                        norm_v = v.strip()
+                        if norm_v in seen_secrets and seen_secrets[norm_v] != cid:
+                            missing.append(f"duplicate_credential_secret:{seen_secrets[norm_v]}:{cid}")
+                        seen_secrets[norm_v] = cid
+                    cfg = scopes.get(cid) or {}
+                    if isinstance(cfg, dict):
+                        fixed_owner = str(cfg.get("fixed_owner") or "")
+                        if ":" in fixed_owner:
+                            missing.append(f"invalid_fixed_owner_delimiter:{cid}")
+                        for t in (cfg.get("allowed_tenants") or []):
+                            if ":" in str(t):
+                                missing.append(f"invalid_tenant_delimiter:{cid}")
+        except Exception:
+            missing.append("AGCORE_CREDENTIAL_SCOPES_INVALID_JSON")
+    if missing:
+        raise RuntimeError(
+            "Production boot fail-fast: missing or invalid required credentials: " + ", ".join(missing)
+        )

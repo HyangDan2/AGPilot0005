@@ -5,11 +5,12 @@ import os
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.core.auth import require_authenticated_caller
 from app.gateway.client import authorized_gateway_clients, gateway_client
 from app.gateway.direct import DirectLLMClient, SSRFSecurityError, validate_base_url
 from app.runtime.runner import runner
@@ -17,7 +18,7 @@ from app.schemas.agent import AgentRunOptions, AgentRunRequest
 from app.schemas.gateway import GatewayMessage
 from app.tools.registry import registry
 
-router = APIRouter(prefix="/demo", tags=["Demo Console"])
+router = APIRouter(prefix="/demo", tags=["Demo Console"], dependencies=[Depends(require_authenticated_caller)])
 
 class DemoConnectRequest(BaseModel):
     mode: Literal["direct", "gateway"] = "direct"

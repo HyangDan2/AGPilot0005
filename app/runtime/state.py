@@ -9,6 +9,9 @@ class AgentState(BaseModel):
     session_id: Optional[str] = None
     service_id: Optional[str] = None
     owner_id: str = "default_user"
+    tenant_id: str = "default_tenant"
+    authenticated: bool = False
+    execution_scope: Optional[Any] = None
     context_refs: List[str] = Field(default_factory=list)
     document_titles: Dict[str,str] = Field(default_factory=dict)
     citations: List[Dict[str,Any]] = Field(default_factory=list)
@@ -31,6 +34,7 @@ class AgentState(BaseModel):
     
     # Traces & Events
     traces: List[ToolExecutionTrace] = Field(default_factory=list)
+    usage: Dict[str, int] = Field(default_factory=dict)
     
     # Stream flag
     stream: bool = False

@@ -22,16 +22,37 @@ class TaskRepository(Protocol):
 
 
 class ScopedDocuments:
-    """Confine the legacy ContextVar to the HTTP adapter boundary."""
+    """ADD-02: Propagates persisted Tenant + Owner ExecutionScope to Document Adapter across create & resume."""
     def __init__(self, adapter, access: AccessContext):
         self.adapter, self.access = adapter, access
 
     async def call(self, operation, *args, **kwargs):
-        token = document_owner_id.set(self.access.owner)
+        from app.core.auth import ExecutionScope, current_execution_scope
+
+        raw_owner = self.access.owner
+        scope_token = None
+        if "::" in raw_owner:
+            tenant_id, actual_owner = raw_owner.split("::", 1)
+            task_scope = ExecutionScope(
+                tenant_id=tenant_id,
+                owner_id=actual_owner,
+                service_id=self.access.service,
+                role="service",
+                authenticated=True,
+                auth_source="durable_task",
+                allowed_tenants=frozenset({tenant_id}),
+                allowed_services=frozenset({self.access.service}),
+            )
+            scope_token = current_execution_scope.set(task_scope)
+            owner_token = document_owner_id.set(actual_owner)
+        else:
+            owner_token = document_owner_id.set(raw_owner)
         try:
             return await getattr(self.adapter, operation)(*args, **kwargs)
         finally:
-            document_owner_id.reset(token)
+            if scope_token is not None:
+                current_execution_scope.reset(scope_token)
+            document_owner_id.reset(owner_token)
 
 
 class JsonTaskRepository:

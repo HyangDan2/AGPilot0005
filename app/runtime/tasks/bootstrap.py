@@ -12,28 +12,55 @@ class AnalysisServices:
     def __init__(self, legacy, orchestrator, store):
         self.legacy, self.orchestrator, self.store = legacy, orchestrator, store
 
-    async def create(self, owner, service, message, refs, history=None, analysis_refs=None, session_id=None, reasoning_effort='off'):
+    @staticmethod
+    def _effective_owner(owner: str, tenant_id: str | None) -> str:
+        from app.core.auth import validate_scope_identifier
+
+        safe_owner = validate_scope_identifier(owner, "owner_id")
+        if tenant_id is not None:
+            safe_tenant = validate_scope_identifier(tenant_id, "tenant_id")
+            return f"{safe_tenant}::{safe_owner}"
+        return safe_owner
+
+    async def create(
+        self,
+        owner,
+        service,
+        message,
+        refs,
+        history=None,
+        analysis_refs=None,
+        session_id=None,
+        reasoning_effort='off',
+        tenant_id=None,
+    ):
+        scoped_owner = self._effective_owner(owner, tenant_id)
         if service not in ('hd2ai-admin', 'hd2ai-beta', 'hd2ai-public'):
-            return await self.legacy.create(owner, service, message, refs, reasoning_effort=reasoning_effort)
+            return await self.legacy.create(scoped_owner, service, message, refs, reasoning_effort=reasoning_effort)
         refs = list(dict.fromkeys(refs))
         modern = []
         for job_id in analysis_refs or []:
             raw = self.store.read(job_id)
-            if not raw or raw.get('owner_id') != owner or raw.get('service_id') != service:
+            if not raw or raw.get('owner_id') != scoped_owner or raw.get('service_id') != service:
                 raise ValueError('analysis_reference_unavailable')
             previous_docs = raw.get('document_ids', [])
             if refs and not set(previous_docs).issubset(refs): continue
             if raw.get('schema_version') == 2: modern.append(job_id)
             refs = list(dict.fromkeys(refs + previous_docs))
-        return await self.orchestrator.create(owner, service, message, refs, history, modern, session_id, reasoning_effort)
+        return await self.orchestrator.create(scoped_owner, service, message, refs, history, modern, session_id, reasoning_effort)
 
     def _manager(self, job_id):
         raw = self.store.read(job_id)
         return self.orchestrator if raw and raw.get('schema_version') == 2 else self.legacy
 
-    def get(self, job_id, owner, service): return self._manager(job_id).get(job_id, owner, service)
-    def resume(self, job_id, owner, service): return self._manager(job_id).resume(job_id, owner, service)
-    def cancel(self, job_id, owner, service): return self._manager(job_id).cancel(job_id, owner, service)
+    def get(self, job_id, owner, service, tenant_id=None):
+        return self._manager(job_id).get(job_id, self._effective_owner(owner, tenant_id), service)
+
+    def resume(self, job_id, owner, service, tenant_id=None):
+        return self._manager(job_id).resume(job_id, self._effective_owner(owner, tenant_id), service)
+
+    def cancel(self, job_id, owner, service, tenant_id=None):
+        return self._manager(job_id).cancel(job_id, self._effective_owner(owner, tenant_id), service)
 
 
 def services(app):

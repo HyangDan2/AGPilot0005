@@ -1,12 +1,13 @@
 """ADR-0017: Dynamic Tool Providers, Tool Profiles, and Service Binding Admin API."""
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, StrictBool
 
+from app.core.auth import require_admin_caller
 from app.tools.policy import VALID_ID, tool_policy, validate_provider_url
 from app.tools.registry import registry
 
-router = APIRouter(prefix="/config/tools", tags=["Tools Policy"])
+router = APIRouter(prefix="/config/tools", tags=["Tools Policy"], dependencies=[Depends(require_admin_caller)])
 
 
 class ProviderUpsert(BaseModel):

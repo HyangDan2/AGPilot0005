@@ -2,10 +2,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, Dict, FrozenSet, Mapping, Optional, Protocol, Tuple
 
 from app.runtime.policy.constraints import ActionType, ConstraintSpec
+
+
+class DecisionType(str, Enum):
+    """R1-FIX-06: Typed Policy Decision Contract."""
+
+    NEXT_NODE = "NEXT_NODE"
+    TOOL_SELECTION = "TOOL_SELECTION"
+    CONTEXT_ALLOCATION = "CONTEXT_ALLOCATION"
+    MODEL_PREFERENCE = "MODEL_PREFERENCE"
+    REASONING_CONFIG = "REASONING_CONFIG"
+    # Reserved contracts for follow-up phases (NOT active in Phase R1.1)
+    RETRIEVAL_CONFIG = "RETRIEVAL_CONFIG"
+    VERIFICATION = "VERIFICATION"
+    REPLANNING = "REPLANNING"
+    TERMINATION = "TERMINATION"
+
+
+RESERVED_DECISION_TYPES: FrozenSet[str] = frozenset(
+    {
+        DecisionType.RETRIEVAL_CONFIG.value,
+        DecisionType.VERIFICATION.value,
+        DecisionType.REPLANNING.value,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +49,7 @@ class StateView:
     estimated_context_tokens: int
     has_pending_tool_calls: bool
     pending_tool_names: Tuple[str, ...] = ()
+    pending_tool_call_ids: Tuple[str, ...] = ()
     pending_tool_count: int = 0
     has_final_answer: bool = False
     context_compacted: bool = False
@@ -86,6 +112,7 @@ class DefaultAGPolicy:
                 chosen_action=ActionType.CALL_TOOLS.value,
                 proposed_parameters=MappingProxyType(
                     {
+                        "tool_call_ids": state_view.pending_tool_call_ids,
                         "tool_names": state_view.pending_tool_names,
                         "tool_count": state_view.pending_tool_count,
                     }

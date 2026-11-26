@@ -34,7 +34,7 @@ class ConstraintSpec:
 
     service_id: str
     owner_id: str
-    authenticated: bool = True
+    authenticated: bool = False
     allowed_tools: FrozenSet[str] = field(default_factory=frozenset)
     allowed_actions: FrozenSet[str] = field(default_factory=lambda: DEFAULT_ALLOWED_ACTIONS)
     max_steps: int = 20
@@ -91,7 +91,7 @@ class ConstraintSpec:
         max_tool_calls: int,
         time_budget_seconds: float,
         context_budget_tokens: int,
-        authenticated: bool = True,
+        authenticated: bool = False,
         safety_blocked: bool = False,
         safety_reason: Optional[str] = None,
         default_reasoning_effort: str = "default",
