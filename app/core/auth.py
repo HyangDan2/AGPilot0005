@@ -34,6 +34,35 @@ def validate_scope_identifier(value: str, field_name: str) -> str:
 
 
 current_execution_scope: ContextVar[Optional["ExecutionScope"]] = ContextVar("current_execution_scope", default=None)
+current_run_approvals: ContextVar[FrozenSet[str]] = ContextVar("current_run_approvals", default=frozenset())
+
+
+def has_user_approval(
+    approvals: FrozenSet[str],
+    *,
+    tool_name: str,
+    action: str,
+    target_path: Optional[str] = None,
+) -> bool:
+    """R2-INT-FIX-03-BE: Verify explicit server-side user approval from AgentRunRequest.approvals.
+
+    Never trusts LLM-supplied tool arguments (e.g., confirm=True).
+    Accepted approval tokens:
+    - Exact path-scoped:  ``<tool_name>:<path>``, ``<action>:<path>``
+    - Tool-scoped:        ``<tool_name>``
+    - Action-scoped:      ``workspace:<action>``
+    - General write grant (NOT valid for irreversible delete): ``workspace:write_approved``
+    """
+    if not approvals:
+        return False
+    norm_path = (target_path or "").strip().lstrip("/")
+    candidates = {tool_name, f"workspace:{action}"}
+    if norm_path:
+        candidates.add(f"{tool_name}:{norm_path}")
+        candidates.add(f"{action}:{norm_path}")
+    if action != "delete":
+        candidates.add("workspace:write_approved")
+    return any(tok in approvals for tok in candidates)
 _FORBIDDEN_TOKEN_PLACEHOLDERS: FrozenSet[str] = frozenset(
     {
         "changeme",

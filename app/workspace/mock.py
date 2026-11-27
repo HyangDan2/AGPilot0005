@@ -55,10 +55,29 @@ class _Seq:
         return f"{prefix}_{next(self._counter):012x}"
 
 
+def is_production_env() -> bool:
+    """R2-INT-FIX-03-BE: Detect production mode from AGCORE_ENV or app.config.settings."""
+    import os
+
+    raw = os.environ.get("AGCORE_ENV")
+    if raw is not None:
+        return raw.strip().lower() == "production"
+    try:
+        from app.config import settings
+
+        return str(getattr(settings, "ENVIRONMENT", "development")).strip().lower() == "production"
+    except Exception:
+        return False
+
+
 class MockWorkspaceProvider:
-    """In-memory implementation of the shared provider interface."""
+    """In-memory implementation of the shared provider interface (development/test only)."""
 
     def __init__(self) -> None:
+        if is_production_env():
+            raise RuntimeError(
+                "MockWorkspaceProvider is restricted to development/test environments (AGCORE_ENV=production)."
+            )
         self._ids = _Seq()
         self._workspaces: Dict[str, WorkspaceIdentity] = {}
         self._files: Dict[str, Dict[str, object]] = {}
@@ -538,10 +557,22 @@ def default_mock_provider() -> MockWorkspaceProvider:
 
 
 def build_mock_router(provider: Optional[MockWorkspaceProvider] = None) -> APIRouter:
-    """REST subset of contract §3 backed by the mock provider (preview only)."""
+    """REST subset of contract §3 backed by the mock provider (preview only; blocked in production)."""
+    from fastapi import Depends
+
+    def _require_non_production() -> None:
+        if is_production_env():
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "mock_disabled_in_production",
+                    "message": "Workspace mock endpoints are disabled when AGCORE_ENV=production.",
+                    "retryable": False,
+                },
+            )
 
     mock = provider or default_mock_provider()
-    router = APIRouter(prefix="/_mock", tags=["workspace-mock"])
+    router = APIRouter(prefix="/_mock", tags=["workspace-mock"], dependencies=[Depends(_require_non_production)])
 
     @router.get("/workspaces")
     def list_workspaces() -> dict:

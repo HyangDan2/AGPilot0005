@@ -302,6 +302,7 @@ class AgentRunner:
                 execution_scope=caller_scope,
                 context_refs=refs,
                 workspace_id=workspace_id,
+                approvals=list(req.approvals or ()),
                 document_titles=titles,
                 messages=messages,
                 max_steps=min(opts.max_steps, get_runtime_config().max_agent_steps) if opts and opts.max_steps else get_runtime_config().max_agent_steps,

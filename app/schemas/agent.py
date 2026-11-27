@@ -1,6 +1,6 @@
 """Agent Execution REST API Request/Response Schemas."""
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class AgentRunOptions(BaseModel):
     reasoning_effort: Optional[Literal['off', 'on', 'low', 'medium', 'high', 'default']] = None
@@ -19,6 +19,21 @@ class AgentRunRequest(BaseModel):
     history: List[Dict[str, str]] = Field(default_factory=list, max_length=16)
     analysis_refs: List[str] = Field(default_factory=list, max_length=10)
     workspace_id: Optional[str] = None
+    approvals: List[str] = Field(default_factory=list, max_length=32)
+
+    @field_validator("approvals")
+    @classmethod
+    def _validate_approvals(cls, values: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        for raw in values or []:
+            if not isinstance(raw, str):
+                raise ValueError("approval token must be a string")
+            tok = raw.strip()
+            if not tok or len(tok) > 256 or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in tok):
+                raise ValueError("invalid approval token")
+            if tok not in cleaned:
+                cleaned.append(tok)
+        return cleaned
 
 class ToolExecutionTrace(BaseModel):
     step: int

@@ -14,6 +14,7 @@ class AgentState(BaseModel):
     execution_scope: Optional[Any] = None
     context_refs: List[str] = Field(default_factory=list)
     workspace_id: Optional[str] = None
+    approvals: List[str] = Field(default_factory=list)
     document_titles: Dict[str,str] = Field(default_factory=dict)
     citations: List[Dict[str,Any]] = Field(default_factory=list)
     

@@ -1040,8 +1040,8 @@ WORKSPACE_TOOL_NAMES: Tuple[str, ...] = READ_TOOLS + WRITE_TOOLS
 
 
 def install_workspace_tools(tool_registry: Any) -> List[str]:
-    """CP-03: Register all 11 Workspace Agent Tools into the AGCore ToolRegistry."""
-    from app.core.auth import current_execution_scope
+    """CP-03 & R2-INT-FIX-03-BE: Register all 11 Workspace Agent Tools with server-side approval enforcement."""
+    from app.core.auth import current_execution_scope, current_run_approvals, has_user_approval
     from app.workspace.runtime import get_runtime as _get_workspace_runtime
 
     installed: List[str] = []
@@ -1063,8 +1063,36 @@ def install_workspace_tools(tool_registry: Any) -> List[str]:
                         "message": "authenticated ExecutionScope is required for workspace tools",
                     }
                 rt = _get_workspace_runtime()
+                run_approvals = current_run_approvals.get()
+                safe_args = dict(kwargs)
+
+                # R2-INT-FIX-03-BE: Never trust LLM-supplied confirm / confirm_overwrite booleans!
+                # Strip them first and grant ONLY when verified in server-side AgentRunRequest.approvals.
+                if tname == "workspace_delete_file":
+                    safe_args["confirm"] = False
+                    target_path = safe_args.get("path")
+                    if not target_path and safe_args.get("file_id") and safe_args.get("workspace_id"):
+                        try:
+                            fid_meta = rt.manager.get_file_metadata(safe_args["workspace_id"], safe_args["file_id"], scope)
+                            target_path = relative_path_of(fid_meta)
+                        except Exception:
+                            target_path = safe_args.get("file_id")
+                    if has_user_approval(run_approvals, tool_name=tname, action="delete", target_path=target_path):
+                        safe_args["confirm"] = True
+                elif tname == "workspace_create_file":
+                    safe_args["confirm_overwrite"] = False
+                    target_path = safe_args.get("path")
+                    if has_user_approval(run_approvals, tool_name=tname, action="overwrite", target_path=target_path):
+                        safe_args["overwrite"] = True
+                        safe_args["confirm_overwrite"] = True
+                elif tname == "workspace_move_file":
+                    safe_args["confirm_overwrite"] = False
+                    target_path = safe_args.get("new_path")
+                    if has_user_approval(run_approvals, tool_name=tname, action="move_overwrite", target_path=target_path):
+                        safe_args["confirm_overwrite"] = True
+
                 ctx = ToolInvocationContext(scope=scope)
-                out = rt.tools.invoke(tname, kwargs, ctx)
+                out = rt.tools.invoke(tname, safe_args, ctx)
                 # CP-02 #7: Never report server-side tool success when local_browser requires client_write
                 inner = out.get("result") if isinstance(out, dict) else None
                 if isinstance(inner, dict) and inner.get("client_write") is not None:
@@ -1078,7 +1106,8 @@ def install_workspace_tools(tool_registry: Any) -> List[str]:
                         "client_write": inner.get("client_write"),
                     }
                 if isinstance(out, dict) and out.get("status") != "ok":
-                    return {"error": True, **out}
+                    err_code = (out.get("error") or {}).get("code") if isinstance(out.get("error"), dict) else None
+                    return {"error": True, "code": err_code or out.get("status"), **out}
                 return out
 
             _handler.__name__ = tname

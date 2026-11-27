@@ -800,3 +800,205 @@ async def test_r2_int_fix_02_beta_only_service_isolation(monkeypatch, tmp_path):
             assert fin["answer"] == f"{svc_name} 일반 대화 정상 응답"
             exposed = set(gw_plain.calls[0]["tools"])
             assert not any(t.startswith("workspace_") or t.startswith("canvas.") for t in exposed), f"{svc_name} leaked R2 tools: {exposed}"
+
+
+# ---------------------------------------------------------------------------
+# R2-INT-FIX-03-BE: Server-Side User Approval & Production Mock/Preview Block
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_r2_int_fix_03_server_side_approval_blocks_llm_confirm_and_allows_user_approval(monkeypatch, tmp_path):
+    ws_rt, _ = _setup_r2_env(monkeypatch, tmp_path, ScriptedGateway([]))
+    scope = _scope()
+    ws_dir = tmp_path / "allowed" / "approval-ws"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    ws = ws_rt.manager.open_folder(scope, str(ws_dir), name="approval-ws", root_id="rw_root")
+    ws_rt.manager.write_file(
+        ws.workspace_id,
+        scope,
+        WorkspaceWriteRequest(path="notes/protected.md", content="ORIGINAL CONTENT"),
+    )
+    disk_file = Path(ws.root.display_path) / "notes" / "protected.md"
+    hdr = _proxy_headers()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1) LLM passes overwrite=True & confirm_overwrite=True WITHOUT server-side AgentRunRequest.approvals -> BLOCKED!
+        gw_ow_denied = ScriptedGateway(
+            [
+                {
+                    "content": None,
+                    "tool_calls": [
+                        ToolCall(
+                            id="tc_ow_1",
+                            function=FunctionCall(
+                                name="workspace_create_file",
+                                arguments=json.dumps(
+                                    {
+                                        "workspace_id": ws.workspace_id,
+                                        "path": "notes/protected.md",
+                                        "content": "HIJACKED",
+                                        "overwrite": True,
+                                        "confirm_overwrite": True,
+                                    }
+                                ),
+                            ),
+                        )
+                    ],
+                },
+                {"content": "덮어쓰기 승인이 필요합니다."},
+            ]
+        )
+        monkeypatch.setattr("app.runtime.graph.gateway_for_service", lambda svc, c: gw_ow_denied)
+        r1 = await client.post(
+            "/api/v1/agent/runs",
+            json={"message": "덮어써줘", "workspace_id": ws.workspace_id, "stream": False},
+            headers=hdr,
+        )
+        assert r1.status_code == 202
+        await _wait_terminal(client, r1.json()["run_id"], hdr)
+        tool_msg1 = next(m for m in gw_ow_denied.calls[1]["messages"] if m.role == "tool")
+        assert json.loads(tool_msg1.content)["code"] == "approval_required"
+        assert disk_file.read_text(encoding="utf-8") == "ORIGINAL CONTENT"
+
+        # 2) LLM passes confirm=True on delete WITHOUT delete approval (even with write_approved!) -> BLOCKED!
+        gw_del_denied = ScriptedGateway(
+            [
+                {
+                    "content": None,
+                    "tool_calls": [
+                        ToolCall(
+                            id="tc_del_1",
+                            function=FunctionCall(
+                                name="workspace_delete_file",
+                                arguments=json.dumps(
+                                    {
+                                        "workspace_id": ws.workspace_id,
+                                        "path": "notes/protected.md",
+                                        "confirm": True,
+                                    }
+                                ),
+                            ),
+                        )
+                    ],
+                },
+                {"content": "삭제 승인이 필요합니다."},
+            ]
+        )
+        monkeypatch.setattr("app.runtime.graph.gateway_for_service", lambda svc, c: gw_del_denied)
+        r2 = await client.post(
+            "/api/v1/agent/runs",
+            json={
+                "message": "삭제해줘",
+                "workspace_id": ws.workspace_id,
+                "approvals": ["workspace:write_approved"],
+                "stream": False,
+            },
+            headers=hdr,
+        )
+        assert r2.status_code == 202
+        await _wait_terminal(client, r2.json()["run_id"], hdr)
+        tool_msg2 = next(m for m in gw_del_denied.calls[1]["messages"] if m.role == "tool")
+        assert json.loads(tool_msg2.content)["code"] == "approval_required"
+        assert disk_file.is_file()
+
+        # 3) Explicit server-side AgentRunRequest.approvals grants overwrite -> SUCCEEDS!
+        gw_ow_ok = ScriptedGateway(
+            [
+                {
+                    "content": None,
+                    "tool_calls": [
+                        ToolCall(
+                            id="tc_ow_2",
+                            function=FunctionCall(
+                                name="workspace_create_file",
+                                arguments=json.dumps(
+                                    {
+                                        "workspace_id": ws.workspace_id,
+                                        "path": "notes/protected.md",
+                                        "content": "APPROVED UPDATE",
+                                        "overwrite": True,
+                                    }
+                                ),
+                            ),
+                        )
+                    ],
+                },
+                {"content": "사용자 승인 후 덮어쓰기 완료."},
+            ]
+        )
+        monkeypatch.setattr("app.runtime.graph.gateway_for_service", lambda svc, c: gw_ow_ok)
+        r3 = await client.post(
+            "/api/v1/agent/runs",
+            json={
+                "message": "승인됨, 덮어써줘",
+                "workspace_id": ws.workspace_id,
+                "approvals": ["workspace_create_file:notes/protected.md"],
+                "stream": False,
+            },
+            headers=hdr,
+        )
+        assert r3.status_code == 202
+        await _wait_terminal(client, r3.json()["run_id"], hdr)
+        assert disk_file.read_text(encoding="utf-8") == "APPROVED UPDATE"
+
+        # 4) Explicit server-side AgentRunRequest.approvals grants delete -> SUCCEEDS!
+        gw_del_ok = ScriptedGateway(
+            [
+                {
+                    "content": None,
+                    "tool_calls": [
+                        ToolCall(
+                            id="tc_del_2",
+                            function=FunctionCall(
+                                name="workspace_delete_file",
+                                arguments=json.dumps(
+                                    {
+                                        "workspace_id": ws.workspace_id,
+                                        "path": "notes/protected.md",
+                                    }
+                                ),
+                            ),
+                        )
+                    ],
+                },
+                {"content": "사용자 승인 후 삭제 완료."},
+            ]
+        )
+        monkeypatch.setattr("app.runtime.graph.gateway_for_service", lambda svc, c: gw_del_ok)
+        r4 = await client.post(
+            "/api/v1/agent/runs",
+            json={
+                "message": "승인됨, 삭제해줘",
+                "workspace_id": ws.workspace_id,
+                "approvals": ["workspace_delete_file:notes/protected.md"],
+                "stream": False,
+            },
+            headers=hdr,
+        )
+        assert r4.status_code == 202
+        await _wait_terminal(client, r4.json()["run_id"], hdr)
+        tool_msg4 = next(m for m in gw_del_ok.calls[1]["messages"] if m.role == "tool")
+        assert json.loads(tool_msg4.content)["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_r2_int_fix_03_mock_and_preview_blocked_in_production(monkeypatch):
+    from app.workspace import preview_app
+    from app.workspace.mock import MockWorkspaceProvider
+
+    monkeypatch.setenv("AGCORE_ENV", "production")
+
+    with pytest.raises(RuntimeError, match="MockWorkspaceProvider"):
+        MockWorkspaceProvider()
+
+    with pytest.raises(RuntimeError, match="Workspace preview app"):
+        async with preview_app.lifespan(preview_app.app):
+            pass
+
+    async with AsyncClient(transport=ASGITransport(app=preview_app.app), base_url="http://test") as client:
+        r_health = await client.get("/health")
+        assert r_health.status_code == 403
+        assert r_health.json()["detail"]["code"] == "preview_disabled_in_production"
+
+        r_mock = await client.get("/_mock/workspaces")
+        assert r_mock.status_code == 403
+        assert r_mock.json()["detail"]["code"] == "preview_disabled_in_production"
