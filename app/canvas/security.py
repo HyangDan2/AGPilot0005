@@ -53,7 +53,7 @@ ALLOWED_ATTRS: Set[str] = {
 }
 
 SAFE_DATA_IMAGE = re.compile(r"^data:image/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$", re.IGNORECASE)
-SAFE_LINK = re.compile(r"^(https?://|mailto:|#|/)", re.IGNORECASE)
+SAFE_LINK = re.compile(r"^(https?://|mailto:|#|/(?!/))", re.IGNORECASE)
 
 PREVIEW_CSP = (
     "default-src 'none'; img-src data:; style-src 'none'; script-src 'none'; "
@@ -108,7 +108,9 @@ class _Sanitizer(HTMLParser):
                     self.blocked_urls.append(name)
                     continue
                 if name == "href":
-                    if not SAFE_LINK.match(candidate):
+                    # A backslash is normalised to "/" by browsers, so "\\\\evil.example" and
+                    # "\\/evil.example" would become a protocol-relative external link.
+                    if "\\" in candidate or not SAFE_LINK.match(candidate):
                         self.blocked_urls.append(name)
                         continue
                     cleaned.append(("href", candidate))
@@ -122,6 +124,10 @@ class _Sanitizer(HTMLParser):
     def handle_starttag(self, tag: str, attrs) -> None:
         tag = tag.lower()
         if self.skip_depth:
+            # Audit fidelity: even inside a dropped subtree, a nested active element is recorded
+            # (e.g. the <input> inside a dropped <form>) so warnings show everything removed.
+            if tag in DROP_WITH_CONTENT:
+                self._note_removed(tag)
             if tag == self.skip_tag:
                 self.skip_depth += 1
             return
