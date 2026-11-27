@@ -23,7 +23,13 @@ from typing import Any, Dict, List, Optional
 from app.canvas.config import CanvasSettings
 from app.canvas.errors import CanvasError, CanvasErrorCode
 from app.canvas.export import CompositeExportProvider, ExportResult
-from app.canvas.models import Artifact, ArtifactPage, PatchRequest, Revision
+from app.canvas.models import (
+    Artifact,
+    ArtifactPage,
+    PatchRequest,
+    Revision,
+    WorkspaceFileLink,
+)
 from app.canvas.security import sanitize_title, validate_identifier, reject_scope_override
 from app.canvas.storage import CanvasStorage, iso_now, new_artifact_id
 from app.canvas.types import ArtifactTypeRegistry
@@ -33,6 +39,7 @@ from app.canvas.workspace import (
     WorkspaceGateway,
     enforce_workspace_state,
     normalise_required,
+    read_workspace_file,
     write_workspace_file,
 )
 
@@ -130,6 +137,72 @@ def visible_artifact(
             operation=operation or "artifact",
         )
     return artifact
+
+
+#: Workspace file extension → Canvas artifact type used when a load does not name one (WO-C18-04).
+LOAD_ARTIFACT_TYPES: Dict[str, str] = {
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".txt": "plain_text",
+    ".text": "plain_text",
+    ".log": "plain_text",
+    ".csv": "plain_text",
+    ".html": "html",
+    ".htm": "html",
+    ".json": "structured_json",
+}
+
+#: Workspace file extension → language for a ``source_code`` artifact.
+LOAD_SOURCE_LANGUAGES: Dict[str, str] = {
+    ".py": "python",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".jsx": "jsx",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".c": "c",
+    ".cpp": "cpp",
+    ".cs": "csharp",
+    ".rb": "ruby",
+    ".php": "php",
+    ".swift": "swift",
+    ".sql": "sql",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".ps1": "powershell",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".css": "css",
+    ".scss": "scss",
+    ".xml": "xml",
+}
+
+
+def inferred_artifact_type(path: str, mime_type: Optional[str] = None) -> tuple[str, Optional[str]]:
+    """Artifact type (and language) inferred from a workspace file path.
+
+    Canvas edits text only; anything it cannot name becomes ``plain_text`` so the loaded buffer is
+    always editable instead of silently failing on an unknown extension.
+    """
+
+    suffix = ("." + path.rsplit(".", 1)[-1].lower()) if "." in path.rsplit("/", 1)[-1] else ""
+    if suffix in LOAD_SOURCE_LANGUAGES:
+        return "source_code", LOAD_SOURCE_LANGUAGES[suffix]
+    if suffix in LOAD_ARTIFACT_TYPES:
+        return LOAD_ARTIFACT_TYPES[suffix], None
+    mime = (mime_type or "").lower()
+    if mime.startswith("text/markdown"):
+        return "markdown", None
+    if "html" in mime:
+        return "html", None
+    if "json" in mime:
+        return "structured_json", None
+    return "plain_text", None
 
 
 def validate_structured_json(content: str) -> Dict[str, Any]:
@@ -496,6 +569,8 @@ class ArtifactManager:
         changes workspace content."""
         artifact = owned_artifact(self.storage, artifact_id, scope)
         if kind == "workspace":
+            # WO-C18-04: detaching also drops the save state; the workspace file itself is untouched.
+            self.storage.delete_workspace_link(artifact.artifact_id)
             return self.storage.set_links(artifact.artifact_id, workspace_id=None)
         if kind == "conversation":
             return self.storage.set_links(artifact.artifact_id, conversation_id=None)
@@ -598,6 +673,350 @@ class ArtifactManager:
             "export_warnings": exported.warnings,
             "content_metrics": _metrics(content),
             "workspace_access": access.model_dump(mode="json"),
+            "contract_revision": WORKSPACE_CONTRACT_REVISION,
+        }
+
+    # ------------------------------------------------------------------ workspace save / load (WO-C18-04)
+
+    def workspace_link(self, scope: Any, artifact_id: str) -> Dict[str, Any]:
+        """Current workspace save state of an artifact (``workspace_link: null`` when unlinked)."""
+
+        artifact = visible_artifact(
+            self.storage, artifact_id, scope, workspace=self.workspace,
+            required="read", operation="artifact.workspace_link",
+        )
+        link = self.storage.get_workspace_link(artifact.artifact_id)
+        return {
+            "artifact_id": artifact.artifact_id,
+            "workspace_id": artifact.workspace_id,
+            "workspace_link": link.model_dump(mode="json") if link else None,
+            "contract_revision": WORKSPACE_CONTRACT_REVISION,
+        }
+
+    def load_from_workspace(
+        self,
+        scope: Any,
+        *,
+        workspace_id: str,
+        path: Optional[str] = None,
+        workspace_file_id: Optional[str] = None,
+        title: Optional[str] = None,
+        artifact_type: Optional[str] = None,
+        language: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        revision: Optional[int] = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Open an **existing** workspace file as a Canvas editing session (WO-C18-04 load).
+
+        The workspace file stays the source of truth: Canvas records a :class:`WorkspaceFileLink`
+        (workspace file id, relative path, hash) and keeps only an edit buffer (its revisions).
+        Re-loading the same file reuses the same artifact instead of making a second copy; the
+        buffer is refreshed only when the Canvas side has no unsaved edits (or ``force`` is set).
+
+        ``write`` access is required: the session is workspace-linked (a revoked workspace hides it
+        immediately, C-FIX-02) and it is opened to be saved back. A read-only root is therefore
+        refused with ``403 read_only_workspace``.
+        """
+
+        workspace_id = validate_identifier(workspace_id, "workspace_id")
+        access = assert_workspace_level(
+            self.workspace, workspace_id, scope,
+            required="write", operation="artifact.load_from_workspace",
+        )
+        content = read_workspace_file(
+            self.workspace, scope, access,
+            workspace_file_id=workspace_file_id, path=path, revision=revision,
+        )
+        source = content.metadata
+        tenant_id, owner_id, service_id = scope_ids(scope)
+        existing = self.storage.find_workspace_link(
+            tenant_id=tenant_id, owner_id=owner_id, service_id=service_id,
+            workspace_id=workspace_id, relative_path=source.relative_path,
+        )
+        if existing is not None and self.storage.get_artifact(existing.artifact_id) is None:
+            self.storage.delete_workspace_link(existing.artifact_id)
+            existing = None
+
+        source_payload = {
+            "workspace_id": workspace_id,
+            "workspace_file_id": source.workspace_file_id,
+            "relative_path": source.relative_path,
+            "content_hash": content.content_hash,
+            "revision": content.revision,
+            "mime_type": source.mime_type,
+            "size_bytes": content.size_bytes,
+            "storage_provider": access.storage_provider,
+            "content_origin": source.content_origin,
+        }
+
+        if existing is not None:
+            owned_artifact(self.storage, existing.artifact_id, scope)  # scope isolation first
+            artifact, revision_row, buffer = self.storage.read_current(existing.artifact_id)
+            if buffer == content.text:
+                link = self.storage.upsert_workspace_link(
+                    self._link_update(
+                        existing, workspace_id=workspace_id, source=source,
+                        content_hash=content.content_hash, save_state=existing.save_state,
+                    )
+                )
+                return self._load_payload(
+                    artifact, revision_row, buffer, link, source_payload,
+                    reused=True, refreshed=False,
+                )
+            unsaved_edits = revision_row.content_hash != existing.last_saved_content_hash
+            if unsaved_edits and not force:
+                raise CanvasError(
+                    CanvasErrorCode.CONTENT_CONFLICT,
+                    "Canvas has edits that were not saved to the workspace file; nothing was overwritten",
+                    context={
+                        "artifact_id": artifact.artifact_id,
+                        "workspace_id": workspace_id,
+                        "path": source.relative_path,
+                        "canvas_content_hash": revision_row.content_hash,
+                        "workspace_content_hash": content.content_hash,
+                        "recovery": "save to workspace first, or reload with force=true to discard the edits",
+                    },
+                )
+            artifact, revision_row = self._replace_buffer(
+                scope, artifact.artifact_id, revision_row.revision, content.text,
+                change_reason=f"reloaded from workspace {source.relative_path}",
+            )
+            link = self.storage.upsert_workspace_link(
+                self._link_update(
+                    existing, workspace_id=workspace_id, source=source,
+                    content_hash=content.content_hash, save_state=existing.save_state,
+                )
+            )
+            return self._load_payload(
+                artifact, revision_row, content.text, link, source_payload,
+                reused=True, refreshed=True,
+            )
+
+        type_key = artifact_type
+        inferred_language = language
+        if type_key is None:
+            type_key, inferred_language = inferred_artifact_type(
+                source.relative_path, source.mime_type
+            )
+        created, revision_row, _duplicate, meta = self.create(
+            scope,
+            title=title or source.name or source.relative_path,
+            artifact_type=type_key,
+            content=content.text,
+            language=inferred_language,
+            conversation_id=conversation_id,
+            workspace_id=workspace_id,
+            creation_source="import",
+            change_reason=f"loaded from workspace {source.relative_path}",
+            actor="import",
+            actor_id=owner_id,
+        )
+        link = self.storage.upsert_workspace_link(
+            WorkspaceFileLink(
+                artifact_id=created.artifact_id,
+                workspace_id=workspace_id,
+                workspace_file_id=source.workspace_file_id,
+                relative_path=source.relative_path,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                service_id=service_id,
+                source_content_hash=content.content_hash,
+                last_saved_content_hash=content.content_hash,
+                last_saved_revision=None,
+                last_saved_at=None,
+                save_state="linked",
+                storage_provider=access.storage_provider,
+                content_origin=source.content_origin,
+                created_at=iso_now(),
+                updated_at=iso_now(),
+            )
+        )
+        payload = self._load_payload(
+            created, revision_row, content.text, link, source_payload,
+            reused=False, refreshed=False,
+        )
+        payload.update(meta)
+        return payload
+
+    def save_to_workspace(
+        self,
+        scope: Any,
+        artifact_id: str,
+        *,
+        workspace_id: Optional[str] = None,
+        path: Optional[str] = None,
+        revision: Optional[int] = None,
+        format: Optional[str] = None,
+        expected_content_hash: Optional[str] = None,
+        create_parents: bool = True,
+        overwrite: bool = True,
+        mime_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """*Save to Workspace* with link state (WO-C18-04 save semantics).
+
+        Reuses :meth:`export_to_workspace` byte-for-byte (same export provider, same write
+        contract), then records ``workspace_file_id`` / ``relative_path`` /
+        ``last_saved_content_hash``. A later save to the same file defaults
+        ``expected_content_hash`` to that hash, so a file changed by another agent or the user is
+        refused with ``409 content_conflict`` rather than overwritten.
+
+        A failed save changes nothing in Canvas: the revisions are read only here, so the user's
+        editing content survives every refusal.
+        """
+
+        artifact = owned_artifact(self.storage, artifact_id, scope)
+        link = self.storage.get_workspace_link(artifact.artifact_id)
+        target_workspace = (
+            validate_identifier(workspace_id, "workspace_id") if workspace_id else (link.workspace_id if link else None)
+        )
+        if not target_workspace:
+            raise CanvasError(
+                CanvasErrorCode.INVALID_REQUEST,
+                "workspace_id is required for the first save of an artifact",
+                context={"artifact_id": artifact.artifact_id},
+            )
+        same_target = link is not None and link.workspace_id == target_workspace
+        target_path = path if path is not None else (link.relative_path if same_target else None)
+        defaulted = False
+        if (
+            expected_content_hash is None
+            and same_target
+            and link.last_saved_content_hash
+            and (path is None or path == link.relative_path)
+            and overwrite
+        ):
+            # Optimistic concurrency: the hash Canvas last reconciled with is what it expects to
+            # find. This is what blocks a silent overwrite by another agent or the user.
+            expected_content_hash = link.last_saved_content_hash
+            defaulted = True
+
+        result = self.export_to_workspace(
+            scope,
+            artifact_id,
+            workspace_id=target_workspace,
+            path=target_path,
+            revision=revision,
+            format=format,
+            expected_content_hash=expected_content_hash,
+            create_parents=create_parents,
+            overwrite=overwrite,
+            mime_type=mime_type,
+        )
+
+        # A saved artifact is a workspace-linked artifact: the C-FIX-02 re-check must apply to it.
+        current_artifact = self.storage.get_artifact(artifact.artifact_id)
+        if current_artifact is not None and current_artifact.workspace_id != target_workspace:
+            self.link(scope, artifact.artifact_id, workspace_id=target_workspace)
+
+        client_write = result.get("client_write")
+        written_file = result.get("workspace_file") or {}
+        save_state = "client_write_pending" if client_write else "saved"
+        now = iso_now()
+        previous_hash = link.last_saved_content_hash if link else None
+        previous_revision = link.last_saved_revision if link else None
+        previous_saved_at = link.last_saved_at if link else None
+        stored = self.storage.upsert_workspace_link(
+            WorkspaceFileLink(
+                artifact_id=artifact.artifact_id,
+                workspace_id=target_workspace,
+                workspace_file_id=written_file.get("file_id") or (link.workspace_file_id if link else None),
+                relative_path=result["path"],
+                tenant_id=artifact.tenant_id,
+                owner_id=artifact.owner_id,
+                service_id=artifact.service_id,
+                source_content_hash=(link.source_content_hash if link else None),
+                # A client write is not confirmed by the server, so the previous hash stays in force.
+                last_saved_content_hash=previous_hash if client_write else result.get("content_hash"),
+                last_saved_revision=previous_revision if client_write else result["artifact_revision"],
+                last_saved_at=previous_saved_at if client_write else now,
+                save_state=save_state,
+                storage_provider=result["storage_provider"],
+                content_origin=result["content_origin"],
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return {
+            **result,
+            "save_state": stored.save_state,
+            "workspace_link": stored.model_dump(mode="json"),
+            "expected_content_hash_used": expected_content_hash,
+            "expected_content_hash_defaulted": defaulted,
+            "canvas_content_preserved": True,
+            "completion_contract": (
+                "unverified: r2-w/v1+a01 defines no client write completion report; the browser "
+                "must confirm the write and Canvas cannot verify it"
+                if client_write
+                else "server_write"
+            ),
+        }
+
+    def _link_update(
+        self,
+        link: WorkspaceFileLink,
+        *,
+        workspace_id: str,
+        source: Any,
+        content_hash: str,
+        save_state: str,
+    ) -> WorkspaceFileLink:
+        """Reload bookkeeping: the buffer now equals the workspace file, so the expected hash follows."""
+
+        return link.model_copy(
+            update={
+                "workspace_id": workspace_id,
+                "workspace_file_id": source.workspace_file_id,
+                "relative_path": source.relative_path,
+                "source_content_hash": content_hash,
+                "last_saved_content_hash": content_hash,
+                "save_state": save_state,
+                "storage_provider": source.storage_provider,
+                "content_origin": source.content_origin,
+                "updated_at": iso_now(),
+            }
+        )
+
+    def _replace_buffer(self, scope: Any, artifact_id: str, base_revision: int, text: str, *, change_reason: str):
+        """Append a revision holding the workspace file's content (the edit buffer is replaced)."""
+
+        artifact, revision, _computation = self.storage.apply_patch(
+            PatchRequest(
+                artifact_id=artifact_id,
+                base_revision=base_revision,
+                operation="replace_content",
+                replacement_text=text,
+                change_reason=change_reason,
+                actor="import",
+            ),
+            actor="import",
+            actor_id=scope_ids(scope)[1],
+        )
+        return artifact, revision
+
+    def _load_payload(
+        self,
+        artifact: Artifact,
+        revision: Revision,
+        content: str,
+        link: WorkspaceFileLink,
+        source: Dict[str, Any],
+        *,
+        reused: bool,
+        refreshed: bool,
+    ) -> Dict[str, Any]:
+        from app.canvas.offsets import content_metrics
+
+        return {
+            "artifact": artifact.model_dump(),
+            "revision": revision.model_dump(),
+            "content": content,
+            "content_metrics": content_metrics(content),
+            "reused": reused,
+            "refreshed": refreshed,
+            "source": source,
+            "workspace_link": link.model_dump(mode="json"),
+            "copy_semantics": "external_reference_with_edit_buffer",
             "contract_revision": WORKSPACE_CONTRACT_REVISION,
         }
 

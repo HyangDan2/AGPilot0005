@@ -41,6 +41,19 @@ The same access answer now also carries where the root lives and whether it is u
   no real path is ever reported, and a write is answered with a ``client_write`` directive for the
   browser to perform through its file handle.
 
+WO-C18 (``Omni Agent Canvas Architecture Amendment``)
+-----------------------------------------------------
+* ``read_file`` (plus ``get_file_metadata`` / ``list_workspace_files``) is now consumed for
+  "load from workspace": an existing workspace file is read through the provider and opened as a
+  Canvas editing session, with the workspace file recorded as the source of truth
+  (``WorkspaceFileLink``) instead of Canvas claiming a copy of it.
+* **Single contract switch point** — :func:`_resolve_contract_module` (:func:`contract_source`,
+  :func:`contract_switch_point`). When ``app/workspace/contracts.py`` is importable (that is, after
+  ``origin/feat/r2-workspace-rag`` = ``907482c`` is merged) :func:`validate_relative_path` delegates
+  to the contract's own path gate and the write request is built from the contract's model. Until
+  then the byte-identical mirror below is used, so **no code change is needed at integration
+time** — the switch happens by import availability, and the reported source says which one ran.
+
 Three providers exist:
 
 * ``RuntimeWorkspaceProvider`` — binds ``app/workspace/contracts.py::WorkspaceProvider`` as soon as
@@ -58,7 +71,7 @@ import base64
 import hashlib
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, Optional, Protocol, Sequence, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -69,6 +82,85 @@ WORKSPACE_CONTRACT_VERSION = "r2-w/v1"
 #: Additive revision Canvas understands on top of v1.
 WORKSPACE_CONTRACT_AMENDMENT = "A01"
 WORKSPACE_CONTRACT_REVISION = "r2-w/v1+a01"
+#: Workspace/RAG single source of truth (WO-C18-05) — recorded, never modified from this branch.
+WORKSPACE_CONTRACT_SSOT_REF = "origin/feat/r2-workspace-rag"
+WORKSPACE_CONTRACT_SSOT_SHA = "907482c"
+WORKSPACE_CONTRACT_MODULE = "app.workspace.contracts"
+#: Marker returned by :func:`contract_source` while the mirror below is the active implementation.
+WORKSPACE_CONTRACT_MIRROR = "canvas_mirror"
+
+#: What the mirror owns and what the contract owns once it is importable (WO-C18-05).
+CONTRACT_MIRROR_SURFACE = (
+    "validate_relative_path",
+    "WorkspaceWriteRequest",
+    "WorkspaceWriteResult",
+    "ClientWriteDirective",
+    "WorkspaceRootInfo",
+    "WorkspaceStorageProvider",
+    "WorkspaceLifecycleState",
+    "ContentOrigin",
+)
+
+_UNRESOLVED = object()
+_contract_module_cache: Any = _UNRESOLVED
+
+
+def _resolve_contract_module() -> Any:
+    """Return ``app.workspace.contracts`` when it is importable, else ``None``.
+
+    This is the **only** place Canvas decides which side of the shared contract it uses. The
+    module is resolved once per process (the package cannot change under a running process) and is
+    deliberately optional: this branch must build and test while ``app/workspace/**`` is absent.
+    """
+
+    global _contract_module_cache
+    if _contract_module_cache is _UNRESOLVED:
+        try:  # pragma: no cover - depends on the Workspace branch being merged
+            import importlib
+
+            _contract_module_cache = importlib.import_module(WORKSPACE_CONTRACT_MODULE)
+        except Exception:
+            _contract_module_cache = None
+    return _contract_module_cache
+
+
+def reset_contract_cache() -> None:
+    """Test hook: forget the resolved contract module so the switch can be observed again."""
+
+    global _contract_module_cache
+    _contract_module_cache = _UNRESOLVED
+
+
+def contract_source() -> str:
+    """``app.workspace.contracts`` when the Workspace branch is present, else ``canvas_mirror``."""
+
+    return WORKSPACE_CONTRACT_MODULE if _resolve_contract_module() is not None else WORKSPACE_CONTRACT_MIRROR
+
+
+def contract_switch_point() -> Dict[str, Any]:
+    """Integration switch point, reported by ``/capabilities`` and the handover (WO-C18-05)."""
+
+    module = _resolve_contract_module()
+    return {
+        "ssot": {
+            "repository": "AGPilot0005",
+            "ref": WORKSPACE_CONTRACT_SSOT_REF,
+            "sha": WORKSPACE_CONTRACT_SSOT_SHA,
+            "module": WORKSPACE_CONTRACT_MODULE,
+        },
+        "active_source": contract_source(),
+        "mirror_surface": list(CONTRACT_MIRROR_SURFACE),
+        "delegates_to_contract": module is not None,
+        "replace_at_integration": (
+            "nothing: the resolver prefers app.workspace.contracts and falls back to the mirror, "
+            "so merging the Workspace branch requires no Canvas code change"
+        ),
+        "fallback": (
+            "byte-identical mirror in app/canvas/workspace.py (validate_relative_path, write/read "
+            "result models) used only while the package is not importable"
+        ),
+        "verified_path_gate": "validate_relative_path (invalid_path 400)",
+    }
 
 """Permission ladder, lowest first. A higher level satisfies every lower requirement."""
 PERMISSION_LADDER = ("none", "read", "write", "admin")
@@ -237,13 +329,29 @@ _FORBIDDEN_SEGMENTS = {"", ".", ".."}
 
 
 def validate_relative_path(path: str, *, allow_empty: bool = False) -> str:
-    """Validate and normalize a workspace-relative path.
+    """Validate and normalize a workspace-relative path through the shared path gate.
 
-    This is a byte-for-byte mirror of ``app/workspace/contracts.py::validate_relative_path`` (the
-    contract's single path gate). Canvas keeps its own copy because ``app/workspace/**`` belongs to
-    the Workspace/RAG engineer and is not importable from this branch; the rules and the failure
-    code (``invalid_path``, 400) are identical, so a path the server accepts is a path Canvas
-    accepts and vice versa.
+    WO-C18-05 switch point: when ``app.workspace.contracts`` is importable the contract's own
+    ``validate_relative_path`` is used; otherwise this module's byte-identical mirror runs. Both
+    reject the same inputs and the failure is always ``invalid_path`` (400), so a path the server
+    accepts is a path Canvas accepts and vice versa, before and after the merge.
+    """
+
+    contract = _resolve_contract_module()
+    validator = getattr(contract, "validate_relative_path", None) if contract is not None else None
+    if callable(validator):  # pragma: no cover - only when the Workspace branch is merged
+        try:
+            return validator(path, allow_empty=allow_empty)
+        except Exception as exc:
+            raise _invalid_path(path, str(exc) or "rejected by the workspace contract") from exc
+    return _mirror_validate_relative_path(path, allow_empty=allow_empty)
+
+
+def _mirror_validate_relative_path(path: str, *, allow_empty: bool = False) -> str:
+    """Canvas-side mirror of ``app/workspace/contracts.py::validate_relative_path``.
+
+    Kept because ``app/workspace/**`` belongs to the Workspace/RAG engineer and is not importable
+    from this branch; the rules and the failure code (``invalid_path``, 400) are identical.
     """
 
     raw = path or ""
@@ -668,6 +776,251 @@ def _dump(value: Any) -> Any:
     return value
 
 
+# --------------------------------------------------------------------------- read contract (§2)
+
+
+class WorkspaceFileIdentity(BaseModel):
+    """Canvas-side view of the ``FileIdentity`` fields a load needs (contract §2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_file_id: str
+    workspace_id: str
+    relative_path: str
+    name: str = ""
+    mime_type: Optional[str] = None
+    content_hash: Optional[str] = None
+    revision: int = 0
+    size_bytes: int = 0
+    storage_provider: str = WorkspaceStorageProvider.SERVER_MANAGED.value
+    content_origin: str = ContentOrigin.EXTERNAL.value
+
+
+class WorkspaceFileContent(BaseModel):
+    """Normalised ``FileContent`` (contract §2 ``read_file``) for a Canvas load.
+
+    ``text`` is ``None`` when the provider handed bytes that are not valid UTF-8; Canvas then
+    refuses the load with ``415 unsupported_artifact_type`` instead of editing mojibake.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    metadata: WorkspaceFileIdentity
+    revision: int = 0
+    content_hash: str = ""
+    #: raw bytes (the contract's ``FileContent.bytes``; named differently because pydantic owns
+    #: the ``bytes`` attribute name on a model)
+    raw_bytes: Optional[bytes] = None
+    text: Optional[str] = None
+    size_bytes: int = 0
+
+
+def _provider_mismatch(access: WorkspaceAccess, operation: str, reason: str = "") -> CanvasError:
+    return CanvasError(
+        CanvasErrorCode.PROVIDER_MISMATCH,
+        reason or f"the workspace provider does not implement {operation}",
+        context={
+            "workspace_id": access.workspace_id,
+            "storage_provider": access.storage_provider,
+            "required_operation": operation,
+            "contract_revision": WORKSPACE_CONTRACT_REVISION,
+        },
+    )
+
+
+def normalise_file_identity(
+    value: Any, *, access: WorkspaceAccess, fallback_path: Optional[str] = None
+) -> WorkspaceFileIdentity:
+    """Read a provider ``FileIdentity`` (model, dict or object) into the Canvas view."""
+
+    provider = _field(value, "storage_provider", access.storage_provider)
+    provider = str(getattr(provider, "value", provider) or access.storage_provider)
+    origin = _field(value, "content_origin", None)
+    origin = str(getattr(origin, "value", origin) or ContentOrigin.EXTERNAL.value)
+    relative = _field(value, "relative_path", None)
+    raw_path = _field(value, "path", "") or ""
+    relative = str(relative or (raw_path.lstrip("/") if raw_path else fallback_path or ""))
+    name = str(_field(value, "name", "") or relative.rsplit("/", 1)[-1])
+    file_id = str(_field(value, "file_id", _field(value, "workspace_file_id", "")) or "")
+    if not file_id:  # a provider that addresses files by path only cannot be loaded
+        raise CanvasError(
+            CanvasErrorCode.PROVIDER_MISMATCH,
+            "the workspace provider did not return a file_id for the file",
+            context={
+                "workspace_id": access.workspace_id,
+                "relative_path": relative,
+                "contract_revision": WORKSPACE_CONTRACT_REVISION,
+            },
+        )
+    return WorkspaceFileIdentity(
+        workspace_file_id=file_id,
+        workspace_id=str(_field(value, "workspace_id", access.workspace_id) or access.workspace_id),
+        relative_path=validate_relative_path(relative) if relative else (fallback_path or ""),
+        name=name,
+        mime_type=_field(value, "mime_type", None),
+        content_hash=_field(value, "content_hash", None),
+        revision=int(_field(value, "revision", 0) or 0),
+        size_bytes=int(_field(value, "size_bytes", 0) or 0),
+        storage_provider=provider if provider in STORAGE_PROVIDERS else access.storage_provider,
+        content_origin=origin if origin in (ContentOrigin.BLOB.value, ContentOrigin.EXTERNAL.value) else ContentOrigin.EXTERNAL.value,
+    )
+
+
+def normalise_file_content(
+    result: Any, *, access: WorkspaceAccess, metadata: WorkspaceFileIdentity
+) -> WorkspaceFileContent:
+    """Read a provider ``FileContent`` into text, refusing anything Canvas cannot edit as text."""
+
+    identity = normalise_file_identity(
+        _field(result, "metadata", None) or metadata, access=access, fallback_path=metadata.relative_path
+    )
+    payload = _field(result, "bytes", None)
+    if payload is None:
+        payload = _field(result, "raw_bytes", None)
+    text = _field(result, "text", None)
+    if payload is None:
+        payload = str(text).encode("utf-8") if text is not None else b""
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    payload = bytes(payload)
+    if text is None:
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CanvasError(
+                CanvasErrorCode.UNSUPPORTED_ARTIFACT_TYPE,
+                "workspace file is not UTF-8 text; Canvas edits text artifacts only",
+                context={
+                    "workspace_id": access.workspace_id,
+                    "path": identity.relative_path,
+                    "mime_type": identity.mime_type,
+                    "encoding": "utf-8",
+                },
+            ) from exc
+    digest = _field(result, "content_hash", None) or identity.content_hash
+    if not digest:
+        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    return WorkspaceFileContent(
+        metadata=identity,
+        revision=int(_field(result, "revision", identity.revision) or 0),
+        content_hash=str(digest),
+        text=str(text),
+        size_bytes=len(payload) or len(str(text).encode("utf-8")),
+    )
+
+
+def read_workspace_file(
+    gateway: "WorkspaceGateway",
+    scope: Any,
+    access: WorkspaceAccess,
+    *,
+    workspace_file_id: Optional[str] = None,
+    path: Optional[str] = None,
+    revision: Optional[int] = None,
+) -> WorkspaceFileContent:
+    """Read one existing workspace file for a Canvas editing session (WO-C18-04 load).
+
+    Canvas never opens a workspace path itself: either the caller names a ``file_id`` or a
+    workspace-relative ``path``, which is resolved through ``list_workspace_files``. A
+    ``local_browser`` root has no server-side path access, so the read is refused with
+    ``400 provider_mismatch`` and ``client_read_required: true`` instead of guessing.
+    """
+
+    if access.is_local_browser:
+        raise CanvasError(
+            CanvasErrorCode.PROVIDER_MISMATCH,
+            "a browser-owned workspace has no server-side path access; the client must supply the file",
+            context={
+                "workspace_id": access.workspace_id,
+                "storage_provider": access.storage_provider,
+                "client_handle_id": access.client_handle_id,
+                "client_read_required": True,
+                "relative_path": path,
+                "contract_revision": WORKSPACE_CONTRACT_REVISION,
+            },
+        )
+    if not workspace_file_id and not (path or "").strip():
+        raise CanvasError(
+            CanvasErrorCode.INVALID_REQUEST,
+            "workspace_file_id or path is required to load a workspace file",
+            context={"workspace_id": access.workspace_id},
+        )
+    metadata = _workspace_file_metadata(
+        gateway, scope, access, workspace_file_id=workspace_file_id, path=path
+    )
+    reader = getattr(gateway, "read_file", None)
+    if not callable(reader):
+        raise _provider_mismatch(access, "read_file")
+    try:
+        result = reader(access.workspace_id, metadata.workspace_file_id, scope, revision)
+    except CanvasError:
+        raise
+    except TypeError as exc:
+        raise _provider_mismatch(
+            access, "read_file", f"workspace provider read_file is not compatible with the contract: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise translate_workspace_error(
+            exc, workspace_id=access.workspace_id, operation="read_file"
+        ) from exc
+    return normalise_file_content(result, access=access, metadata=metadata)
+
+
+def _workspace_file_metadata(
+    gateway: "WorkspaceGateway",
+    scope: Any,
+    access: WorkspaceAccess,
+    *,
+    workspace_file_id: Optional[str],
+    path: Optional[str],
+) -> WorkspaceFileIdentity:
+    """Resolve ``file_id`` or workspace-relative ``path`` to file metadata (contract §2)."""
+
+    if workspace_file_id:
+        getter = getattr(gateway, "get_file_metadata", None)
+        if not callable(getter):
+            raise _provider_mismatch(access, "get_file_metadata")
+        try:
+            found = getter(access.workspace_id, workspace_file_id, scope)
+        except CanvasError:
+            raise
+        except TypeError as exc:
+            raise _provider_mismatch(
+                access, "get_file_metadata", f"workspace provider get_file_metadata is not compatible: {exc}"
+            ) from exc
+        except Exception as exc:
+            raise translate_workspace_error(
+                exc, workspace_id=access.workspace_id, operation="get_file_metadata"
+            ) from exc
+        return normalise_file_identity(found, access=access)
+
+    target = validate_relative_path(path or "")
+    lister = getattr(gateway, "list_workspace_files", None)
+    if not callable(lister):
+        raise _provider_mismatch(access, "list_workspace_files")
+    try:
+        entries = lister(access.workspace_id, scope, None, True)
+    except CanvasError:
+        raise
+    except TypeError as exc:
+        raise _provider_mismatch(
+            access, "list_workspace_files", f"workspace provider list_workspace_files is not compatible: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise translate_workspace_error(
+            exc, workspace_id=access.workspace_id, operation="list_workspace_files"
+        ) from exc
+    for entry in entries or []:
+        identity = normalise_file_identity(entry, access=access, fallback_path=target)
+        if identity.relative_path.lstrip("/") == target:
+            return identity
+    raise CanvasError(
+        CanvasErrorCode.WORKSPACE_FILE_NOT_FOUND,
+        "no workspace file exists at this path",
+        context={"workspace_id": access.workspace_id, "path": target},
+    )
+
+
 # --------------------------------------------------------------------------- provider protocols
 
 
@@ -717,6 +1070,28 @@ class UnavailableWorkspaceProvider:
             self.reason,
             retryable=True,
             context={"workspace_id": workspace_id, "operation": "write_file"},
+        )
+
+    def get_file_metadata(self, workspace_id: str, file_id: str, scope: Any) -> Any:
+        raise CanvasError(
+            CanvasErrorCode.WORKSPACE_UNAVAILABLE, self.reason, retryable=True,
+            context={"workspace_id": workspace_id, "operation": "get_file_metadata"},
+        )
+
+    def list_workspace_files(
+        self, workspace_id: str, scope: Any, parent_id: Any = None, recursive: bool = False
+    ) -> Any:
+        raise CanvasError(
+            CanvasErrorCode.WORKSPACE_UNAVAILABLE, self.reason, retryable=True,
+            context={"workspace_id": workspace_id, "operation": "list_workspace_files"},
+        )
+
+    def read_file(
+        self, workspace_id: str, file_id: str, scope: Any, revision: Optional[int] = None
+    ) -> Any:
+        raise CanvasError(
+            CanvasErrorCode.WORKSPACE_UNAVAILABLE, self.reason, retryable=True,
+            context={"workspace_id": workspace_id, "operation": "read_file"},
         )
 
 
@@ -860,17 +1235,25 @@ class LocalDevWorkspaceProvider:
         if display_path is not None:
             record["display_path"] = display_path
 
-    def seed_file(self, workspace_id: str, path: str, content: str = "") -> Dict[str, Any]:
-        """Put a file in the dev root so a write can be tested against an existing hash."""
+    def seed_file(self, workspace_id: str, path: str, content: Union[str, bytes] = "", *, mime_type: str = "text/plain") -> Dict[str, Any]:
+        """Put a file in the dev root (or replace its content) so a load or a write can be tested.
+
+        The ``file_id`` is stable across replacements, exactly like the real engine: a file that is
+        edited outside Canvas keeps its identity while its hash and revision move.
+        """
 
         relative = validate_relative_path(path)
         record = self._ensure(workspace_id)
-        raw = content.encode("utf-8")
+        raw = content if isinstance(content, bytes) else str(content).encode("utf-8")
+        existing = record["files"].get(relative)
         entry = {
+            "file_id": (existing or {}).get("file_id") or f"wf_dev{uuid_suffix()}",
+            "name": relative.rsplit("/", 1)[-1],
             "content": raw,
             "content_hash": "sha256:" + hashlib.sha256(raw).hexdigest(),
-            "revision": 1,
-            "mime_type": "text/plain",
+            "revision": int(existing["revision"]) + 1 if existing else 1,
+            "mime_type": mime_type or (existing or {}).get("mime_type") or "text/plain",
+            "size_bytes": len(raw),
         }
         record["files"][relative] = entry
         return {"path": relative, **{key: value for key, value in entry.items() if key != "content"}}
@@ -889,6 +1272,95 @@ class LocalDevWorkspaceProvider:
             }
             for path, entry in record["files"].items()
         }
+
+    # -- read surface (WO-C18-04 load) -------------------------------------------
+
+    def _file_entry(self, workspace_id: str, file_id: str) -> Tuple[str, Dict[str, Any]]:
+        record = self._workspaces.get(workspace_id)
+        if record is not None:
+            for path, entry in record["files"].items():
+                if entry.get("file_id") == file_id:
+                    return path, entry
+        raise CanvasError(
+            CanvasErrorCode.WORKSPACE_FILE_NOT_FOUND,
+            "no workspace file has this id",
+            context={"workspace_id": workspace_id, "file_id": file_id},
+        )
+
+    def _identity(self, workspace_id: str, path: str, entry: Dict[str, Any], record: Dict[str, Any]) -> WorkspaceFileIdentity:
+        storage_provider = record["storage_provider"]
+        return WorkspaceFileIdentity(
+            workspace_file_id=str(entry["file_id"]),
+            workspace_id=workspace_id,
+            relative_path=path,
+            name=str(entry.get("name") or path.rsplit("/", 1)[-1]),
+            mime_type=entry.get("mime_type"),
+            content_hash=entry.get("content_hash"),
+            revision=int(entry.get("revision") or 0),
+            size_bytes=int(entry.get("size_bytes") or len(entry.get("content") or b"")),
+            storage_provider=storage_provider,
+            content_origin=(
+                ContentOrigin.BLOB.value
+                if storage_provider == WorkspaceStorageProvider.SERVER_MANAGED.value
+                else ContentOrigin.EXTERNAL.value
+            ),
+        )
+
+    def _readable(self, workspace_id: str, scope: Any) -> Dict[str, Any]:
+        access = self.check_access(workspace_id, scope)
+        if not access.exists or not access.can_read:
+            raise CanvasError(
+                CanvasErrorCode.WORKSPACE_ACCESS_DENIED,
+                "workspace read access denied",
+                context={
+                    "workspace_id": workspace_id,
+                    "level": access.level,
+                    "required_level": "read",
+                    "provider_mode": self.mode,
+                },
+            )
+        enforce_workspace_state(access, required="read", operation="dev.read_file")
+        return self._workspaces[workspace_id]
+
+    def get_file_metadata(self, workspace_id: str, file_id: str, scope: Any) -> WorkspaceFileIdentity:
+        record = self._readable(workspace_id, scope)
+        path, entry = self._file_entry(workspace_id, file_id)
+        return self._identity(workspace_id, path, entry, record)
+
+    def list_workspace_files(
+        self, workspace_id: str, scope: Any, parent_id: Any = None, recursive: bool = False
+    ) -> list:
+        record = self._readable(workspace_id, scope)
+        return [
+            self._identity(workspace_id, path, entry, record)
+            for path, entry in record["files"].items()
+        ]
+
+    def read_file(
+        self, workspace_id: str, file_id: str, scope: Any, revision: Optional[int] = None
+    ) -> WorkspaceFileContent:
+        record = self._readable(workspace_id, scope)
+        path, entry = self._file_entry(workspace_id, file_id)
+        if revision is not None and int(revision) != int(entry.get("revision") or 0):
+            raise CanvasError(
+                CanvasErrorCode.WORKSPACE_FILE_NOT_FOUND,
+                "the dev provider keeps only the current file revision",
+                context={"workspace_id": workspace_id, "path": path, "revision": revision},
+            )
+        raw = entry.get("content") or b""
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # Never invent replacement characters: Canvas is the one that refuses non-text files.
+            text = None
+        return WorkspaceFileContent(
+            metadata=self._identity(workspace_id, path, entry, record),
+            revision=int(entry.get("revision") or 0),
+            content_hash=str(entry.get("content_hash")),
+            raw_bytes=raw,
+            text=text,
+            size_bytes=len(raw),
+        )
 
     # -- contract surface ---------------------------------------------------------
 
@@ -1015,11 +1487,15 @@ class LocalDevWorkspaceProvider:
         digest = "sha256:" + hashlib.sha256(payload).hexdigest()
         revision = int(existing["revision"]) + 1 if existing else 1
         mime_type = _request_field(request, "mime_type", None) or "text/markdown"
+        file_id = (existing or {}).get("file_id") or f"wf_dev{uuid_suffix()}"
         files[relative] = {
+            "file_id": file_id,
+            "name": relative.rsplit("/", 1)[-1],
             "content": payload,
             "content_hash": digest,
             "revision": revision,
             "mime_type": mime_type,
+            "size_bytes": len(payload),
         }
         origin = (
             ContentOrigin.BLOB
@@ -1030,7 +1506,7 @@ class LocalDevWorkspaceProvider:
             workspace_id=workspace_id,
             path=relative,
             file={
-                "file_id": f"wf_dev{revision:04d}{len(files):04d}",
+                "file_id": file_id,
                 "workspace_id": workspace_id,
                 "name": relative.rsplit("/", 1)[-1],
                 "path": "/" + relative,
@@ -1169,6 +1645,46 @@ class RuntimeWorkspaceProvider:
                 exc, workspace_id=workspace_id, operation="write_file"
             ) from exc
 
+    # -- read surface (WO-C18-04 load) -------------------------------------------
+
+    def _read_call(self, operation: str, workspace_id: str, *args: Any) -> Any:
+        """Call one frozen v1 read operation, keeping its errors and refusing an absent one."""
+
+        method = getattr(self._provider, operation, None)
+        if not callable(method):
+            raise CanvasError(
+                CanvasErrorCode.PROVIDER_MISMATCH,
+                f"the bound workspace provider does not implement {operation}",
+                context={
+                    "workspace_id": workspace_id,
+                    "required_operation": operation,
+                    "contract_revision": WORKSPACE_CONTRACT_REVISION,
+                },
+            )
+        try:
+            return method(*args)
+        except CanvasError:
+            raise
+        except Exception as exc:
+            raise translate_workspace_error(
+                exc, workspace_id=workspace_id, operation=operation
+            ) from exc
+
+    def get_file_metadata(self, workspace_id: str, file_id: str, scope: Any) -> Any:
+        return self._read_call("get_file_metadata", workspace_id, workspace_id, file_id, scope)
+
+    def list_workspace_files(
+        self, workspace_id: str, scope: Any, parent_id: Any = None, recursive: bool = False
+    ) -> Any:
+        return self._read_call(
+            "list_workspace_files", workspace_id, workspace_id, scope, parent_id, bool(recursive)
+        )
+
+    def read_file(
+        self, workspace_id: str, file_id: str, scope: Any, revision: Optional[int] = None
+    ) -> Any:
+        return self._read_call("read_file", workspace_id, workspace_id, file_id, scope, revision)
+
 
 class _RuntimeProviderFactory:
     """Indirection so the Workspace owner can register its provider without Canvas importing it."""
@@ -1214,12 +1730,19 @@ def workspace_contract_report() -> Dict[str, Any]:
         "version": WORKSPACE_CONTRACT_VERSION,
         "amendment": WORKSPACE_CONTRACT_AMENDMENT,
         "revision": WORKSPACE_CONTRACT_REVISION,
+        "ssot": {
+            "repository": "AGPilot0005",
+            "ref": WORKSPACE_CONTRACT_SSOT_REF,
+            "sha": WORKSPACE_CONTRACT_SSOT_SHA,
+        },
+        "switch_point": contract_switch_point(),
         "v1_operations": [
             "check_workspace_access",
             "get_workspace",
             "register_artifact_reference",
             "list_artifact_references",
         ],
+        "read_operations": ["get_file_metadata", "list_workspace_files", "read_file"],
         "a01_operations": ["write_file"],
         "lifecycle_states": list(LIFECYCLE_STATES),
         "storage_providers": list(STORAGE_PROVIDERS),
@@ -1229,4 +1752,6 @@ def workspace_contract_report() -> Dict[str, Any]:
         },
         "path_gate": "validate_relative_path (invalid_path 400)",
         "export_to_workspace": "POST /api/v1/canvas/artifacts/{artifact_id}/export-to-workspace",
+        "save_to_workspace": "POST /api/v1/canvas/artifacts/{artifact_id}/save-to-workspace",
+        "load_from_workspace": "POST /api/v1/canvas/artifacts/from-workspace",
     }

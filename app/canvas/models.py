@@ -16,6 +16,7 @@ from app.canvas.offsets import OffsetUnit, Selection
 CreationSource = Literal["user", "ai", "import", "tool"]
 ActorType = Literal["user", "ai", "import", "system"]
 ProposalStatus = Literal["proposed", "applied", "rejected", "stale"]
+WorkspaceSaveState = Literal["linked", "saved", "client_write_pending"]
 PatchOperation = Literal[
     "replace_content",
     "replace_selection",
@@ -123,6 +124,38 @@ class EditProposal(BaseModel):
     request: Dict[str, Any] = Field(default_factory=dict)
     context_budget: Dict[str, Any] = Field(default_factory=dict)
     preview: Optional[Dict[str, Any]] = None
+
+
+class WorkspaceFileLink(BaseModel):
+    """Canvas ↔ workspace file link, i.e. the *Save to Workspace* state (WO-C18-04).
+
+    The workspace file is the source of truth. Canvas keeps an edit buffer (its revisions) plus this
+    row: which workspace file the buffer belongs to, and the hash the workspace file had the last
+    time Canvas read from / wrote to it. ``last_saved_content_hash`` is what the next save sends as
+    ``expected_content_hash``, so a file another agent (or the user) changed in the meantime is
+    refused with ``409 content_conflict`` instead of being silently overwritten.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str
+    workspace_id: str
+    workspace_file_id: Optional[str] = None
+    relative_path: str
+    tenant_id: str
+    owner_id: str
+    service_id: str
+    #: hash of the workspace file the current edit buffer was last synchronised from
+    source_content_hash: Optional[str] = None
+    #: hash of the workspace file Canvas last wrote (what the next save expects to find)
+    last_saved_content_hash: Optional[str] = None
+    last_saved_revision: Optional[int] = None
+    last_saved_at: Optional[str] = None
+    save_state: WorkspaceSaveState = "linked"
+    storage_provider: str = "server_managed"
+    content_origin: str = "external"
+    created_at: str
+    updated_at: str
 
 
 class ArtifactPage(BaseModel):

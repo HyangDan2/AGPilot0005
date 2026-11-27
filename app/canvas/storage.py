@@ -34,10 +34,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Protocol, Tuple, Union
 
 from app.canvas.errors import CanvasError, CanvasErrorCode
-from app.canvas.models import Artifact, EditProposal, PatchRequest, Revision
+from app.canvas.models import Artifact, EditProposal, PatchRequest, Revision, WorkspaceFileLink
 from app.canvas.patching import PatchComputation, compute_patch
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def iso_now(epoch: Optional[float] = None) -> str:
@@ -117,6 +117,22 @@ class CanvasStorage(Protocol):
     ) -> Tuple[EditProposal, Artifact, Revision, PatchComputation]: ...
 
     def count_pruned_revisions(self, artifact_id: str) -> int: ...
+
+    def get_workspace_link(self, artifact_id: str) -> Optional[WorkspaceFileLink]: ...
+
+    def find_workspace_link(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        service_id: str,
+        workspace_id: str,
+        relative_path: str,
+    ) -> Optional[WorkspaceFileLink]: ...
+
+    def upsert_workspace_link(self, link: WorkspaceFileLink) -> WorkspaceFileLink: ...
+
+    def delete_workspace_link(self, artifact_id: str) -> None: ...
 
     def list_pruned_revisions(self, artifact_id: str) -> List[Dict[str, Any]]: ...
 
@@ -278,6 +294,28 @@ class SqliteCanvasStorage:
                         reason TEXT NOT NULL,
                         PRIMARY KEY (artifact_id, revision)
                     );
+
+                    -- WO-C18-04 (schema v3): Canvas ↔ workspace file link / save state.
+                    CREATE TABLE IF NOT EXISTS canvas_workspace_links (
+                        artifact_id TEXT PRIMARY KEY,
+                        workspace_id TEXT NOT NULL,
+                        workspace_file_id TEXT,
+                        relative_path TEXT NOT NULL,
+                        tenant_id TEXT NOT NULL,
+                        owner_id TEXT NOT NULL,
+                        service_id TEXT NOT NULL,
+                        source_content_hash TEXT,
+                        last_saved_content_hash TEXT,
+                        last_saved_revision INTEGER,
+                        last_saved_at REAL,
+                        save_state TEXT NOT NULL,
+                        storage_provider TEXT NOT NULL,
+                        content_origin TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_canvas_workspace_links_target
+                        ON canvas_workspace_links(tenant_id, owner_id, service_id, workspace_id, relative_path);
                     """
                 )
                 conn.execute(
@@ -601,6 +639,7 @@ class SqliteCanvasStorage:
             conn.execute("DELETE FROM canvas_edit_proposals WHERE artifact_id=?", (artifact_id,))
             conn.execute("DELETE FROM canvas_revisions WHERE artifact_id=?", (artifact_id,))
             conn.execute("DELETE FROM canvas_events WHERE artifact_id=?", (artifact_id,))
+            conn.execute("DELETE FROM canvas_workspace_links WHERE artifact_id=?", (artifact_id,))
             conn.execute("DELETE FROM canvas_artifacts WHERE artifact_id=?", (artifact_id,))
 
     def set_links(self, artifact_id: str, *, workspace_id: Any = ..., conversation_id: Any = ...) -> Artifact:
@@ -858,6 +897,99 @@ class SqliteCanvasStorage:
             ]
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------ workspace file links
+
+    @staticmethod
+    def _row_to_workspace_link(row: sqlite3.Row) -> WorkspaceFileLink:
+        return WorkspaceFileLink(
+            artifact_id=row["artifact_id"],
+            workspace_id=row["workspace_id"],
+            workspace_file_id=row["workspace_file_id"],
+            relative_path=row["relative_path"],
+            tenant_id=row["tenant_id"],
+            owner_id=row["owner_id"],
+            service_id=row["service_id"],
+            source_content_hash=row["source_content_hash"],
+            last_saved_content_hash=row["last_saved_content_hash"],
+            last_saved_revision=row["last_saved_revision"],
+            last_saved_at=iso_now(row["last_saved_at"]) if row["last_saved_at"] is not None else None,
+            save_state=row["save_state"],
+            storage_provider=row["storage_provider"],
+            content_origin=row["content_origin"],
+            created_at=iso_now(row["created_at"]),
+            updated_at=iso_now(row["updated_at"]),
+        )
+
+    def get_workspace_link(self, artifact_id: str) -> Optional[WorkspaceFileLink]:
+        conn = self._connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM canvas_workspace_links WHERE artifact_id=?", (artifact_id,)
+            ).fetchone()
+            return self._row_to_workspace_link(row) if row else None
+        finally:
+            conn.close()
+
+    def find_workspace_link(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        service_id: str,
+        workspace_id: str,
+        relative_path: str,
+    ) -> Optional[WorkspaceFileLink]:
+        """The artifact already bound to this workspace file in this execution scope, if any."""
+
+        conn = self._connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM canvas_workspace_links WHERE tenant_id=? AND owner_id=? AND service_id=? "
+                "AND workspace_id=? AND relative_path=?",
+                (tenant_id, owner_id, service_id, workspace_id, relative_path),
+            ).fetchone()
+            return self._row_to_workspace_link(row) if row else None
+        finally:
+            conn.close()
+
+    def upsert_workspace_link(self, link: WorkspaceFileLink) -> WorkspaceFileLink:
+        """Insert or update the save state of one artifact (one row per artifact)."""
+
+        now = self._now()
+        saved_at = now if link.last_saved_at is not None else None
+        with self._tx() as conn:
+            conn.row_factory = sqlite3.Row
+            existing = conn.execute(
+                "SELECT * FROM canvas_workspace_links WHERE artifact_id=?", (link.artifact_id,)
+            ).fetchone()
+            created = existing["created_at"] if existing is not None else now
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO canvas_workspace_links (
+                    artifact_id, workspace_id, workspace_file_id, relative_path,
+                    tenant_id, owner_id, service_id, source_content_hash,
+                    last_saved_content_hash, last_saved_revision, last_saved_at,
+                    save_state, storage_provider, content_origin, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    link.artifact_id, link.workspace_id, link.workspace_file_id, link.relative_path,
+                    link.tenant_id, link.owner_id, link.service_id, link.source_content_hash,
+                    link.last_saved_content_hash, link.last_saved_revision, saved_at,
+                    link.save_state, link.storage_provider, link.content_origin, created, now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM canvas_workspace_links WHERE artifact_id=?", (link.artifact_id,)
+            ).fetchone()
+            return self._row_to_workspace_link(row)
+
+    def delete_workspace_link(self, artifact_id: str) -> None:
+        with self._tx() as conn:
+            conn.execute("DELETE FROM canvas_workspace_links WHERE artifact_id=?", (artifact_id,))
 
     def list_revisions(self, artifact_id: str, *, limit: int = 50, offset: int = 0) -> Tuple[List[Revision], int]:
         conn = self._connect()
