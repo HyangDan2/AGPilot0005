@@ -151,8 +151,80 @@ class DevScriptedEditAdapter:
         )
 
 
+def _strip_single_outer_fence(text: str, *, original_text: str = "") -> str:
+    """Unwrap a single outer ```...``` fence if the original document was not fenced."""
+    import re
+
+    stripped = text.strip()
+    if original_text.lstrip().startswith("```"):
+        return text
+    m = re.fullmatch(r"```[A-Za-z0-9_+-]*[ \t]*\r?\n(.*?)\r?\n```", stripped, flags=re.DOTALL)
+    if m:
+        return m.group(1)
+    return text
+
+
+def _parse_runtime_edit_output(
+    raw_text: str,
+    *,
+    artifact_type: str,
+    original_text: str = "",
+) -> tuple[str, Optional[str]]:
+    """R2-BETA-HOTFIX-04-BE: Extract pure revised content & optional summary from LLM edit output.
+
+    1. Prefer strict JSON object ``{"content": "...", "summary": "..."}`` (direct or inside ```json```).
+    2. Fallback: if output contains a single fenced block (e.g. ```markdown ... ```) surrounded by
+       conversational preamble / trailing notes, extract only the inner fenced body (unless the
+       original text itself starts with a fence).
+    3. Otherwise return stripped text as-is.
+    """
+    import json
+    import re
+
+    text = (raw_text or "").strip()
+    if not text:
+        return "", None
+
+    # 1a. Direct JSON object
+    candidates: List[str] = [text]
+    # 1b. JSON inside ```json ... ``` fence
+    for jm in re.finditer(r"```(?:json)?[ \t]*\r?\n(\{.*?\})\r?\n```", text, flags=re.DOTALL | re.IGNORECASE):
+        candidates.append(jm.group(1).strip())
+    # 1c. Outermost {...} block if preamble/postamble wraps JSON
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidates.append(text[first_brace : last_brace + 1].strip())
+
+    for cand in candidates:
+        if not cand.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
+            clean_content = _strip_single_outer_fence(parsed["content"], original_text=original_text)
+            raw_summary = parsed.get("summary")
+            summary = raw_summary.strip() if isinstance(raw_summary, str) and raw_summary.strip() else None
+            return clean_content, summary
+
+    # 2. Single fenced block with optional conversational preamble / trailing explanation
+    if not original_text.lstrip().startswith("```"):
+        fenced_blocks = re.findall(
+            r"(?:^|\n)```[A-Za-z0-9_+-]*[ \t]*\r?\n(.*?)\r?\n```[ \t]*(?:\n|$)",
+            text,
+            flags=re.DOTALL,
+        )
+        if len(fenced_blocks) == 1:
+            return fenced_blocks[0], None
+
+    # 3. Plain text (or intentional multi-fence document)
+    return _strip_single_outer_fence(text, original_text=original_text), None
+
+
 class RuntimeEditAdapter:
-    """R2-BETA-HOTFIX-03: AI Gateway-backed edit adapter using R1.3 gateway_for_service."""
+    """R2-BETA-HOTFIX-03 / 04: AI Gateway-backed edit adapter with strict JSON output sanitation."""
 
     mode = "runtime"
 
@@ -162,8 +234,11 @@ class RuntimeEditAdapter:
 
         sys_prompt = (
             "You are a precise document and code editor. "
-            "Apply the user's editing instruction to the provided target text and return ONLY the revised replacement text. "
-            "Do not include explanations, preambles, or surrounding code fences unless they are part of the content itself."
+            "Apply the user's editing instruction to the provided target text and respond ONLY with a valid JSON object "
+            'matching this exact schema: {"content": "<revised text only>", "summary": "<one-line summary of changes>"}. '
+            "Rules: Put ONLY the revised target text inside `content`. "
+            "NEVER wrap `content` in outer markdown code fences (```), and NEVER include conversational preambles, "
+            "explanations, or '수정 내역' notes inside `content`."
         )
         parts = [
             f"Artifact type: {envelope.artifact_type}" + (f" ({envelope.language})" if envelope.language else ""),
@@ -234,7 +309,12 @@ class RuntimeEditAdapter:
         else:
             content = str(raw) if raw is not None else ""
 
-        if not isinstance(content, str) or not content.strip():
+        clean_content, summary = _parse_runtime_edit_output(
+            content if isinstance(content, str) else "",
+            artifact_type=envelope.artifact_type,
+            original_text=envelope.selected_text,
+        )
+        if not clean_content.strip():
             raise CanvasError(
                 CanvasErrorCode.AI_ADAPTER_UNAVAILABLE,
                 "AI Gateway returned an empty edit proposal",
@@ -242,13 +322,16 @@ class RuntimeEditAdapter:
                 context={"adapter": self.mode, "reason": "empty_response", "service_id": service_id},
             )
 
+        notes = ["generated via AI Gateway runtime edit adapter"]
+        if summary:
+            notes.append(summary)
         return EditProposalDraft(
-            replacement_text=content,
+            replacement_text=clean_content,
             operation=envelope.operation,
-            change_reason=f"AI edit: {envelope.instruction[:120]}",
+            change_reason=summary or f"AI edit: {envelope.instruction[:120]}",
             adapter=self.mode,
             model_label=model_label,
-            notes=["generated via AI Gateway runtime edit adapter"],
+            notes=notes,
         )
 
     def propose(self, envelope: EditEnvelope, *, request: Dict[str, Any]) -> EditProposalDraft:

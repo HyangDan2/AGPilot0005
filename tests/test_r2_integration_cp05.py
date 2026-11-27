@@ -1125,3 +1125,84 @@ async def test_r2_beta_hotfix_03_canvas_runtime_edit_adapter_gateway_propose_dif
         )
         assert rf.status_code == 503, rf.text
         assert rf.json()["detail"]["code"] == "ai_adapter_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# R2-BETA-HOTFIX-04-BE: Canvas AI Edit Output Sanitization & Capabilities Verified
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_r2_beta_hotfix_04_edit_output_sanitization_and_capabilities_verified(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGCORE_CANVAS_AI_ADAPTER", "runtime")
+    _setup_r2_env(monkeypatch, tmp_path, ScriptedGateway([]))
+    hdr = _proxy_headers("alice", "tenant-a", "hd2ai-beta")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # (c) /capabilities reports ai_integration_verified=True & edit_adapter_mode="runtime"
+        caps = await client.get("/api/v1/canvas/capabilities", headers=hdr)
+        assert caps.status_code == 200, caps.text
+        ai_edit = caps.json()["ai_edit"]
+        assert ai_edit["adapter"] == "runtime"
+        assert ai_edit["edit_adapter_mode"] == "runtime"
+        assert ai_edit["ai_integration_verified"] is True
+        assert ai_edit["dev_preview"] is False
+
+        rc = await client.post(
+            "/api/v1/canvas/artifacts",
+            json={
+                "title": "안내 편지",
+                "artifact_type": "markdown",
+                "content": "# 안내\n초안 내용입니다.\n",
+            },
+            headers=hdr,
+        )
+        assert rc.status_code == 201
+        aid = rc.json()["artifact"]["artifact_id"]
+
+        # (a) Strict JSON response -> separates content and summary cleanly
+        gw_json = ScriptedGateway(
+            [
+                {
+                    "content": json.dumps(
+                        {
+                            "content": "# 정중한 안내\n정중하게 다듬어진 본문입니다.",
+                            "summary": "문체를 정중하고 간결하게 개선했습니다.",
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+            ]
+        )
+        monkeypatch.setattr("app.gateway.client.gateway_for_service", lambda svc, c: gw_json)
+        rp1 = await client.post(
+            f"/api/v1/canvas/artifacts/{aid}/edit-proposals",
+            json={"instruction": "문체 다듬기", "instruction_kind": "change_style"},
+            headers=hdr,
+        )
+        assert rp1.status_code == 201, rp1.text
+        p1 = rp1.json()["proposal"]
+        assert p1["replacement_text"] == "# 정중한 안내\n정중하게 다듬어진 본문입니다."
+        assert p1["change_reason"] == "문체를 정중하고 간결하게 개선했습니다."
+
+        # (b) Preamble + ```markdown ... ``` + trailing '수정 내역:' commentary -> extracts pure body only!
+        noisy_reply = (
+            "전통적인 서신 형식을 살려 문체를 다듬었습니다.\n\n"
+            "```markdown\n"
+            "# 따뜻한 안내\n"
+            "봄바람과 함께 안부를 전합니다.\n"
+            "```\n\n"
+            "수정 내역:\n"
+            "- 인사말을 부드럽게 변경했습니다.\n"
+        )
+        gw_noisy = ScriptedGateway([{"content": noisy_reply}])
+        monkeypatch.setattr("app.gateway.client.gateway_for_service", lambda svc, c: gw_noisy)
+        rp2 = await client.post(
+            f"/api/v1/canvas/artifacts/{aid}/edit-proposals",
+            json={"instruction": "따뜻하게 다듬어줘", "instruction_kind": "change_style"},
+            headers=hdr,
+        )
+        assert rp2.status_code == 201, rp2.text
+        p2 = rp2.json()["proposal"]
+        assert p2["replacement_text"] == "# 따뜻한 안내\n봄바람과 함께 안부를 전합니다."
+        assert "```" not in p2["replacement_text"]
+        assert "수정 내역" not in p2["replacement_text"]
+        assert "전통적인 서신" not in p2["replacement_text"]

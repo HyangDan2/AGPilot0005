@@ -117,9 +117,14 @@ class CanvasService:
             },
             "ai_edit": {
                 "adapter": getattr(self.edit_adapter, "mode", "unknown"),
-                "ai_integration_verified": False,
-                "dev_preview": self.dev_preview,
-                "note": "No real LLM call is made in R2 backend work; R1.3 runtime integration is pending.",
+                "edit_adapter_mode": getattr(self.edit_adapter, "mode", "unknown"),
+                "ai_integration_verified": getattr(self.edit_adapter, "mode", "unknown") == "runtime",
+                "dev_preview": self.dev_preview and getattr(self.edit_adapter, "mode", "unknown") != "runtime",
+                "note": (
+                    "Connected to R1.3 AI Gateway runtime edit adapter."
+                    if getattr(self.edit_adapter, "mode", "unknown") == "runtime"
+                    else "Development edit adapter active (non-production preview)."
+                ),
             },
             "approval": approval_policy(),
             "omni": omni_integration_report(),
