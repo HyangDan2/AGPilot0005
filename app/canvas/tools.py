@@ -15,8 +15,9 @@ Every handler:
   dispatcher records a failed trace instead of a fake success,
 * never executes generated code and never opens a terminal.
 
-Exposure is unchanged until an operator adds these names to a tool profile
-(``app/tools/policy.py``), so registering them does not alter today's runtime behaviour.
+Registration is opt-in (``AGCORE_CANVAS_TOOLS_ENABLED=1/true/yes/on``), so importing the
+registry never changes today's runtime surface. Exposure additionally requires an operator to add
+these names to a tool profile (``app/tools/policy.py``); no shipped profile lists them.
 """
 from __future__ import annotations
 
@@ -460,8 +461,8 @@ def manifest() -> Dict[str, Any]:
             "tenant_owner_service_fields": "not accepted in any tool schema",
         },
         "integration": {
-            "runtime_tool_calling": "not connected in R2 (R1.3 integration stage)",
+            "runtime_tool_calling": "not connected in R2 (R1.3 integration stage; registration requires AGCORE_CANVAS_TOOLS_ENABLED)",
             "verification": "dev API / adapter only; no real LLM call was made",
-            "exposure": "tools are registered but no tool profile lists them until an operator opts in",
+            "exposure": "registered only when AGCORE_CANVAS_TOOLS_ENABLED is on; no shipped tool profile lists them",
         },
     }

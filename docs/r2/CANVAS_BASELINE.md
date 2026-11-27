@@ -130,7 +130,7 @@ Isolation is `tenant_id` + `owner_id` + `service_id`, all taken from the `Execut
 A foreign or unknown artifact id returns `404 artifact_not_found` — never `403` — so artifact
 existence is not disclosed.
 
-Endpoint surface (final shape is frozen by `docs/r2/CANVAS_API_CONTRACT.md` in CP-05):
+Endpoint surface (final shape is frozen by `docs/r2/CANVAS_BACKEND_HANDOVER.md` §5 after CP-05):
 
 ```
 GET    /canvas/capabilities
