@@ -321,6 +321,10 @@ the existing chat path keeps 100% of its behaviour. With a selection the request
 (keyword/vector/hybrid, index key, degradation reasons), and `context_policy.file_contents_included=false`.
 No file body is inserted; content is only fetched by a tool call the model makes.
 
+`POST /workspaces/{id}/agent/turn` builds the same scope for the turn (capability derived from the
+workspace read-only flag, budget bounded by `AGCORE_CONTEXT_BUDGET_TOKENS`) and returns it as
+`workspace_context` next to the answer, so the chat can show exactly what scope the tools ran with.
+
 ### 11c.4 Agent loop and intent routing (no fixed RAG pipeline)
 
 | Request | Intent | Tools actually used |

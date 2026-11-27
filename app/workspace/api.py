@@ -678,15 +678,27 @@ def agent_turn(
     """Agentic Execution Preview Adapter: one turn with real workspace tools."""
 
     from app.workspace.agent import AgentTurnRequest
+    from app.workspace.chat import WorkspaceChatSelection, build_workspace_chat_context
 
     request = AgentTurnRequest.model_validate(body)
+    selection = WorkspaceChatSelection(
+        workspace_id=workspace_id,
+        context_budget_tokens=request.context_budget_tokens,
+        granted_capabilities=request.capability,
+    )
+    scope_context = build_workspace_chat_context(
+        runtime.manager, runtime.retriever, workspace_id, scope, selection=selection, settings=runtime.settings
+    )
     response = _agent(runtime).run(
         workspace_id,
         scope,
         request.message,
         conversation_id=request.conversation_id,
-        capability=request.capability,
-        context_budget=request.context_budget_tokens,
+        capability=request.capability or scope_context.granted_capabilities,
+        context_budget=scope_context.granted_capabilities.get("context_budget_tokens"),
         approvals=request.approvals,
     )
-    return response.model_dump(mode="json")
+    payload = response.model_dump(mode="json")
+    # The same seven-field scope a chat request receives, so the client can render "what the model saw".
+    payload["workspace_context"] = scope_context.model_dump(mode="json")
+    return payload

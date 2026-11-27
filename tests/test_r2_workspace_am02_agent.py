@@ -464,5 +464,9 @@ def test_preview_api_exposes_chat_context_and_agent_turn(tmp_path):
         assert payload["llm"]["mock"] is True
         assert payload["tool_calls"][0]["tool"] == "workspace_list_files"
         assert payload["conversation_id"] == "api-conv"
+        scope_block = payload["workspace_context"]
+        assert scope_block["workspace_id"] == workspace_id
+        assert scope_block["context_policy"]["file_contents_included"] is False
+        assert scope_block["granted_capabilities"]["context_budget_tokens"] >= 64
     finally:
         set_runtime(None)
