@@ -1,4 +1,4 @@
-# AGCore R2 — Canvas Backend Handover (CP-06 / WO-C15 · WO-C16 · WO-C17)
+# AGCore R2 — Canvas Backend Handover (CP-06 / WO-C15 · WO-C16 · WO-C17 · R2-W Amendment 01)
 
 Recorded 2026-11-27 (KST) by the Canvas Engineer (피클 / 향단이), branch `feat/r2-canvas`.
 Status: **backend complete and locally verified, not merged, not deployed, no production change.**
@@ -6,6 +6,11 @@ WO-C17 (Canvas Backend Correction, `C-FIX-01` … `C-FIX-07`) is applied on top:
 off by default, workspace write/read authority is separated and re-checked on every path, proposal
 apply is one transaction, the revision cap prunes instead of blocking, and applying a proposal
 requires a verified user approval (§16).
+**R2-W Amendment 01 (`r2-w/v1+a01`, folder-based workspace)** is consumed on top of that (§17):
+workspace lifecycle (`open`/`closed`/`deleted`), read-only roots, the three storage providers
+including `local_browser`, and "export to workspace" through the shared
+`PUT /workspaces/{id}/file` write contract. v1 behaviour is unchanged and the frozen v1 surface
+keeps its meaning.
 `main` was not touched, no pull request was opened, and no operating AGCore store, `Server-HQ`
 configuration or gateway was modified.
 
@@ -39,6 +44,8 @@ Companion documents:
 | `136ac0f` | WO-C17 / C-FIX-01·02 | Workspace write-vs-read authority, live access re-check on every artifact path, list filtering for revoked artifacts |
 | `db551a3` | WO-C17 / C-FIX-03·04·06 | Atomic proposal apply (one `BEGIN IMMEDIATE`), revision retention by pruning, user-approval gate for apply |
 | `f383aff` | WO-C17 tests | `tests/test_r2_canvas_correction.py` (18) plus the corrected existing Canvas expectations |
+| `769d6e8` | R2-W Amendment 01 | `r2-w/v1+a01` consumer: lifecycle/read-only/storage-provider, export-to-workspace, contract error bridge (§17) |
+| `7315d73` | R2-W Amendment 01 tests | `tests/test_r2_canvas_workspace_a01.py` (27) |
 
 Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover: `git ls-remote origin feat/r2-canvas`). The first push attempt returned HTTP 403 from the GitHub App write path and the immediate retry succeeded; if the connection stops accepting writes, the operator must transfer the branch — never force-push or merge `main`. No pull request was opened and `main` remains at `0d2047f`.
 
@@ -53,7 +60,7 @@ Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover:
 | `__init__.py` | Public exports of the package | 21 |
 | `config.py` | `AGCORE_CANVAS_*` settings resolved at call time; feature flag + separate dev-preview gate; production downgrade of dev adapters; retention window | 178 |
 | `approval.py` | User-approval contract for `apply` (`UserApproval`, role rules, `require_user_approval`, policy report) | 129 |
-| `errors.py` | `CanvasError` + `CanvasErrorCode` → HTTP status map; R2-W-compatible envelope | 88 |
+| `errors.py` | `CanvasError` + `CanvasErrorCode` → HTTP status map; R2-W-compatible envelope; Amendment 01 / contract error codes (§17.4) | 121 |
 | `types.py` | Extensible artifact type registry (5 enabled, 4 reserved), language → extension map | 227 |
 | `models.py` | Pydantic domain models: `Artifact`, `Revision`, `PatchRequest`, `PatchOutcome`, `EditProposal`, pages (page reports workspace exclusions) | 148 |
 | `offsets.py` | UTF-16 ↔ code-point offset contract, surrogate-split rejection, content metrics | 137 |
@@ -69,13 +76,13 @@ Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover:
 | `tools.py` | Eight-tool manifest, handlers, AI-exposed subset (withholds `apply_edit`), `install_canvas_tools()` | 506 |
 | `service.py` | `CanvasService` singleton wiring storage/types/workspace/exporter/adapter/managers; feature gate; isolation report | 155 |
 | `schemas.py` | Re-exported event-type constants | 16 |
-| `workspace.py` | `WorkspaceGateway` protocol, providers, `WorkspaceAccess` with read/write levels, dev `set_level` | 316 |
+| `workspace.py` | `WorkspaceGateway` protocol, providers, `WorkspaceAccess` with read/write levels, dev `set_level`; Amendment 01: storage provider / lifecycle / read-only, path gate, write contract, contract error bridge, export (§17) | 1232 |
 
 ### 2.2 API and tests
 
 | File | Content |
 | --- | --- |
-| `app/api/canvas.py` | `/api/v1/canvas` router (24 endpoints), feature-flag gate, approval body on apply, request models with `extra="forbid"`, structured errors (540 LOC) |
+| `app/api/canvas.py` | `/api/v1/canvas` router (25 endpoints, incl. `export-to-workspace`), feature-flag gate, approval body on apply, request models with `extra="forbid"`, structured errors (589 LOC) |
 | `tests/conftest.py` | `canvas` / `configured` fixtures (throw-away data dir + service reset) — new file, 36 LOC |
 | `tests/r2_canvas_support.py` | Scope/header/client helpers, `configure()` (feature flag + dev preview on) (77 LOC) |
 | `tests/test_r2_canvas_foundation.py` | CP-01: types, manager, persistence, restart recovery, limits (11 tests) |
@@ -83,6 +90,7 @@ Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover:
 | `tests/test_r2_canvas_ai.py` | CP-03: generation stream, edit proposals, tools, opt-in registration (17 tests) |
 | `tests/test_r2_canvas_export_security.py` | CP-05: export formats, filename/header hardening, sanitizer, isolation, limits (10 tests) |
 | `tests/test_r2_canvas_correction.py` | WO-C17: C-FIX-01…06 verification (18 tests) |
+| `tests/test_r2_canvas_workspace_a01.py` | R2-W Amendment 01: lifecycle, read-only, export-to-workspace, error bridge (27 tests) |
 
 ### 2.3 Shared files touched (merge targets, see §14)
 
@@ -246,6 +254,7 @@ frozen R2 contract referenced by `CANVAS_BASELINE.md` §4.
 | DELETE | `/artifacts/{artifact_id}/links/{kind}` | unlink `workspace` or `conversation` |
 | GET | `/artifacts/{artifact_id}/export` | export current/selected revision (`format`, `revision`) |
 | GET | `/artifacts/{artifact_id}/preview` | sanitized preview payload + policy |
+| POST | `/artifacts/{artifact_id}/export-to-workspace` | write the artifact (or `revision`) into a workspace root through the Amendment 01 write contract; `local_browser` answers `client_write` (§17.3) |
 | POST | `/artifacts/{artifact_id}/edit-proposals` | AI edit proposal (dev adapter) (201) |
 | GET | `/artifacts/{artifact_id}/edit-proposals` | list proposals (`status`, paging) |
 | GET | `/edit-proposals/{proposal_id}` | one proposal (+ `is_stale`) |
@@ -284,6 +293,18 @@ frozen R2 contract referenced by `CANVAS_BASELINE.md` §4.
 | `proposal_rejected` | 409 | apply of a rejected proposal (WO-C17) |
 | `user_approval_required` | 403 | apply without a verified user approval (WO-C17 / C-FIX-06) |
 | `canvas_disabled` | 503 | `AGCORE_CANVAS_ENABLED` is off, so the whole router is gated (WO-C17 / C-FIX-05) |
+| `workspace_closed` | 409 | workspace lifecycle is `closed`; reopen it first (Amendment 01) |
+| `read_only_workspace` | 403 | the workspace root was opened read-only, so no write (Amendment 01) |
+| `path_outside_allowed_root` | 403 | path is not inside a declared allowed root (Amendment 01, passed through) |
+| `symlink_escape` | 400 | a symlink component would escape the root (Amendment 01, passed through) |
+| `root_unavailable` | 409 | the root folder is missing or unreadable (Amendment 01, passed through) |
+| `provider_mismatch` | 400 | the provider does not implement the operation (e.g. a v1-only provider asked to write) |
+| `content_conflict` | 409 | `expected_content_hash` no longer matches the workspace file |
+| `source_delete_not_permitted` | 403 | disconnecting may not delete real files (Amendment 01, passed through) |
+| `metadata_overlap` / `watch_unavailable` / `index_not_ready` | 400 / 409 / 409 | further contract codes Canvas carries unchanged when a provider answers them |
+| `workspace_not_found` | 404 | workspace is detached (`lifecycle_state: deleted`) |
+| `file_exists` / `file_not_found` | 409 / 404 | workspace file names/ids reported through Canvas |
+| `invalid_path` | 400 | the shared relative-path gate rejected the path |
 
 ### 5.2 Request rules
 
@@ -349,11 +370,26 @@ Providers:
 
 * `RuntimeWorkspaceProvider` — lazy bind, `mode = "workspace"`, `enforced = true`.
 * `LocalDevWorkspaceProvider` — in-memory, `mode = "dev"`, `enforced = false`, refuses to be
-  constructed in production, seeded with `ws_dev00000001`.
+  constructed in production, seeded with `ws_dev00000001` (Amendment 01 setup: `set_level`,
+  `set_lifecycle_state`, `set_read_only`, `set_storage_provider`, `seed_file`).
 * `UnavailableWorkspaceProvider` — fail-closed default (`workspace_unavailable`).
 
-Out of scope for R2: writing an artifact into a workspace file ("Export to workspace"), workspace
-file listing, search/embedding/index, and any workspace file storage.
+### Amendment 01 (`r2-w/v1+a01`) on top of the above
+
+Canvas consumes only the **additive** members of the revision, so a v1 provider keeps working:
+
+| Amendment 01 item | Canvas use |
+| --- | --- |
+| `WorkspaceIdentity.lifecycle_state` (`open` / `closed` / `deleted`) | every workspace-linked read/write/export: `closed` → `409 workspace_closed`, `deleted` → `404 workspace_not_found`; detach (`DELETE /links/workspace`) stays owner-allowed |
+| `WorkspaceIdentity.root.read_only` | `403 read_only_workspace` on every write requirement |
+| `WorkspaceIdentity.root.storage_provider` | `server_managed` / `server_mounted_folder` / `local_browser`; reported in `/capabilities` and on the export response |
+| `WorkspaceIdentity.root.server_side_path_access` | `false` for `local_browser`: no server path is echoed and no write is attempted server-side |
+| `write_file` (`PUT /workspaces/{id}/file`) | the only Amendment 01 operation Canvas calls — export to workspace (§17.3) |
+| §A1.10 error codes | carried through Canvas' own envelope with the contract's status (§17.4) |
+
+Still out of scope for R2 Canvas: workspace file listing, search/embedding/index, folder open/new/
+close/reopen/disconnect/watch (those are Workspace endpoints), and any workspace file storage —
+Canvas only *sends* bytes through the contract and never touches a real path.
 
 ---
 
@@ -609,6 +645,43 @@ Smoke run over HTTP (2026-11-27, `uvicorn` on 127.0.0.1):
 | second apply | `409 proposal_already_applied` |
 | `/agent/agents` with `AGCORE_CANVAS_TOOLS_ENABLED=1` | 7 `canvas.*` tools, `canvas.apply_edit` absent |
 
+### 11.2 R2-W Amendment 01 verification run
+
+```bash
+cd /workspace/repos/AGPilot0005
+/workspace/.venv-r2canvas/bin/pytest tests/test_r2_canvas_*.py -q
+```
+
+Result: **90 passed, 0 failed** (Python 3.12.16, 2026-11-27) — the 63 pre-existing Canvas tests
+(unchanged, v1 regression 0) plus the 27 new Amendment 01 tests. The 219-test baseline and the R1.3
+86-test run were not repeated (their PASS evidence is accepted, per the task).
+
+| Area | Assertion |
+| --- | --- |
+| `closed` lifecycle | `GET artifact` / `export` / `preview` / `revisions` / `diff` → `409 workspace_closed` (`retryable: true`, `context.recovery` names reopen); patch / rename → 409; export-to-workspace → 409; rows kept; detach `DELETE /links/workspace` → 200; reopen restores reads |
+| `deleted` lifecycle | `404 workspace_not_found`, detach still allowed |
+| `read_only` root | create-into-workspace / patch / export-to-workspace → `403 read_only_workspace`; reads → 200; nothing written |
+| export-to-workspace (mounted folder) | 200 with `storage_provider: server_mounted_folder`, `content_origin: external`, `content_hash` = sha256 of the exported bytes, `workspace_file.relative_path`, `workspace_file_revision` 1→2, default path from the sanitized title |
+| export-to-workspace (`local_browser`) | 200 with `write_mode: client_write`, `server_side_path_access: false`, `workspace_root_path: null`, `client_write.client_handle_id`, `written_bytes: 0`, no file stored server-side |
+| path gate | 7 rejected forms (absolute, `..`, `.`, `//`, drive letter, backslash, NUL) → `400 invalid_path`, artifact untouched |
+| write conflicts | `expected_content_hash` mismatch → `409 content_conflict` (file unchanged); `overwrite:false` on an existing path → `409 file_exists` |
+| v1-only provider | access/link/reference unchanged (200, reference registered); export → `400 provider_mismatch` |
+| runtime identity | `WorkspaceIdentity.lifecycle_state` / `root` are consumed: closed → 409, `read_only` → 403, mounted root path reported, `write_file` receives `path` / `content` / `create_parents` / `overwrite` |
+| error bridge | all 22 contract codes map to their own Canvas code and contract status (13 of them end-to-end through the endpoint, all 22 at unit level); an unknown engine failure → `503 workspace_unavailable` (not a client error) |
+| `/capabilities` | `workspace.contract.revision == "r2-w/v1+a01"`, amendment `A01`, `a01_operations: [write_file]`, lifecycle enforcement report |
+
+Smoke run over HTTP (`uvicorn` on 127.0.0.1, dev workspace provider, 2026-11-27):
+
+| Check | Result |
+| --- | --- |
+| `GET /api/v1/health` with Canvas on | `200` |
+| `GET /canvas/capabilities` | `revision: r2-w/v1+a01`, `a01_operations: ["write_file"]` |
+| export to a mounted-folder workspace (`smoke/report.md`) | `200`, `server_mounted_folder`, `server_write`, `sha256:48f1e5…`, file present in the root |
+| export with `../escape.md` | `400 invalid_path` |
+| export to a `local_browser` root | `200`, `client_write`, `client_handle_id: h-1`, `workspace_root_path: null` |
+| list with `?workspace_id` after close | `409 workspace_closed` |
+| export after close | `409 workspace_closed` |
+
 ## 12. Not implemented / not verified
 
 | Item | State |
@@ -617,7 +690,7 @@ Smoke run over HTTP (2026-11-27, `uvicorn` on 127.0.0.1):
 | **Real LLM AI edit proposals** | **Not verified.** The dev adapter needs `scripted_replacement` or a `dev_rule`; otherwise 503 `ai_adapter_unavailable`. No R1.3 runtime adapter exists yet (`AGCORE_CANVAS_AI_ADAPTER=runtime` → unavailable). |
 | Canvas frontend (CP-04) | Out of this task. `AGPilot0011` was not accessible to the GitHub App (404 on installation scope); no UI file was touched. |
 | Office export (DOCX/PDF/XLSX/PPTX) | Contract declared in `OFFICE_EXPORT_CONTRACT`, refused with `export_format_unsupported`. No conversion engine. |
-| Export into a workspace file | Out of scope; needs the Workspace owner's approval of a file-write API. |
+| Export into a workspace file | **Implemented against the contract** (§17): `POST /artifacts/{id}/export-to-workspace` via `write_file`. Verified against the dev provider (server-managed, mounted-folder and `local_browser` + `client_write`). Not yet exercised against the live engine, because `feat/r2-workspace-rag` is not merged into this branch. |
 | Live Workspace provider | `RuntimeWorkspaceProvider` is implemented but never exercised against a merged `feat/r2-workspace-rag`; only the dev provider is tested. The WO-C17 revocation tests use the dev provider's `set_level()`, so the *live* revocation path (real provider answering `none`) is still unverified. |
 | Generation session expiry / storage quota | P2 backlog — see §16.8 (C-FIX-07). |
 | Tool exposure to a live model | Tools dispatch through `ToolDispatcher` in tests, but no real LLM tool-calling run was made; no shipped profile lists `canvas.*`. |
@@ -853,3 +926,215 @@ the tools). `/capabilities.feature_isolation` reports all of this, including
 
 No file under `app/runtime/`, `app/runtime/policy/`, `app/gateway/`, `app/adapters/`,
 `app/workspace/` or `app/tools/{registry,policy}.py` is modified by WO-C17.
+
+---
+
+## 17. R2-W Amendment 01 — Folder-Based Workspace (`r2-w/v1+a01`)
+
+Reference (read-only, Workspace/RAG-owned): `docs/r2/WORKSPACE_CONTRACT.md` §A1.1–§A1.11,
+`app/workspace/contracts.py`, `app/workspace/mock.py` on `origin/feat/r2-workspace-rag` (`907482c`).
+No file under `app/workspace/**` was created or modified — Canvas keeps a mirror of the few types it
+must understand (`WorkspaceWriteRequest`, `ClientWriteDirective`, `WorkspaceWriteResult`,
+`validate_relative_path`) because that package is not importable from `feat/r2-canvas`.
+
+### 17.1 What Canvas now understands
+
+| Contract item | Canvas consumption |
+| --- | --- |
+| `WORKSPACE_CONTRACT_VERSION = "r2-w/v1"` | unchanged; every v1 field/operation keeps its meaning |
+| `WORKSPACE_CONTRACT_AMENDMENT = "A01"`, `WORKSPACE_CONTRACT_REVISION = "r2-w/v1+a01"` | exported as constants, reported by `/capabilities` (`workspace.contract`) and on every export response |
+| `WorkspaceStorageProvider` (`server_managed` / `server_mounted_folder` / `local_browser`) | carried on `WorkspaceAccess.storage_provider`, chosen by the target workspace, reported in the export result |
+| `WorkspaceLifecycleState` (`open` / `closed` / `deleted`) | enforced on every workspace-linked artifact path (§17.2) |
+| `WorkspaceRootInfo.read_only` | `403 read_only_workspace` for a write requirement |
+| `WorkspaceRootInfo.server_side_path_access` | `false` for `local_browser`: Canvas never builds, resolves or echoes a server path; the export response carries `workspace_root_path: null` |
+| `WorkspaceWriteRequest` / `WorkspaceWriteResult` / `ClientWriteDirective` | request is built by `build_write_request()` (contract model when importable, identical mirror otherwise) and the result is normalised so every contract field is always present |
+| `validate_relative_path()` | mirrored byte-for-byte in `app/canvas/workspace.py`, raised as `400 invalid_path` |
+| §A1.10 error codes | mapped to Canvas codes with the contract status (§17.4) |
+
+The v1 provider operations are untouched: `check_workspace_access`, `register_artifact_reference`
+(and `get_workspace`, used only to *enrich* the access answer with lifecycle/root). A provider that
+does not implement `get_workspace` (a v1-only provider) is treated as an open, server-managed
+workspace — exactly the v1 behaviour.
+
+### 17.2 Lifecycle and read-only enforcement
+
+`assert_workspace_level()` — the single choke point every workspace-linked Canvas path goes through
+— now runs `enforce_workspace_state()` after the permission level is satisfied. Order matters: a
+caller without access gets `403 workspace_access_denied` and learns nothing about the lifecycle.
+
+| Workspace state | Reads (`read`) | Writes (`write`) | Export to workspace |
+| --- | --- | --- | --- |
+| `open`, writable | allowed | allowed | allowed |
+| `open`, `read_only: true` | allowed | `403 read_only_workspace` | `403 read_only_workspace` |
+| `closed` | `409 workspace_closed` | `409 workspace_closed` | `409 workspace_closed` |
+| `deleted` (detached) | `404 workspace_not_found` | `404 workspace_not_found` | `404 workspace_not_found` |
+
+Paths covered by the read/write table: get, list (explicit `workspace_id` filter), export, preview,
+revision history/get, diff, patches (apply/preview), restore, rename, delete, link, proposal
+create/apply/reject, generation start, and export-to-workspace.
+
+Deliberate exception (C-FIX-02, unchanged): `DELETE /api/v1/canvas/artifacts/{id}/links/workspace`
+uses owner scope only — detaching is the documented way out of a closed or detached workspace, it
+neither reads nor writes workspace content, and it is the only way a user can recover their
+artifact after the workspace went away.
+
+### 17.3 Export to Workspace
+
+`POST /api/v1/canvas/artifacts/{artifact_id}/export-to-workspace`
+
+```json
+{
+  "workspace_id": "ws_7f3c1a9e2b04",
+  "path": "reports/summary.md",
+  "revision": 2,
+  "format": "md",
+  "expected_content_hash": null,
+  "create_parents": true,
+  "overwrite": true,
+  "mime_type": "text/markdown"
+}
+```
+
+The bytes come from the **same export provider the download endpoint uses**, so the written file is
+exactly what the user would have downloaded (`format` defaults to the type's default format; the
+`artifact_revision` written is echoed). The target `path` is validated with the shared path gate;
+when omitted, the export filename derived from the sanitized title is used.
+
+Service path: `ArtifactManager.export_to_workspace()` → `read_content(required="read")` →
+`assert_workspace_level(required="write")` (closed/read-only refused here, before any byte is
+produced) → `exporter.export()` → `write_workspace_file()` → provider `write_file()`.
+
+Response `200`:
+
+```json
+{
+  "artifact_id": "art_8ce43de6a789",
+  "artifact_revision": 1,
+  "artifact_type": "markdown",
+  "format": "md",
+  "extension": ".md",
+  "media_type": "text/markdown; charset=utf-8",
+  "workspace_id": "ws_7f3c1a9e2b04",
+  "path": "reports/summary.md",
+  "storage_provider": "server_mounted_folder",
+  "content_origin": "external",
+  "client_write": null,
+  "write_mode": "server_write",
+  "server_side_path_access": true,
+  "workspace_root_path": "/srv/hd2lab/workspaces/lab-docs",
+  "workspace_file": { "file_id": "wf_…", "relative_path": "reports/summary.md", "revision": 1, "content_hash": "sha256:…", "content_origin": "external" },
+  "workspace_file_revision": 1,
+  "content_hash": "sha256:…",
+  "written_bytes": 8123,
+  "export_warnings": [],
+  "content_metrics": { "codepoints": 8120, "utf16_units": 8123, "utf8_bytes": 8123 },
+  "workspace_access": { "level": "write", "lifecycle_state": "open", "read_only": false, "storage_provider": "server_mounted_folder", "server_side_path_access": true, "…": "…" },
+  "contract_revision": "r2-w/v1+a01"
+}
+```
+
+Rules that hold on every provider:
+
+* Canvas writes **nothing** itself: the workspace engine owns the file, the atomic replace, the
+  revision row and the index job. Canvas only builds `{path, content | content_base64, mime_type,
+  expected_content_hash, create_parents, overwrite}`.
+* Text content travels as `content`; bytes that are not valid UTF-8 (or contain NUL) travel as
+  `content_base64`.
+* `expected_content_hash` mismatch → `409 content_conflict` and the file is unchanged, so two agents
+  writing the same path cannot silently overwrite each other.
+* `overwrite: false` on an existing path → `409 file_exists`.
+* A provider that does not implement `write_file` (v1-only) → `400 provider_mismatch`.
+
+### 17.4 Contract error → Canvas error bridge
+
+`translate_workspace_error()` reads `detail.code` / `exc.code` from whatever the provider raises
+(`HTTPException` with the contract envelope, the contract's own error type, or a plain exception) and
+keeps the meaning. The map covers the whole contract table:
+
+| Contract code | Canvas code | HTTP |
+| --- | --- | --- |
+| `workspace_not_found` | `workspace_not_found` | 404 |
+| `workspace_closed` | `workspace_closed` | 409 |
+| `read_only_workspace` | `read_only_workspace` | 403 |
+| `path_outside_allowed_root` | `path_outside_allowed_root` | 403 |
+| `symlink_escape` | `symlink_escape` | 400 |
+| `root_unavailable` | `root_unavailable` | 409 |
+| `provider_mismatch` | `provider_mismatch` | 400 |
+| `content_conflict` | `content_conflict` | 409 |
+| `source_delete_not_permitted` | `source_delete_not_permitted` | 403 |
+| `metadata_overlap` | `metadata_overlap` | 400 |
+| `watch_unavailable` | `watch_unavailable` | 409 |
+| `file_not_found` | `file_not_found` | 404 |
+| `file_exists` | `file_exists` | 409 |
+| `revision_conflict` | `revision_conflict` | 409 |
+| `quota_exceeded`, `file_too_large` | `content_too_large` | 413 |
+| `unsupported_media_type` | `unsupported_artifact_type` | 415 |
+| `invalid_path` | `invalid_path` | 400 |
+| `invalid_request` | `invalid_request` | 422 (Canvas schema semantics) |
+| `index_not_ready` | `index_not_ready` | 409 |
+| `embedding_unavailable` | `workspace_unavailable` | 503 |
+| `forbidden` | `forbidden` | 403 |
+
+An **unknown** provider failure stays `503 workspace_unavailable` (`retryable: true`) with the
+provider exception class in `context.reason` — an outage is never reported as a client error.
+Every mapped error keeps the contract's `message`, `retryable` and `context`, plus
+`context.workspace_id`, `context.operation` and `context.provider_code`.
+
+### 17.5 `local_browser` (client write)
+
+For a browser-owned root the server has no path access. Canvas reflects that everywhere:
+
+* `WorkspaceAccess.server_side_path_access = false`, `root_display_path = ""` — even if a provider
+  sends a display path, Canvas drops it instead of echoing a client machine path;
+* the export answers `200` with `write_mode: "client_write"`, `written_bytes: 0`, no
+  `workspace_file`, and
+  `client_write: {required: true, client_handle_id, relative_path, reason:
+  "local_browser_no_server_path_access"}`;
+* the browser then performs the write through its file handle (frontend responsibility) — Canvas
+  never retries server-side.
+
+### 17.6 v1 backward compatibility
+
+| v1 behaviour | Evidence |
+| --- | --- |
+| 63 pre-existing Canvas tests | unchanged and still passing |
+| `read`/`write` separation, revocation re-check, detach escape | `test_r2_canvas_correction.py` unchanged |
+| A provider without `get_workspace` / `write_file` | access, create-into-workspace, link and reference registration work exactly as before (`test_a01_v1_only_provider_keeps_working_but_cannot_write`); only the new export answers `provider_mismatch` |
+| `WORKSPACE_CONTRACT_VERSION = "r2-w/v1"` | still the consumed version; the amendment is tracked separately (`+a01`) |
+
+### 17.7 Changed files (Amendment 01)
+
+| File | Change |
+| --- | --- |
+| `app/canvas/workspace.py` | contract revision constants, `WorkspaceStorageProvider` / `WorkspaceLifecycleState` / `ContentOrigin`, `WorkspaceRootInfo`, write-contract mirrors, `validate_relative_path`, `enforce_workspace_state`, `apply_workspace_identity`, `WORKSPACE_ERROR_CODES` + `translate_workspace_error`, `write_workspace_file`, dev-provider Amendment 01 state and `write_file`, runtime `write_file` + identity enrichment, `workspace_contract_report()` |
+| `app/canvas/manager.py` | `assert_workspace_level` enforces lifecycle/read-only; `export_to_workspace()` |
+| `app/canvas/errors.py` | 15 new codes (8 Amendment 01 + 7 pass-through v1/file codes) with the contract status |
+| `app/canvas/service.py` | `/capabilities` reports the contract, the Amendment 01 operations and the lifecycle enforcement |
+| `app/api/canvas.py` | `POST /artifacts/{artifact_id}/export-to-workspace` + `ExportToWorkspaceBody` (`extra="forbid"`) |
+| `tests/test_r2_canvas_workspace_a01.py` | 27 tests (§11.2) |
+
+No file under `app/workspace/`, `app/runtime/`, `app/gateway/`, `app/adapters/`,
+`app/tools/{registry,policy}.py`, `app/schemas/events.py` or `app/main.py` is modified by this
+amendment.
+
+### 17.8 Not verified
+
+| Item | State |
+| --- | --- |
+| Export to a **live** workspace engine | Not verified: `feat/r2-workspace-rag` is not merged into this branch, so `write_file`, `get_workspace` and the real error envelopes were exercised only through the dev provider and a contract-shaped fake provider. |
+| Real-file write / atomic replace / index enqueue | Owned by the Workspace engine; Canvas cannot observe it. The dev provider stores bytes in memory only. |
+| Browser handle write (`local_browser`) | The directive is returned and covered by tests; performing it is frontend work (`AGPilot0011` CP-04 / the frontend Amendment 01 task). |
+| Reopen, watch, sync, folder open/new, disconnect | Workspace endpoints; Canvas calls none of them. `source_delete_not_permitted` is only carried through the error bridge. |
+| Office formats into a workspace | Still `export_format_unsupported` (no conversion engine). |
+
+### 17.9 Integration order
+
+1. Merge `feat/r2-workspace-rag` (`907482c`) first; then merge `feat/r2-canvas`.
+2. Set `AGCORE_CANVAS_WORKSPACE_PROVIDER=workspace` and `register_runtime_provider_factory(lambda:
+   WorkspaceService(...))`; no Canvas code change is needed — `RuntimeWorkspaceProvider` binds
+   `write_file` / `get_workspace` by attribute.
+3. Re-run §11.2 against the live engine and confirm: closed → 409, read-only → 403, mounted-folder
+   export writes a real file, `local_browser` returns `client_write`, `expected_content_hash`
+   conflict → 409.
+4. Frontend: consume `write_mode` / `client_write` / the Amendment 01 error codes (sibling task on
+   `AGPilot0011`).
