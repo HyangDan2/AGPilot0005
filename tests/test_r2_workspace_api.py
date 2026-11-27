@@ -320,22 +320,40 @@ def test_extension_tools_manifest_and_invocation(api):
     runtime.indexer.run_pending(limit=5)
 
     names = runtime.tools.tool_names()
+    # Amendment 02 replaced the v1 four-tool manifest with 11 agent tools.
     assert names == [
         "workspace_list_files",
-        "workspace_search",
+        "workspace_find_files",
+        "workspace_get_file_info",
         "workspace_read_file",
-        "workspace_get_context",
+        "workspace_search_text",
+        "workspace_retrieve",
+        "workspace_create_file",
+        "workspace_patch_file",
+        "workspace_move_file",
+        "workspace_delete_file",
+        "workspace_create_directory",
     ]
     manifest = runtime.tools.manifest()
-    assert manifest["version"] == "r2-w/v1"
+    assert manifest["version"] == "r2-w/v1+a02"
+    read_names = {
+        "workspace_list_files",
+        "workspace_find_files",
+        "workspace_get_file_info",
+        "workspace_read_file",
+        "workspace_search_text",
+        "workspace_retrieve",
+    }
     for tool in manifest["tools"]:
         assert tool["input_schema"]["type"] == "object"
-        assert tool["side_effects"] == "none"
+        if tool["name"] in read_names:
+            assert tool["side_effects"] == "none"
+        else:
+            assert tool["side_effects"] != "none"
 
     context = ToolInvocationContext(scope=Scope(), context_budget=256)
     listed = runtime.tools.invoke("workspace_list_files", {"workspace_id": workspace_id}, context)
     assert listed["status"] == "ok" and listed["result"]["total"] == 1
-
     search = runtime.tools.invoke(
         "workspace_search", {"workspace_id": workspace_id, "query": "파싱 정책"}, context
     )

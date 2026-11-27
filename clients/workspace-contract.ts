@@ -1,5 +1,5 @@
 /**
- * AGCore R2-W — Workspace Shared Contract (client types, contract r2-w/v1+a01)
+ * AGCore R2-W — Workspace Shared Contract (client types, contract r2-w/v1+a02)
  *
  * Mirror of `docs/r2/WORKSPACE_CONTRACT.md` and `app/workspace/contracts.py`.
  * Canonical copy lives in AGPilot0005 `clients/workspace-contract.ts`; the frontend copy is
@@ -8,12 +8,19 @@
  * Amendment 01 (folder-based workspace) is additive: every v1 field/operation keeps its
  * meaning, and every Amendment 01 member is optional for a v1 consumer.
  *
+ * Amendment 02 (agent tools) is additive as well: the workspace exposes 11 server-side agent
+ * tools and a metadata-only chat scope. Agent tools are NOT client provider operations; the
+ * `WorkspaceProvider` interface below is unchanged.
+ *
  * Canvas Engineer: build against `WorkspaceProvider` + `createMockWorkspaceProvider()`.
+ * Workspace→Canvas handoff (WO-C18): `POST /artifacts/from-workspace`,
+ * `POST /artifacts/{id}/save-to-workspace`, `GET /artifacts/{id}/workspace-link`;
+ * the workspace file's `content_hash` is the Canvas `last_saved_content_hash`.
  */
 
 export const WORKSPACE_CONTRACT_VERSION = 'r2-w/v1';
-export const WORKSPACE_CONTRACT_AMENDMENT = 'A01';
-export const WORKSPACE_CONTRACT_REVISION = 'r2-w/v1+a01';
+export const WORKSPACE_CONTRACT_AMENDMENT = 'A02';
+export const WORKSPACE_CONTRACT_REVISION = 'r2-w/v1+a02';
 
 export type WorkspaceStatus = 'active' | 'archived' | 'deleted';
 export type WorkspaceLifecycleState = 'open' | 'closed' | 'deleted';
@@ -49,7 +56,12 @@ export type WorkspaceErrorCode =
   | 'invalid_request'
   | 'index_not_ready'
   | 'embedding_unavailable'
-  | 'forbidden';
+  | 'forbidden'
+  // Amendment 02 — agent tools
+  | 'approval_required'
+  | 'patch_conflict'
+  | 'section_not_found'
+  | 'capability_denied';
 
 export interface WorkspaceError {
   code: WorkspaceErrorCode;
@@ -499,6 +511,10 @@ export const ERROR_HTTP_STATUS: Record<WorkspaceErrorCode, number> = {
   index_not_ready: 409,
   embedding_unavailable: 503,
   forbidden: 403,
+  approval_required: 409,
+  patch_conflict: 409,
+  section_not_found: 404,
+  capability_denied: 403,
 };
 
 /**
@@ -838,4 +854,81 @@ export function createMockWorkspaceProvider(
     },
   };
   return provider;
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Amendment 02 — agent tools and the workspace scope of a chat request
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The 11 server-side workspace agent tools (Amendment 02 §1). No terminal/OS tool exists. */
+export type WorkspaceAgentToolName =
+  | 'workspace_list_files'
+  | 'workspace_find_files'
+  | 'workspace_get_file_info'
+  | 'workspace_read_file'
+  | 'workspace_search_text'
+  | 'workspace_retrieve'
+  | 'workspace_create_file'
+  | 'workspace_patch_file'
+  | 'workspace_move_file'
+  | 'workspace_delete_file'
+  | 'workspace_create_directory';
+
+export interface WorkspaceAgentFileAction {
+  action: 'read' | 'created' | 'patched' | 'moved' | 'deleted' | 'opened';
+  file_id: string;
+  path: string;
+  name: string;
+  revision: number;
+  previous_revision?: number | null;
+  diff?: string | null;
+  content_hash?: string | null;
+  canvas?: {
+    action: 'open';
+    artifact_id: string;
+    artifact_ref_id: string;
+    workspace_id: string;
+    file_id: string;
+    path: string;
+    revision: number;
+    content_hash?: string | null;
+  } | null;
+}
+
+export interface WorkspaceChatScopeContext {
+  workspace_id: string;
+  workspace_root: {
+    root_id?: string | null;
+    display_path: string;
+    read_only: boolean;
+    zero_copy: boolean;
+    lifecycle_state: WorkspaceLifecycleState;
+  };
+  storage_provider: WorkspaceStorageProvider;
+  execution_scope: { tenant_id: string; owner_id: string; service_id: string };
+  granted_capabilities: {
+    allowed_tools: WorkspaceAgentToolName[];
+    read_only: boolean;
+    write: boolean;
+    delete: boolean;
+    context_budget_tokens: number;
+  };
+  /** Counts and top-level names only — the chat scope never carries a file body. */
+  file_metadata: {
+    files: number;
+    folders: number;
+    bytes: number;
+    indexed: number;
+    pending: number;
+    failed: number;
+    stale: number;
+    top_level: Array<{ file_id: string; kind: FileKind; name: string; relative_path: string }>;
+  };
+  retrieval_availability: {
+    keyword: boolean;
+    vector: boolean;
+    hybrid: boolean;
+    degraded: boolean;
+    reasons: string[];
+  };
 }

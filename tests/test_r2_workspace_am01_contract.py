@@ -41,9 +41,9 @@ def test_amendment_is_additive_on_the_frozen_v1_surface():
     # v1 stays exactly as frozen for existing consumers
     assert WORKSPACE_CONTRACT_VERSION == "r2-w/v1"
     assert len(provider_operations()) == 8
-    # Amendment 01 is tracked separately and adds its own operation list
-    assert WORKSPACE_CONTRACT_AMENDMENT == "A01"
-    assert WORKSPACE_CONTRACT_REVISION == "r2-w/v1+a01"
+    # Amendments are tracked separately and each adds its own operation list
+    assert WORKSPACE_CONTRACT_AMENDMENT == "A02"
+    assert WORKSPACE_CONTRACT_REVISION == "r2-w/v1+a02"
     assert set(provider_operations_a01()) == {
         "open_folder",
         "new_workspace",

@@ -15,8 +15,8 @@ WORKSPACE_CONTRACT_VERSION = "r2-w/v1"
 # Amendment 01 (folder-based workspace) is additive on top of the frozen v1 surface.
 # Existing v1 operations, fields and error codes keep their meaning; every Amendment 01 type
 # below is optional for a v1 consumer.
-WORKSPACE_CONTRACT_AMENDMENT = "A01"
-WORKSPACE_CONTRACT_REVISION = "r2-w/v1+a01"
+WORKSPACE_CONTRACT_AMENDMENT = "A02"
+WORKSPACE_CONTRACT_REVISION = "r2-w/v1+a02"
 
 ID_PATTERN = r"^(ws|wf|wc|wj|wref)_[a-z0-9]{4,32}$"
 _ROOT_ID_PATTERN = r"^[a-z0-9][a-z0-9_-]{1,47}$"
@@ -136,6 +136,11 @@ class WorkspaceErrorCode(str, Enum):
     INDEX_NOT_READY = "index_not_ready"
     EMBEDDING_UNAVAILABLE = "embedding_unavailable"
     FORBIDDEN = "forbidden"
+    # Amendment 02 additions (agent tools; additive)
+    APPROVAL_REQUIRED = "approval_required"
+    PATCH_CONFLICT = "patch_conflict"
+    SECTION_NOT_FOUND = "section_not_found"
+    CAPABILITY_DENIED = "capability_denied"
 
 
 ERROR_STATUS: Dict[WorkspaceErrorCode, int] = {
@@ -160,6 +165,10 @@ ERROR_STATUS: Dict[WorkspaceErrorCode, int] = {
     WorkspaceErrorCode.INVALID_REQUEST: 400,
     WorkspaceErrorCode.INDEX_NOT_READY: 409,
     WorkspaceErrorCode.EMBEDDING_UNAVAILABLE: 503,
+    WorkspaceErrorCode.APPROVAL_REQUIRED: 409,
+    WorkspaceErrorCode.PATCH_CONFLICT: 409,
+    WorkspaceErrorCode.SECTION_NOT_FOUND: 404,
+    WorkspaceErrorCode.CAPABILITY_DENIED: 403,
     WorkspaceErrorCode.FORBIDDEN: 403,
 }
 

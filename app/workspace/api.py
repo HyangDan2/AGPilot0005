@@ -634,3 +634,59 @@ def list_conversation_references(
 ) -> Dict[str, Any]:
     items = runtime.manager.list_conversation_references(workspace_id, scope)
     return {"items": items, "total": len(items)}
+
+
+# ----------------------------------------------------------------------------- Amendment 02
+def _agent(runtime: WorkspaceRuntime):
+    from app.workspace.agent import WorkspaceAgentAdapter
+
+    if runtime.agent is None:
+        runtime.agent = WorkspaceAgentAdapter(
+            runtime.manager, runtime.retriever, runtime.assembler, runtime.tools, settings=runtime.settings
+        )
+    return runtime.agent
+
+
+@router.post("/{workspace_id}/chat/context")
+@guarded
+def chat_context(
+    workspace_id: str,
+    body: Optional[Dict[str, Any]] = Body(default=None),
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    """Workspace scope a chat request would receive (metadata only, no file bodies)."""
+
+    from app.workspace.chat import WorkspaceChatSelection, build_workspace_chat_context
+
+    payload = body or {}
+    selection = WorkspaceChatSelection(workspace_id=workspace_id, **{k: v for k, v in payload.items() if k != "workspace_id"})
+    context = build_workspace_chat_context(
+        runtime.manager, runtime.retriever, workspace_id, scope, selection=selection, settings=runtime.settings
+    )
+    return context.model_dump(mode="json")
+
+
+@router.post("/{workspace_id}/agent/turn")
+@guarded
+def agent_turn(
+    workspace_id: str,
+    body: Dict[str, Any],
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    """Agentic Execution Preview Adapter: one turn with real workspace tools."""
+
+    from app.workspace.agent import AgentTurnRequest
+
+    request = AgentTurnRequest.model_validate(body)
+    response = _agent(runtime).run(
+        workspace_id,
+        scope,
+        request.message,
+        conversation_id=request.conversation_id,
+        capability=request.capability,
+        context_budget=request.context_budget_tokens,
+        approvals=request.approvals,
+    )
+    return response.model_dump(mode="json")

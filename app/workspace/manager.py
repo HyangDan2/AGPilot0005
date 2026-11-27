@@ -1035,6 +1035,51 @@ class WorkspaceManager:
         self._emit(workspace_id, record["file_id"], "file.created", 1)
         return self.file_identity(record)
 
+    def create_directory(
+        self, workspace_id: str, scope: ScopeView, path: str
+    ) -> FileIdentity:
+        """Create every missing folder of a relative `path` and return the deepest folder.
+
+        Amendment 02 addition: the agent `workspace_create_directory` tool needs nested folders.
+        For folder-backed workspaces the real directories are created too; a read-only or closed
+        workspace fails before anything is touched.
+        """
+
+        from app.workspace import folder as folderfs
+        from app.workspace.contracts import validate_relative_path, InvalidRelativePath
+
+        workspace = self._workspace_record(workspace_id, scope)
+        self._require_writable(workspace)
+        try:
+            rel = validate_relative_path(path)
+        except InvalidRelativePath as exc:
+            raise WorkspaceFailure(WorkspaceErrorCode.INVALID_PATH, str(exc)) from exc
+        provider = WorkspaceStorageProvider(workspace.get("storage_provider") or "server_managed")
+        with self.sync_service.workspace_lock(workspace_id):
+            existing = self.store.get_file_by_rel_path(workspace_id, rel) if self._is_folder_backed(workspace) else None
+            if existing is not None:
+                if existing["kind"] != FileKind.FOLDER.value:
+                    raise WorkspaceFailure(WorkspaceErrorCode.FILE_EXISTS, name=rel, file_id=existing["file_id"])
+                return self.file_identity(existing, provider)
+            if self._is_folder_backed(workspace):
+                folderfs.ensure_directory(self._root_path(workspace), rel)
+                folder_id = self._ensure_folder_rows(workspace_id, rel)
+                row = self.store.get_file(workspace_id, folder_id or "")
+                if row is None:
+                    raise WorkspaceFailure(WorkspaceErrorCode.INVALID_PATH, rel)
+                self._emit(workspace_id, row["file_id"], "folder.created", 1, {"path": rel})
+                return self.file_identity(row, provider)
+            parent_id: Optional[str] = None
+            for part in rel.split("/"):
+                found = self.store.find_file_by_name(workspace_id, parent_id, part)
+                if found is not None:
+                    if found["kind"] != FileKind.FOLDER.value:
+                        raise WorkspaceFailure(WorkspaceErrorCode.FILE_EXISTS, name=part, file_id=found["file_id"])
+                    parent_id = found["file_id"]
+                    continue
+                parent_id = self.create_folder(workspace_id, scope, part, parent_id).file_id
+            return self.get_file_metadata(workspace_id, parent_id, scope)
+
     def _extension_blocked(self, name: str) -> bool:
         lowered = name.lower()
         return any(lowered.endswith(ext) for ext in self.settings.blocked_extensions)

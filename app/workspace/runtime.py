@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from app.workspace.agent import WorkspaceAgentAdapter
 from app.workspace.citations import CitationService
 from app.workspace.config import WorkspaceSettings, get_settings
 from app.workspace.context import ContextAssembler
@@ -31,6 +32,7 @@ class WorkspaceRuntime:
     embedder: Optional[EmbeddingProvider]
     tools: WorkspaceToolAdapter
     watcher: Optional[WorkspaceWatcher] = None
+    agent: Optional[WorkspaceAgentAdapter] = None
 
     @classmethod
     def build(cls, settings: Optional[WorkspaceSettings] = None, *, start_worker: bool = False) -> "WorkspaceRuntime":
@@ -48,8 +50,9 @@ class WorkspaceRuntime:
         retriever = WorkspaceRetriever(store, settings, embedder)
         citations = CitationService(store)
         assembler = ContextAssembler(store, settings, retriever, citations)
-        tools = WorkspaceToolAdapter(manager, retriever, assembler)
+        tools = WorkspaceToolAdapter(manager, retriever, assembler, settings=settings)
         watcher = WorkspaceWatcher(manager, settings)
+        agent = WorkspaceAgentAdapter(manager, retriever, assembler, tools, settings=settings)
         runtime = cls(
             settings=settings,
             store=store,
@@ -62,6 +65,7 @@ class WorkspaceRuntime:
             embedder=embedder,
             tools=tools,
             watcher=watcher,
+            agent=agent,
         )
         manager.recover()
         if start_worker:
