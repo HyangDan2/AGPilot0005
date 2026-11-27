@@ -14,6 +14,7 @@ from app.api.demo import router as demo_router
 from app.api.health import router as health_router
 from app.api.config import router as config_router
 from app.api.tools_admin import router as tools_admin_router
+from app.api.canvas import router as canvas_router
 from app.tools.policy import tool_policy
 from app.tools.registry import registry
 from app.config import settings
@@ -116,6 +117,7 @@ app.include_router(config_router, prefix="/api/v1")
 app.include_router(tools_admin_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
 app.include_router(document_analysis_router, prefix="/api/v1")
+app.include_router(canvas_router, prefix="/api/v1")
 app.include_router(demo_router, prefix="/api/v1")
 
 # Mount built demo console frontend if dist directory exists

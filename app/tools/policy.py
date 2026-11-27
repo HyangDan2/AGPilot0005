@@ -25,6 +25,18 @@ BUILTIN_TOOLS = [
     "document.search",
     "document.read_chunk",
     "document.get_figure_info",
+    # R2 Canvas artifact tools (registered additively; add to a profile to expose them)
+    "canvas.create_artifact",
+    "canvas.read_artifact",
+    "canvas.list_artifacts",
+    "canvas.propose_edit",
+    "canvas.apply_edit",
+    "canvas.list_revisions",
+    "canvas.restore_revision",
+    "canvas.export_artifact",
+    # WO-C18 workspace-aware tools (their own opt-in switch: AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED)
+    "canvas.save_to_workspace",
+    "canvas.load_from_workspace",
 ]
 
 DEFAULT_POLICY: Dict[str, Any] = {

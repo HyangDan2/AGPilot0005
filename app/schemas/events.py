@@ -17,6 +17,14 @@ EventType = Literal[
     "run.completed",
     "run.failed",
     "run.cancelled",
+    # R2 Canvas artifact events (additive; WO-C06)
+    "artifact.created",
+    "artifact.delta",
+    "artifact.updated",
+    "artifact.edit.proposed",
+    "artifact.edit.applied",
+    "artifact.edit.rejected",
+    "artifact.error",
 ]
 
 class SSEEvent(BaseModel):

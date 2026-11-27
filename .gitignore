@@ -13,3 +13,6 @@ __pycache__/
 .venv/
 env/
 .pytest_cache/
+
+# R2 Canvas development storage (never the production store)
+data/canvas/
