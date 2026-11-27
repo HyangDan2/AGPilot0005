@@ -34,6 +34,9 @@ BUILTIN_TOOLS = [
     "canvas.list_revisions",
     "canvas.restore_revision",
     "canvas.export_artifact",
+    # WO-C18 workspace-aware tools (their own opt-in switch: AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED)
+    "canvas.save_to_workspace",
+    "canvas.load_from_workspace",
 ]
 
 DEFAULT_POLICY: Dict[str, Any] = {

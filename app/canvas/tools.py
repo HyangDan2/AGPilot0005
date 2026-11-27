@@ -1,11 +1,16 @@
-"""Canvas tool manifest and handlers (WO-C08).
+"""Canvas tool manifest and handlers (WO-C08 · WO-C18).
 
-Eight tools, compatible with the existing Dynamic Tool Registry and the AI Gateway wire contract
-(function names already use the ``namespace.tool`` shape that the wire layer translates):
+Ten tools in two opt-in surfaces. The frozen eight (WO-C08) are compatible with the existing
+Dynamic Tool Registry and the AI Gateway wire contract (function names already use the
+``namespace.tool`` shape that the wire layer translates):
 
     canvas.create_artifact   canvas.read_artifact     canvas.list_artifacts
     canvas.propose_edit      canvas.apply_edit        canvas.list_revisions
     canvas.restore_revision  canvas.export_artifact
+
+WO-C18-02 adds the workspace-aware pair (own opt-in switch, ``AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED``):
+
+    canvas.save_to_workspace   canvas.load_from_workspace
 
 Every handler:
 * takes identity **only** from ``current_execution_scope`` (the verified ``ExecutionScope``),
@@ -25,6 +30,12 @@ from typing import Any, Dict, List, Optional
 
 from app.canvas.errors import CanvasError, CanvasErrorCode
 from app.canvas.offsets import Selection
+from app.canvas.omni import (
+    OMNI_TOOL_MANIFEST,
+    WORKSPACE_TOOL_NAMES,
+    omni_integration_report,
+    workspace_tools_enabled,
+)
 
 CANVAS_TOOL_NAMES = (
     "canvas.create_artifact",
@@ -446,6 +457,71 @@ _HANDLERS = {
 }
 
 
+# --------------------------------------------------------------------------- workspace tools (WO-C18)
+
+
+async def save_to_workspace(
+    artifact_id: str,
+    workspace_id: Optional[str] = None,
+    path: Optional[str] = None,
+    revision: Optional[int] = None,
+    format: Optional[str] = None,
+    expected_content_hash: Optional[str] = None,
+    create_parents: bool = True,
+    overwrite: bool = True,
+) -> Dict[str, Any]:
+    """Save an artifact into its (or a named) workspace file and record the save state."""
+    try:
+        scope = _scope_or_error()
+        return _service().manager.save_to_workspace(
+            scope,
+            artifact_id,
+            workspace_id=workspace_id,
+            path=path,
+            revision=revision,
+            format=format,
+            expected_content_hash=expected_content_hash,
+            create_parents=create_parents,
+            overwrite=overwrite,
+        )
+    except CanvasError as exc:
+        return _error(exc)
+
+
+async def load_from_workspace(
+    workspace_id: str,
+    workspace_file_id: Optional[str] = None,
+    path: Optional[str] = None,
+    title: Optional[str] = None,
+    artifact_type: Optional[str] = None,
+    language: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Open an existing workspace file as a Canvas editing session (external reference)."""
+    try:
+        scope = _scope_or_error()
+        return _service().manager.load_from_workspace(
+            scope,
+            workspace_id=workspace_id,
+            workspace_file_id=workspace_file_id,
+            path=path,
+            title=title,
+            artifact_type=artifact_type,
+            language=language,
+            conversation_id=conversation_id,
+            force=force,
+        )
+    except CanvasError as exc:
+        return _error(exc)
+
+
+_WORKSPACE_HANDLERS = {
+    "canvas.save_to_workspace": save_to_workspace,
+    "canvas.load_from_workspace": load_from_workspace,
+}
+
+
 def install_canvas_tools(tool_registry: Any = None, *, ai_exposed_only: bool = True) -> List[str]:
     """Register the Canvas tools on the Dynamic Tool Registry (idempotent).
 
@@ -453,6 +529,10 @@ def install_canvas_tools(tool_registry: Any = None, *, ai_exposed_only: bool = T
     ``canvas.apply_edit`` out: the model cannot apply a proposal at all until the R1.3 integration
     provides a verified user-approval channel. Pass ``ai_exposed_only=False`` only for admin
     tooling that supplies a real approval.
+
+    The return value is the **core** surface it registered (WO-C18 keeps it byte-for-byte). The two
+    workspace tools are installed in addition, only when both the Canvas tool gate and
+    ``AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED`` are on — see :mod:`app.canvas.omni`.
     """
     if tool_registry is None:
         from app.tools.registry import registry as default_registry
@@ -474,6 +554,34 @@ def install_canvas_tools(tool_registry: Any = None, *, ai_exposed_only: bool = T
             is_read_only=bool(spec.get("read_only")),
         )
         registered.append(name)
+    if workspace_tools_enabled():
+        install_canvas_workspace_tools(target)
+    return registered
+
+
+def install_canvas_workspace_tools(tool_registry: Any = None) -> List[str]:
+    """Install ``canvas.save_to_workspace`` / ``canvas.load_from_workspace`` (WO-C18-02).
+
+    Callers other than :func:`install_canvas_tools` must have checked
+    :func:`app.canvas.omni.workspace_tools_enabled` themselves: this function only registers.
+    """
+    if tool_registry is None:
+        from app.tools.registry import registry as default_registry
+
+        target = default_registry
+    else:
+        target = tool_registry
+    registered: List[str] = []
+    for spec in OMNI_TOOL_MANIFEST:
+        name = spec["name"]
+        target.register(
+            name=name,
+            description=spec["description"],
+            parameters=spec["parameters"],
+            handler=_WORKSPACE_HANDLERS[name],
+            is_read_only=bool(spec.get("read_only")),
+        )
+        registered.append(name)
     return registered
 
 
@@ -487,6 +595,17 @@ def manifest() -> Dict[str, Any]:
             {**tool, "ai_exposed": tool["name"] in AI_EXPOSED_TOOL_NAMES}
             for tool in CANVAS_TOOL_MANIFEST
         ],
+        # WO-C18-02: the workspace-aware surface is reported separately so the frozen eight
+        # (and the 90-PASS evidence recorded for them) stay exactly what they were.
+        "workspace_tools": [
+            {
+                **tool,
+                "ai_exposed": True,
+                "gate": "AGCORE_CANVAS_TOOLS_ENABLED + AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED",
+            }
+            for tool in OMNI_TOOL_MANIFEST
+        ],
+        "tool_names": list(CANVAS_TOOL_NAMES) + list(WORKSPACE_TOOL_NAMES),
         "approval_boundary": {
             **approval_policy(),
             "ai_exposed_tools": list(AI_EXPOSED_TOOL_NAMES),
@@ -500,7 +619,9 @@ def manifest() -> Dict[str, Any]:
         "integration": {
             "runtime_tool_calling": "not connected in R2 (R1.3 integration stage; registration requires AGCORE_CANVAS_TOOLS_ENABLED)",
             "ai_exposed_tools": len(AI_EXPOSED_TOOL_NAMES),
+            "workspace_tools_enabled": workspace_tools_enabled(),
             "verification": "dev API / adapter only; no real LLM call was made",
             "exposure": "registered only when AGCORE_CANVAS_TOOLS_ENABLED is on; no shipped tool profile lists them",
         },
+        "omni": omni_integration_report(),
     }

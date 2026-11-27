@@ -19,8 +19,9 @@ from app.canvas.errors import CanvasError, CanvasErrorCode
 from app.canvas.events import GenerationService, events_contract
 from app.canvas.export import provider_for
 from app.canvas.manager import ArtifactManager
+from app.canvas.omni import omni_integration_report, workspace_save_contract
 from app.canvas.revisions import PatchEngine, RevisionManager
-from app.canvas.storage import SqliteCanvasStorage
+from app.canvas.storage import SCHEMA_VERSION, SqliteCanvasStorage
 from app.canvas.tools import CANVAS_TOOL_MANIFEST
 from app.canvas.types import ArtifactTypeRegistry, default_type_registry
 from app.canvas.workspace import build_workspace_gateway, workspace_contract_report
@@ -72,7 +73,7 @@ class CanvasService:
         return {
             "enabled": self.settings.enabled,
             "environment": self.settings.environment,
-            "schema_version": 2,
+            "schema_version": SCHEMA_VERSION,
             "storage": {
                 "backend": self.storage.__class__.__name__,
                 "database": self.settings.db_path.name,
@@ -121,6 +122,8 @@ class CanvasService:
                 "note": "No real LLM call is made in R2 backend work; R1.3 runtime integration is pending.",
             },
             "approval": approval_policy(),
+            "omni": omni_integration_report(),
+            "workspace_save": workspace_save_contract(),
             "export": self.exporter.describe(),
             "events": events_contract(),
             "tools": [tool["name"] for tool in CANVAS_TOOL_MANIFEST],

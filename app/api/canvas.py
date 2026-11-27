@@ -132,6 +132,42 @@ class ExportToWorkspaceBody(BaseModel):
     mime_type: Optional[str] = Field(default=None, max_length=200)
 
 
+class SaveToWorkspaceBody(BaseModel):
+    """WO-C18-04 *Save to Workspace*: export + record the workspace file link.
+
+    ``workspace_id`` / ``path`` may be omitted once the artifact is linked (its own workspace and
+    relative path are used); ``expected_content_hash`` defaults to the hash Canvas last reconciled
+    with, so an external edit is answered with ``409 content_conflict`` instead of an overwrite.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: Optional[str] = Field(default=None, max_length=64)
+    path: Optional[str] = Field(default=None, max_length=1024)
+    revision: Optional[int] = Field(default=None, ge=1)
+    format: Optional[str] = Field(default=None, max_length=32)
+    expected_content_hash: Optional[str] = Field(default=None, max_length=80)
+    create_parents: bool = True
+    overwrite: bool = True
+    mime_type: Optional[str] = Field(default=None, max_length=200)
+
+
+class LoadFromWorkspaceBody(BaseModel):
+    """WO-C18-04 *Load from Workspace*: open an existing workspace file as a Canvas session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: str = Field(min_length=1, max_length=64)
+    workspace_file_id: Optional[str] = Field(default=None, max_length=64)
+    path: Optional[str] = Field(default=None, max_length=1024)
+    title: Optional[str] = Field(default=None, max_length=200)
+    artifact_type: Optional[str] = Field(default=None, max_length=32)
+    language: Optional[str] = Field(default=None, max_length=32)
+    conversation_id: Optional[str] = Field(default=None, max_length=64)
+    revision: Optional[int] = Field(default=None, ge=1)
+    force: bool = False
+
+
 class EditProposalBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -458,6 +494,73 @@ async def export_artifact_to_workspace(
             overwrite=body.overwrite,
             mime_type=body.mime_type,
         )
+    except CanvasError as exc:
+        raise _http(exc) from exc
+
+
+# --------------------------------------------------------------------------- workspace save / load
+
+
+@router.post("/artifacts/from-workspace", status_code=201)
+async def load_artifact_from_workspace(body: LoadFromWorkspaceBody, request: Request) -> Dict[str, Any]:
+    """Open an **existing** workspace file as a Canvas editing session (WO-C18-04).
+
+    Reads through ``get_file_metadata`` / ``list_workspace_files`` / ``read_file`` and creates (or
+    reuses) a workspace-linked artifact. The workspace file stays the source of truth: Canvas keeps
+    an edit buffer and a ``WorkspaceFileLink``, never a second authoritative copy.
+    """
+    scope = _scope(request)
+    try:
+        return _service(request).manager.load_from_workspace(
+            scope,
+            workspace_id=body.workspace_id,
+            workspace_file_id=body.workspace_file_id,
+            path=body.path,
+            title=body.title,
+            artifact_type=body.artifact_type,
+            language=body.language,
+            conversation_id=body.conversation_id,
+            revision=body.revision,
+            force=body.force,
+        )
+    except CanvasError as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/artifacts/{artifact_id}/save-to-workspace")
+async def save_artifact_to_workspace(
+    artifact_id: str, body: SaveToWorkspaceBody, request: Request
+) -> Dict[str, Any]:
+    """*Save to Workspace*: write the artifact and record the workspace file link (WO-C18-04).
+
+    Same bytes and same write contract as ``export-to-workspace``; the difference is the save
+    state (``workspace_file_id``, ``relative_path``, ``last_saved_content_hash``) that makes the
+    next save refuse a silently overwriting write with ``409 content_conflict``.
+    """
+    scope = _scope(request)
+    try:
+        return _service(request).manager.save_to_workspace(
+            scope,
+            artifact_id,
+            workspace_id=body.workspace_id,
+            path=body.path,
+            revision=body.revision,
+            format=body.format,
+            expected_content_hash=body.expected_content_hash,
+            create_parents=body.create_parents,
+            overwrite=body.overwrite,
+            mime_type=body.mime_type,
+        )
+    except CanvasError as exc:
+        raise _http(exc) from exc
+
+
+@router.get("/artifacts/{artifact_id}/workspace-link")
+async def artifact_workspace_link(artifact_id: str, request: Request) -> Dict[str, Any]:
+    """The saved link state of an artifact (``workspace_link: null`` when it was never saved)."""
+    scope = _scope(request)
+    try:
+        return _service(request).manager.workspace_link(scope, artifact_id)
     except CanvasError as exc:
         raise _http(exc) from exc
 
