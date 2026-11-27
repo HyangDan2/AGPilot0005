@@ -223,9 +223,14 @@ async def test_edit_proposal_apply_and_reject(canvas):
         assert r.json()["content"] == content
         assert r.json()["artifact"]["current_revision"] == 1
 
-        r = await c.post(f"{BASE}/edit-proposals/{proposal['proposal_id']}/apply", headers=headers(), json={})
+        r = await c.post(
+            f"{BASE}/edit-proposals/{proposal['proposal_id']}/apply",
+            headers=headers(),
+            json={"user_approved": True},
+        )
         assert r.status_code == 200, r.text
         assert r.json()["applied"] is True
+        assert r.json()["approval"]["source"] == "user_action"
         assert r.json()["revision"]["revision"] == 2
         assert r.json()["revision"]["actor"] == "ai"
         assert r.json()["proposal"]["status"] == "applied"
@@ -233,10 +238,14 @@ async def test_edit_proposal_apply_and_reject(canvas):
         r = await c.get(f"{BASE}/artifacts/{aid}", headers=headers())
         assert r.json()["content"] == "첫 문장." + content[8:]
 
-        # applying again is a no-op, not a second revision
-        r = await c.post(f"{BASE}/edit-proposals/{proposal['proposal_id']}/apply", headers=headers(), json={})
-        assert r.status_code == 200
-        assert r.json()["duplicate"] is True
+        # WO-C17 / C-FIX-03: a second application is an explicit 409 conflict, not a silent no-op
+        r = await c.post(
+            f"{BASE}/edit-proposals/{proposal['proposal_id']}/apply",
+            headers=headers(),
+            json={"user_approved": True},
+        )
+        assert r.status_code == 409
+        assert r.json()["detail"]["code"] == "proposal_already_applied"
         r = await c.get(f"{BASE}/artifacts/{aid}/revisions", headers=headers())
         assert r.json()["total"] == 2
 
@@ -257,8 +266,11 @@ async def test_edit_proposal_apply_and_reject(canvas):
         assert r.json()["event"]["event"] == "artifact.edit.rejected"
         r = await c.get(f"{BASE}/artifacts/{aid}", headers=headers())
         assert r.json()["artifact"]["current_revision"] == 2
-        r = await c.post(f"{BASE}/edit-proposals/{second}/apply", headers=headers(), json={})
-        assert r.status_code == 422
+        r = await c.post(
+            f"{BASE}/edit-proposals/{second}/apply", headers=headers(), json={"user_approved": True}
+        )
+        assert r.status_code == 409
+        assert r.json()["detail"]["code"] == "proposal_rejected"
 
 
 @pytest.mark.asyncio
@@ -291,7 +303,11 @@ async def test_proposal_becomes_stale_instead_of_overwriting_user_edit(canvas):
         )
         assert r.status_code == 200
 
-        r = await c.post(f"{BASE}/edit-proposals/{proposal['proposal_id']}/apply", headers=headers(), json={})
+        r = await c.post(
+            f"{BASE}/edit-proposals/{proposal['proposal_id']}/apply",
+            headers=headers(),
+            json={"user_approved": True},
+        )
         assert r.status_code == 409
         assert r.json()["detail"]["code"] == "proposal_stale"
         r = await c.get(f"{BASE}/artifacts/{aid}", headers=headers())
@@ -405,10 +421,16 @@ def test_tool_manifest_matches_registry_and_opt_in_registration(canvas):
     # AGCORE_CANVAS_TOOLS_ENABLED opt-in.
     assert names.isdisjoint({reg.name for reg in registry.list_tools()})
 
-    # Explicit registration (the opt-in path) adds them and is idempotent.
-    assert set(install_canvas_tools(registry)) == names
-    assert names <= {reg.name for reg in registry.list_tools()}
-    assert set(install_canvas_tools(registry)) == names
+    # Explicit registration (the opt-in path) is idempotent. The default install is the
+    # model-facing surface, which withholds canvas.apply_edit (WO-C17 / C-FIX-06).
+    from app.canvas.tools import AI_EXPOSED_TOOL_NAMES
+
+    assert set(install_canvas_tools(registry)) == set(AI_EXPOSED_TOOL_NAMES)
+    assert "canvas.apply_edit" not in AI_EXPOSED_TOOL_NAMES
+    assert set(AI_EXPOSED_TOOL_NAMES) <= {reg.name for reg in registry.list_tools()}
+    assert set(install_canvas_tools(registry)) == set(AI_EXPOSED_TOOL_NAMES)
+    # An admin surface that supplies a real approval may register all eight.
+    assert set(install_canvas_tools(registry, ai_exposed_only=False)) == names
 
     shipped = manifest()
     assert shipped["integration"]["verification"].startswith("dev API")
@@ -423,7 +445,9 @@ def test_tool_manifest_matches_registry_and_opt_in_registration(canvas):
 def test_canvas_tools_are_registered_only_with_the_opt_in_flag(monkeypatch):
     from app.tools.registry import CANVAS_TOOLS_ENV, ToolRegistry, canvas_tools_enabled
 
-    names = {tool["name"] for tool in CANVAS_TOOL_MANIFEST}
+    from app.canvas.tools import AI_EXPOSED_TOOL_NAMES
+
+    names = set(AI_EXPOSED_TOOL_NAMES)
     for value in ("", "0", "false", "no", "off", "enabled", "2"):
         monkeypatch.setenv(CANVAS_TOOLS_ENV, value)
         assert canvas_tools_enabled() is False, value
@@ -570,6 +594,7 @@ async def test_tool_propose_and_apply_edit(canvas):
         payload = json.loads(result.content)
         assert payload["ai_integration_verified"] is False
 
+        # WO-C17 / C-FIX-06: a tool call is not a user approval — the apply is refused.
         apply_call = ToolCall(
             id="p-2",
             function=FunctionCall(
@@ -578,9 +603,10 @@ async def test_tool_propose_and_apply_edit(canvas):
             ),
         )
         result = await dispatcher.execute_tool_call(apply_call, service=None)
-        assert result.is_error is False, result.content
-        assert json.loads(result.content)["revision"]["revision"] == 2
-        assert canvas.manager.get(scope(), artifact.artifact_id)["content"] == "하하다라"
+        assert result.is_error is True, result.content
+        assert json.loads(result.content)["code"] == "user_approval_required"
+        assert json.loads(result.content)["context"]["tool_call_is_approval"] is False
+        assert canvas.manager.get(scope(), artifact.artifact_id)["content"] == "가나다라"
 
         revisions = ToolCall(
             id="p-3",
@@ -589,6 +615,6 @@ async def test_tool_propose_and_apply_edit(canvas):
             ),
         )
         result = await dispatcher.execute_tool_call(revisions, service=None)
-        assert json.loads(result.content)["total"] == 2
+        assert json.loads(result.content)["total"] == 1
     finally:
         current_execution_scope.reset(token)

@@ -220,30 +220,42 @@ async def test_limits_content_size_and_revision_retention(configured):
     artifact, _revision, _dup, _meta = service.manager.create(
         scope(), title="작은 문서", artifact_type="plain_text", content="a"
     )
-    for index in range(2):
+    # WO-C17 / C-FIX-04: reaching the cap prunes the oldest unprotected revision instead of
+    # blocking edits forever. Three edits on a max_revisions=3 artifact must all succeed.
+    for index in range(3):
         service.patches.apply(
             scope(),
             PatchRequest(
                 artifact_id=artifact.artifact_id,
                 base_revision=index + 1,
                 operation="append_content",
-                replacement_text="b",
+                replacement_text="b" if index < 2 else "c",
             ),
         )
+    loaded = service.manager.get(scope(), artifact.artifact_id)
+    assert loaded["content"] == "abbc"
+    assert loaded["artifact"]["current_revision"] == 4
     assert service.storage.count_revisions(artifact.artifact_id) == 3
-    with pytest.raises(CanvasError) as exc:
-        service.patches.apply(
-            scope(),
-            PatchRequest(
-                artifact_id=artifact.artifact_id,
-                base_revision=3,
-                operation="append_content",
-                replacement_text="c",
-            ),
-        )
-    assert exc.value.code is CanvasErrorCode.REVISION_LIMIT_REACHED
-    # the refused patch left the artifact untouched
-    assert service.manager.get(scope(), artifact.artifact_id)["content"] == "abb"
+    pruned = service.storage.list_pruned_revisions(artifact.artifact_id)
+    assert [row["revision"] for row in pruned] == [2]
+    assert pruned[0]["reason"] == "retention_cap"
+    # current revision and the retention window are intact, and the baseline is still readable
+    assert loaded["limits"]["revision_retention"]["pruned_total"] == 1
+    assert loaded["limits"]["revision_retention"]["editing_blocked_at_limit"] is False
+    assert service.revisions.get(scope(), artifact.artifact_id, 4)["is_current"] is True
+    assert service.revisions.get(scope(), artifact.artifact_id, 1)["content"] == "a"
+    # a further edit keeps working (no permanent block)
+    service.patches.apply(
+        scope(),
+        PatchRequest(
+            artifact_id=artifact.artifact_id,
+            base_revision=4,
+            operation="append_content",
+            replacement_text="d",
+        ),
+    )
+    assert service.manager.get(scope(), artifact.artifact_id)["content"] == "abbcd"
+    assert service.storage.count_revisions(artifact.artifact_id) == 3
 
 
 @pytest.mark.asyncio
@@ -252,11 +264,13 @@ async def test_storage_failure_never_returns_success(canvas, monkeypatch):
         def boom(content):
             raise CanvasError(CanvasErrorCode.STORAGE_FAILURE, "disk unavailable")
 
+        original = canvas.storage._write_blob
         monkeypatch.setattr(canvas.storage, "_write_blob", boom)
         r = await _create(c, title="실패", content="본문")
         assert r.status_code == 500
         assert r.json()["detail"]["code"] == "storage_failure"
-        monkeypatch.undo()
+        # restore only the storage method: monkeypatch.undo() would also drop the feature-flag env
+        canvas.storage._write_blob = original
         r = await c.get(f"{BASE}/artifacts", headers=headers())
         assert r.json()["total"] == 0
 
