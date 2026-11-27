@@ -583,7 +583,7 @@ async def artifact_workspace_link(artifact_id: str, request: Request) -> Dict[st
 async def create_edit_proposal(artifact_id: str, body: EditProposalBody, request: Request) -> Dict[str, Any]:
     scope = _scope(request)
     try:
-        return _service(request).proposals.create(
+        return await _service(request).proposals.create_async(
             scope,
             artifact_id,
             instruction=body.instruction,

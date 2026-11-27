@@ -152,16 +152,117 @@ class DevScriptedEditAdapter:
 
 
 class RuntimeEditAdapter:
-    """Placeholder for the R1.3-integrated adapter; fails closed until integration."""
+    """R2-BETA-HOTFIX-03: AI Gateway-backed edit adapter using R1.3 gateway_for_service."""
 
     mode = "runtime"
 
+    @staticmethod
+    def _build_messages(envelope: EditEnvelope) -> List[Any]:
+        from app.schemas.gateway import GatewayMessage
+
+        sys_prompt = (
+            "You are a precise document and code editor. "
+            "Apply the user's editing instruction to the provided target text and return ONLY the revised replacement text. "
+            "Do not include explanations, preambles, or surrounding code fences unless they are part of the content itself."
+        )
+        parts = [
+            f"Artifact type: {envelope.artifact_type}" + (f" ({envelope.language})" if envelope.language else ""),
+            f"Edit scope: {'full document' if envelope.operation == 'replace_content' else 'selected range'}",
+            f"Instruction: {envelope.instruction}",
+        ]
+        if envelope.context_text:
+            parts.append(f"Surrounding context (read-only reference):\n{envelope.context_text}")
+        parts.append(f"Target text to revise:\n{envelope.selected_text}")
+        return [
+            GatewayMessage(role="system", content=sys_prompt),
+            GatewayMessage(role="user", content="\n\n".join(parts)),
+        ]
+
+    async def propose_async(self, envelope: EditEnvelope, *, request: Dict[str, Any]) -> EditProposalDraft:
+        import asyncio
+        import inspect
+        from app.gateway.client import gateway_client, gateway_for_service
+        from app.schemas.gateway import ModelReply
+
+        service_id = request.get("service_id") or "hd2ai-admin"
+        client = gateway_for_service(service_id, gateway_client)
+        # Never allow mock fallback for Canvas AI edit proposals
+        if getattr(client, "mock_mode", False):
+            raise CanvasError(
+                CanvasErrorCode.AI_ADAPTER_UNAVAILABLE,
+                "AI Gateway is in mock mode; real model gateway is required for AI edit proposals",
+                retryable=True,
+                context={"adapter": self.mode, "service_id": service_id},
+            )
+        messages = self._build_messages(envelope)
+        try:
+            params = inspect.signature(client.execute).parameters
+            kw: Dict[str, Any] = {}
+            if "_structured" in params:
+                kw["_structured"] = True
+            async with asyncio.timeout(60.0):
+                raw = await client.execute(
+                    messages=messages,
+                    tools=None,
+                    tool_choice="none",
+                    stream=False,
+                    **kw,
+                )
+        except CanvasError:
+            raise
+        except TimeoutError as exc:
+            raise CanvasError(
+                CanvasErrorCode.AI_ADAPTER_UNAVAILABLE,
+                "AI Gateway timed out while generating edit proposal",
+                retryable=True,
+                context={"adapter": self.mode, "reason": "timeout", "service_id": service_id},
+            ) from exc
+        except Exception as exc:
+            raise CanvasError(
+                CanvasErrorCode.AI_ADAPTER_UNAVAILABLE,
+                f"AI Gateway edit proposal failed: {exc.__class__.__name__}",
+                retryable=True,
+                context={"adapter": self.mode, "reason": exc.__class__.__name__, "service_id": service_id},
+            ) from exc
+
+        model_label: Optional[str] = None
+        if isinstance(raw, ModelReply):
+            content = raw.content
+            model_label = raw.model_label
+        elif isinstance(raw, tuple) and len(raw) >= 1:
+            content = raw[0]
+        else:
+            content = str(raw) if raw is not None else ""
+
+        if not isinstance(content, str) or not content.strip():
+            raise CanvasError(
+                CanvasErrorCode.AI_ADAPTER_UNAVAILABLE,
+                "AI Gateway returned an empty edit proposal",
+                retryable=True,
+                context={"adapter": self.mode, "reason": "empty_response", "service_id": service_id},
+            )
+
+        return EditProposalDraft(
+            replacement_text=content,
+            operation=envelope.operation,
+            change_reason=f"AI edit: {envelope.instruction[:120]}",
+            adapter=self.mode,
+            model_label=model_label,
+            notes=["generated via AI Gateway runtime edit adapter"],
+        )
+
     def propose(self, envelope: EditEnvelope, *, request: Dict[str, Any]) -> EditProposalDraft:
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.propose_async(envelope, request=request))
         raise CanvasError(
             CanvasErrorCode.AI_ADAPTER_UNAVAILABLE,
-            "AI edit adapter is not integrated with the R1.3 runtime in this build",
+            "RuntimeEditAdapter requires async invocation (use ProposalService.create_async)",
             retryable=True,
-            context={"adapter": self.mode, "ai_integration_verified": False},
+            context={"adapter": self.mode},
         )
 
 
@@ -297,7 +398,7 @@ class ProposalService:
         self.adapter = adapter
         self.workspace = workspace
 
-    def create(
+    def _prepare_envelope(
         self,
         scope: Any,
         artifact_id: str,
@@ -310,9 +411,8 @@ class ProposalService:
         budget_tokens: Optional[int] = None,
         scripted_replacement: Optional[str] = None,
         dev_rule: Optional[str] = None,
-        change_reason: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> tuple[Any, int, str, Optional[Selection], EditEnvelope]:
         request_payload = {
             "instruction": instruction,
             "selection": selection.model_dump() if selection else None,
@@ -350,9 +450,22 @@ class ProposalService:
             budget_tokens=budget,
             instruction_kind=instruction_kind,
         )
-        draft = self.adapter.propose(
-            envelope, request={"scripted_replacement": scripted_replacement, "dev_rule": dev_rule}
-        )
+        return artifact, current, content, selection, envelope
+
+    def _finalize_proposal(
+        self,
+        *,
+        artifact: Any,
+        current: int,
+        content: str,
+        selection: Optional[Selection],
+        envelope: EditEnvelope,
+        draft: EditProposalDraft,
+        instruction: str,
+        instruction_kind: str,
+        scripted_replacement: Optional[str],
+        change_reason: Optional[str],
+    ) -> Dict[str, Any]:
         expected_original = envelope.selected_text
         operation: PatchOperation = draft.operation
         if operation == "replace_content" and selection is not None:
@@ -364,6 +477,7 @@ class ProposalService:
             )
         preview = self._preview(artifact, content, operation, selection, expected_original, draft.replacement_text, current)
         now = iso_now()
+        is_verified = draft.adapter == "runtime"
         proposal = EditProposal(
             proposal_id=new_proposal_id(),
             artifact_id=artifact.artifact_id,
@@ -377,7 +491,7 @@ class ProposalService:
             actor="ai",
             adapter=draft.adapter,
             model_label=draft.model_label,
-            ai_integration_verified=False,
+            ai_integration_verified=is_verified,
             created_at=now,
             updated_at=now,
             request={
@@ -399,10 +513,110 @@ class ProposalService:
         event = artifact_event(
             "artifact.edit.proposed",
             artifact_id=artifact.artifact_id,
-            data={"proposal": stored.model_dump(), "ai_integration_verified": False},
+            data={"proposal": stored.model_dump(), "ai_integration_verified": is_verified},
             status="proposed",
         )
         return {"proposal": stored.model_dump(), "event": event.model_dump(), "envelope": envelope.model_dump()}
+
+    def create(
+        self,
+        scope: Any,
+        artifact_id: str,
+        *,
+        instruction: str,
+        base_revision: Optional[int] = None,
+        selection: Optional[Selection] = None,
+        offset_unit: Optional[OffsetUnit] = None,
+        instruction_kind: str = "edit_selection",
+        budget_tokens: Optional[int] = None,
+        scripted_replacement: Optional[str] = None,
+        dev_rule: Optional[str] = None,
+        change_reason: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        artifact, current, content, resolved_sel, envelope = self._prepare_envelope(
+            scope,
+            artifact_id,
+            instruction=instruction,
+            base_revision=base_revision,
+            selection=selection,
+            offset_unit=offset_unit,
+            instruction_kind=instruction_kind,
+            budget_tokens=budget_tokens,
+            scripted_replacement=scripted_replacement,
+            dev_rule=dev_rule,
+            extra=extra,
+        )
+        adapter_req = {
+            "scripted_replacement": scripted_replacement,
+            "dev_rule": dev_rule,
+            "service_id": getattr(scope, "service_id", None),
+        }
+        draft = self.adapter.propose(envelope, request=adapter_req)
+        return self._finalize_proposal(
+            artifact=artifact,
+            current=current,
+            content=content,
+            selection=resolved_sel,
+            envelope=envelope,
+            draft=draft,
+            instruction=instruction,
+            instruction_kind=instruction_kind,
+            scripted_replacement=scripted_replacement,
+            change_reason=change_reason,
+        )
+
+    async def create_async(
+        self,
+        scope: Any,
+        artifact_id: str,
+        *,
+        instruction: str,
+        base_revision: Optional[int] = None,
+        selection: Optional[Selection] = None,
+        offset_unit: Optional[OffsetUnit] = None,
+        instruction_kind: str = "edit_selection",
+        budget_tokens: Optional[int] = None,
+        scripted_replacement: Optional[str] = None,
+        dev_rule: Optional[str] = None,
+        change_reason: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        artifact, current, content, resolved_sel, envelope = self._prepare_envelope(
+            scope,
+            artifact_id,
+            instruction=instruction,
+            base_revision=base_revision,
+            selection=selection,
+            offset_unit=offset_unit,
+            instruction_kind=instruction_kind,
+            budget_tokens=budget_tokens,
+            scripted_replacement=scripted_replacement,
+            dev_rule=dev_rule,
+            extra=extra,
+        )
+        adapter_req = {
+            "scripted_replacement": scripted_replacement,
+            "dev_rule": dev_rule,
+            "service_id": getattr(scope, "service_id", None),
+        }
+        propose_async = getattr(self.adapter, "propose_async", None)
+        if callable(propose_async):
+            draft = await propose_async(envelope, request=adapter_req)
+        else:
+            draft = self.adapter.propose(envelope, request=adapter_req)
+        return self._finalize_proposal(
+            artifact=artifact,
+            current=current,
+            content=content,
+            selection=resolved_sel,
+            envelope=envelope,
+            draft=draft,
+            instruction=instruction,
+            instruction_kind=instruction_kind,
+            scripted_replacement=scripted_replacement,
+            change_reason=change_reason,
+        )
 
     def _preview(
         self,

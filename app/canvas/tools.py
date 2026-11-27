@@ -375,7 +375,7 @@ async def propose_edit(
         selection = None
         if selection_start is not None and selection_end is not None:
             selection = Selection(start=selection_start, end=selection_end, offset_unit=offset_unit)  # type: ignore[arg-type]
-        result = _service().proposals.create(
+        result = await _service().proposals.create_async(
             scope,
             artifact_id,
             instruction=instruction,

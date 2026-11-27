@@ -1058,3 +1058,70 @@ async def test_r2_beta_hotfix_02_conversation_id_propagates_to_canvas_artifact(m
         assert len(items) == 1
         assert items[0]["artifact_id"] == created_id
         assert items[0]["conversation_id"] == conv_id
+
+
+# ---------------------------------------------------------------------------
+# R2-BETA-HOTFIX-03: Canvas RuntimeEditAdapter -> AI Gateway Propose / Diff / Apply
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_r2_beta_hotfix_03_canvas_runtime_edit_adapter_gateway_propose_diff_apply(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGCORE_CANVAS_AI_ADAPTER", "runtime")
+    _setup_r2_env(monkeypatch, tmp_path, ScriptedGateway([]))
+    hdr = _proxy_headers("alice", "tenant-a", "hd2ai-beta")
+
+    edit_gw = ScriptedGateway([{"content": "# 다듬어진 제목\n명확하고 간결하게 개선된 본문입니다.\n"}])
+    monkeypatch.setattr("app.gateway.client.gateway_for_service", lambda svc, client: edit_gw)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1) Create artifact
+        rc = await client.post(
+            "/api/v1/canvas/artifacts",
+            json={
+                "title": "AI Edit Test",
+                "artifact_type": "markdown",
+                "content": "# 초안 제목\n좀 어색한 초안 본문입니다.\n",
+            },
+            headers=hdr,
+        )
+        assert rc.status_code == 201, rc.text
+        aid = rc.json()["artifact"]["artifact_id"]
+
+        # 2) Propose AI edit via RuntimeEditAdapter -> AI Gateway
+        rp = await client.post(
+            f"/api/v1/canvas/artifacts/{aid}/edit-proposals",
+            json={"instruction": "문체를 자연스럽게 다듬어줘", "instruction_kind": "change_style"},
+            headers=hdr,
+        )
+        assert rp.status_code == 201, rp.text
+        prop = rp.json()["proposal"]
+        assert prop["adapter"] == "runtime"
+        assert prop["ai_integration_verified"] is True
+        assert prop["model_label"] == "r2-int-mock"
+        assert "개선된 본문" in prop["replacement_text"]
+        assert prop["preview"]["stats"]["added_lines"] >= 1
+
+        # 3) Apply proposal with explicit user approval
+        ra = await client.post(
+            f"/api/v1/canvas/edit-proposals/{prop['proposal_id']}/apply",
+            json={"user_approved": True},
+            headers=hdr,
+        )
+        assert ra.status_code == 200, ra.text
+        assert ra.json()["artifact"]["current_revision"] == 2
+        rg = await client.get(f"/api/v1/canvas/artifacts/{aid}", headers=hdr)
+        assert rg.status_code == 200
+        assert "개선된 본문" in rg.json()["content"]
+
+        # 4) Gateway failure MUST return 503 ai_adapter_unavailable (no mock fallback!)
+        class FailingGW:
+            async def execute(self, **kwargs):
+                raise RuntimeError("upstream_gateway_down")
+
+        monkeypatch.setattr("app.gateway.client.gateway_for_service", lambda svc, client: FailingGW())
+        rf = await client.post(
+            f"/api/v1/canvas/artifacts/{aid}/edit-proposals",
+            json={"instruction": "짧게 요약해줘", "instruction_kind": "adjust_length"},
+            headers=hdr,
+        )
+        assert rf.status_code == 503, rf.text
+        assert rf.json()["detail"]["code"] == "ai_adapter_unavailable"
