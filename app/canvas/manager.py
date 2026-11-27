@@ -247,6 +247,7 @@ class ArtifactManager:
         actor_id: Optional[str] = None,
         artifact_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        _workspace_required_level: str = "write",
     ) -> tuple[Artifact, Revision, bool, Dict[str, Any]]:
         spec = self.types.get(artifact_type)
         normalized_language = self.types.normalize_language(spec.key, language)
@@ -255,10 +256,11 @@ class ArtifactManager:
             conversation_id = validate_identifier(conversation_id, "conversation_id")
         if workspace_id is not None:
             workspace_id = validate_identifier(workspace_id, "workspace_id")
-            # WO-C17 / C-FIX-01: creating *into* a workspace is a write, not a read.
+            # WO-C17 / C-FIX-01 & CP-02 #4: creating directly into a workspace requires write;
+            # loading an existing file from a read-only workspace into a Canvas edit buffer requires read.
             assert_workspace_level(
                 self.workspace, workspace_id, scope,
-                required="write", operation="artifact.create",
+                required=_workspace_required_level, operation="artifact.create",
             )
 
         tenant_id, owner_id, service_id = scope_ids(scope)
@@ -720,9 +722,11 @@ class ArtifactManager:
         """
 
         workspace_id = validate_identifier(workspace_id, "workspace_id")
+        # CP-02 #4: Read-only workspace allows loading into a Canvas edit buffer;
+        # saving/writing back to the workspace still enforces required="write" (403 read_only_workspace).
         access = assert_workspace_level(
             self.workspace, workspace_id, scope,
-            required="write", operation="artifact.load_from_workspace",
+            required="read", operation="artifact.load_from_workspace",
         )
         content = read_workspace_file(
             self.workspace, scope, access,
@@ -811,6 +815,7 @@ class ArtifactManager:
             change_reason=f"loaded from workspace {source.relative_path}",
             actor="import",
             actor_id=owner_id,
+            _workspace_required_level="read",
         )
         link = self.storage.upsert_workspace_link(
             WorkspaceFileLink(

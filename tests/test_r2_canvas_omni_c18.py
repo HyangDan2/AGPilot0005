@@ -224,9 +224,13 @@ async def test_c18_load_refuses_closed_read_only_and_unknown(canvas):
 
         workspace.set_lifecycle_state(WS, "open")
         workspace.set_read_only(WS, True)
+        # CP-02 #4: Read-only workspace allows loading into Canvas edit buffer, while saving back is refused.
         r = await _load(c, path=PATH)
-        assert r.status_code == 403
-        assert r.json()["detail"]["code"] == "read_only_workspace"
+        assert r.status_code == 201
+        ro_aid = r.json()["artifact"]["artifact_id"]
+        r_save_ro = await _save(c, ro_aid, workspace_id=WS, path=PATH)
+        assert r_save_ro.status_code == 403
+        assert r_save_ro.json()["detail"]["code"] == "read_only_workspace"
         workspace.set_read_only(WS, False)
 
         r = await _load(c, path="notes/missing.md")
@@ -237,16 +241,18 @@ async def test_c18_load_refuses_closed_read_only_and_unknown(canvas):
         assert r.status_code == 404
         assert r.json()["detail"]["code"] == "file_not_found"
 
-        # a read-only *grant* is not enough to open an editing session (it is opened to save back)
+        # CP-02 #4: A read-only grant allows loading into Canvas, while saving back is refused with 403.
         canvas.workspace.set_level(WS, "read")
         r = await _load(c, path=PATH)
-        assert r.status_code == 403
-        assert r.json()["detail"]["code"] == "workspace_access_denied"
-        assert r.json()["detail"]["context"]["required_level"] == "write"
+        assert r.status_code == 201
+        r_save_grant = await _save(c, r.json()["artifact"]["artifact_id"], workspace_id=WS, path=PATH)
+        assert r_save_grant.status_code == 403
+        assert r_save_grant.json()["detail"]["code"] == "workspace_access_denied"
+        assert r_save_grant.json()["detail"]["context"]["required_level"] == "write"
         canvas.workspace.set_level(WS, "admin")
 
-        # nothing was created by any refusal
-        assert (await c.get(f"{BASE}/artifacts", headers=headers())).json()["total"] == 0
+        # only the read-only load created an artifact (reused on second load); refusals created none
+        assert (await c.get(f"{BASE}/artifacts", headers=headers())).json()["total"] == 1
 
 
 @pytest.mark.asyncio

@@ -1315,7 +1315,11 @@ class WorkspaceManager:
                 )
                 if captured is None:
                     raise WorkspaceFailure(
-                        WorkspaceErrorCode.FILE_NOT_FOUND, file_id=record["file_id"], revision=revision
+                        WorkspaceErrorCode.PROVIDER_MISMATCH,
+                        "local_browser workspace requires client_read; server-side read is unsupported",
+                        file_id=record["file_id"],
+                        revision=revision,
+                        client_read_required=True,
                     )
                 return captured.encode("utf-8")
             root = self._root_path(workspace)
@@ -1558,9 +1562,24 @@ class WorkspaceManager:
         data = _write_payload(request)
         if self._extension_blocked(rel.rsplit("/", 1)[-1]):
             raise WorkspaceFailure(WorkspaceErrorCode.UNSUPPORTED_MEDIA_TYPE, name=rel)
-        existing = self.store.get_file_by_rel_path(workspace_id, rel) if self._is_folder_backed(workspace) else None
+        if self._is_folder_backed(workspace):
+            existing = self.store.get_file_by_rel_path(workspace_id, rel)
+        else:
+            existing = self._lookup_managed_by_rel_path(workspace_id, rel)
         if request.expected_content_hash is not None:
-            current_hash = existing.get("content_hash") if existing else None
+            current_hash: Optional[str] = existing.get("content_hash") if existing else None
+            # CP-02 #5: For folder-backed workspaces, hash the LIVE file on disk so external edits
+            # made outside AGCore are never silently overwritten using a stale SQLite cache.
+            if self._is_folder_backed(workspace):
+                root = self._root_path(workspace)
+                try:
+                    _live_bytes, live_digest = folderfs.read_relative(root, rel)
+                    current_hash = live_digest
+                except folderfs.FolderError as exc:
+                    if exc.code == "file_not_found":
+                        current_hash = None
+                    else:
+                        raise self._folder_failure(exc) from exc
             if current_hash != request.expected_content_hash:
                 raise WorkspaceFailure(
                     WorkspaceErrorCode.CONTENT_CONFLICT,
@@ -1602,6 +1621,22 @@ class WorkspaceManager:
             storage_provider=provider,
             content_origin=origin,
         )
+
+    def _lookup_managed_by_rel_path(self, workspace_id: str, rel: str) -> Optional[Dict[str, Any]]:
+        """Resolve an active file row by POSIX relative path in a server_managed workspace."""
+        parts = [p for p in rel.split("/") if p]
+        if not parts:
+            return None
+        parent_id: Optional[str] = None
+        for seg in parts[:-1]:
+            folder_row = self.store.find_child(workspace_id, parent_id, seg)
+            if folder_row is None or folder_row.get("kind") != FileKind.FOLDER.value:
+                return None
+            parent_id = folder_row["file_id"]
+        leaf = self.store.find_child(workspace_id, parent_id, parts[-1])
+        if leaf is None or leaf.get("kind") != FileKind.FILE.value:
+            return None
+        return leaf
 
     def _write_external_bytes(
         self,

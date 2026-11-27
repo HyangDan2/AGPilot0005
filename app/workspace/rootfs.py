@@ -11,6 +11,7 @@ Every server-side folder path that becomes a workspace root passes through this 
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from dataclasses import dataclass
@@ -84,7 +85,7 @@ def parse_allowed_roots(raw: str, *, default_root: Optional[Path] = None) -> Tup
         roots.append(
             AllowedRoot(
                 root_id="default",
-                path=str(Path(default_root) / "{owner}"),
+                path=str(Path(default_root) / "{tenant}" / "{owner}"),
                 scope="owner",
                 writable=True,
                 is_default=True,
@@ -167,20 +168,26 @@ class AllowedRootPolicy:
 
         # Pick the root by the *textual* path first, so a symlink at the root boundary is reported
         # as a symlink rather than as an unrelated root miss, then verify the resolved path.
-        text_roots: List[Tuple[int, AllowedRoot, Path]] = []
+        text_roots: List[Tuple[int, AllowedRoot, Path, Path]] = []
         for item in self.visible_roots(tenant_id, owner_id):
             if root_id is not None and item.root.root_id != root_id:
                 continue
-            root_path = _resolve_lenient(item.path)
-            if not _is_inside(candidate_in, Path(item.path).expanduser()):
+            expanded_root = Path(item.path).expanduser()
+            root_path = _resolve_lenient(expanded_root)
+            if not _is_inside(candidate_in, expanded_root):
                 continue
-            text_roots.append((len(str(root_path)), item.root, root_path))
+            text_roots.append((len(str(root_path)), item.root, root_path, expanded_root))
         if not text_roots:
             raise RootPolicyError("path_outside_allowed_root", "path is outside every allowed root")
         text_roots.sort(key=lambda entry: entry[0], reverse=True)
-        _, matched, root_path = text_roots[0]
+        _, matched, root_path, expanded_root = text_roots[0]
         if self.deny_symlinks:
-            self._assert_no_symlink_components(Path(matched.path).expanduser(), candidate_in)
+            try:
+                if expanded_root.exists() and stat.S_ISLNK(os.lstat(expanded_root).st_mode):
+                    raise RootPolicyError("symlink_escape", "allowed root is a symlink")
+            except OSError:
+                pass
+            self._assert_no_symlink_components(expanded_root, candidate_in)
         candidate = _resolve_lenient(candidate_in)
         if not _is_inside(candidate, root_path):
             reason = "symlink_escape" if self.deny_symlinks else "path_outside_allowed_root"
@@ -247,11 +254,15 @@ class AllowedRootPolicy:
 
 
 def _safe_scope_segment(value: str) -> str:
-    keep = []
-    for ch in (value or ""):
-        keep.append(ch if ch.isalnum() or ch in {"-", "_", "."} else "_")
-    cleaned = "".join(keep) or "unknown"
-    return cleaned[:96]
+    """Collision-free, traversal-safe directory segment for tenant/owner isolation (CP-02)."""
+    raw = str(value or "")
+    # Pure ASCII [A-Za-z0-9_-] within length limit without traversal risk stays readable
+    is_pure = bool(raw) and len(raw) <= 64 and all(ch.isalnum() or ch in {"-", "_"} for ch in raw) and raw not in {".", ".."}
+    if is_pure:
+        return raw
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    prefix = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in raw).strip("_")[:32] or "scope"
+    return f"{prefix}__{digest}"
 
 
 def _resolve_lenient(path: Path | str) -> Path:

@@ -89,7 +89,36 @@ class Settings(BaseModel):
     )
     TRAJECTORY_ENABLED: bool = os.environ.get("AGCORE_TRAJECTORY_ENABLED", "true").lower() in ("true", "1", "yes")
 
+    # Phase R2 (CP-02): Workspace & Canvas Feature Flags — default OFF (explicit opt-in required)
+    WORKSPACE_ENABLED: bool = os.environ.get("AGCORE_WORKSPACE_ENABLED", "false").lower() in ("true", "1", "yes")
+    CANVAS_ENABLED: bool = os.environ.get("AGCORE_CANVAS_ENABLED", "false").lower() in ("true", "1", "yes")
+    CANVAS_TOOLS_ENABLED: bool = os.environ.get("AGCORE_CANVAS_TOOLS_ENABLED", "false").lower() in ("true", "1", "yes")
+
 settings = Settings()
+
+
+def is_workspace_enabled() -> bool:
+    """Resolve AGCORE_WORKSPACE_ENABLED dynamically (default False)."""
+    raw = os.environ.get("AGCORE_WORKSPACE_ENABLED")
+    if raw is not None:
+        return raw.strip().lower() in ("true", "1", "yes", "on")
+    return bool(settings.WORKSPACE_ENABLED)
+
+
+def is_canvas_enabled() -> bool:
+    """Resolve AGCORE_CANVAS_ENABLED dynamically (default False)."""
+    raw = os.environ.get("AGCORE_CANVAS_ENABLED")
+    if raw is not None:
+        return raw.strip().lower() in ("true", "1", "yes", "on")
+    return bool(settings.CANVAS_ENABLED)
+
+
+def is_canvas_tools_enabled() -> bool:
+    """Resolve AGCORE_CANVAS_TOOLS_ENABLED dynamically (default False)."""
+    raw = os.environ.get("AGCORE_CANVAS_TOOLS_ENABLED")
+    if raw is not None:
+        return raw.strip().lower() in ("true", "1", "yes", "on")
+    return bool(settings.CANVAS_TOOLS_ENABLED)
 
 
 def validate_runtime_engine_config(engine: Optional[str] = None) -> str:

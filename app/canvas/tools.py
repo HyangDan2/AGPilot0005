@@ -473,7 +473,7 @@ async def save_to_workspace(
     """Save an artifact into its (or a named) workspace file and record the save state."""
     try:
         scope = _scope_or_error()
-        return _service().manager.save_to_workspace(
+        result = _service().manager.save_to_workspace(
             scope,
             artifact_id,
             workspace_id=workspace_id,
@@ -484,6 +484,22 @@ async def save_to_workspace(
             create_parents=create_parents,
             overwrite=overwrite,
         )
+        # CP-02 #7: Never report server-side tool success when local_browser requires unimplemented client_write
+        if result.get("client_write") is not None:
+            return _error(
+                CanvasError(
+                    CanvasErrorCode.PROVIDER_MISMATCH,
+                    "local_browser workspace requires client_write completion which is unsupported in server tool runtime",
+                    context={
+                        "artifact_id": artifact_id,
+                        "workspace_id": result.get("workspace_id"),
+                        "path": result.get("path"),
+                        "save_state": result.get("save_state"),
+                        "client_write_required": True,
+                    },
+                )
+            )
+        return result
     except CanvasError as exc:
         return _error(exc)
 

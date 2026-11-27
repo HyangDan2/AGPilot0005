@@ -55,7 +55,7 @@ def _default_state_dir() -> Path:
 class WorkspaceSettings:
     """Workspace engine settings. All values are env-overridable (`AGCORE_WORKSPACE_*`)."""
 
-    enabled: bool = field(default_factory=lambda: _env_bool("ENABLED", True))
+    enabled: bool = field(default_factory=lambda: _env_bool("ENABLED", False))
     db_path: str = field(default_factory=lambda: _env("DB_PATH", ""))
     storage_root: str = field(default_factory=lambda: _env("STORAGE_ROOT", ""))
 
@@ -184,6 +184,7 @@ class WorkspaceSettings:
     def for_testing(cls, tmp_path, **overrides) -> "WorkspaceSettings":
         base = tmp_path if isinstance(tmp_path, Path) else Path(tmp_path)
         values = dict(
+            enabled=True,
             db_path=str(base / "workspace.db"),
             storage_root=str(base / "storage"),
             max_file_bytes=1024 * 1024,

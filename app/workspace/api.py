@@ -51,7 +51,22 @@ def get_scope(request: Request) -> ExecutionScope:
 
 
 def get_workspace_runtime() -> WorkspaceRuntime:
-    return get_runtime()
+    from app.config import is_workspace_enabled
+
+    rt = get_runtime()
+    # Allow explicit test-injected runtime (WorkspaceSettings.for_testing sets enabled=True)
+    # or env/settings opt-in via AGCORE_WORKSPACE_ENABLED=true.
+    if not (rt.settings.enabled or is_workspace_enabled()):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "workspace_disabled",
+                "message": "Workspace feature is disabled (set AGCORE_WORKSPACE_ENABLED=true to enable).",
+                "retryable": False,
+                "context": {"feature_flag": "AGCORE_WORKSPACE_ENABLED"},
+            },
+        )
+    return rt
 
 
 def _http(failure: WorkspaceFailure) -> HTTPException:
