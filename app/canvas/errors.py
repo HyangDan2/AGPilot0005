@@ -34,6 +34,23 @@ class CanvasErrorCode(str, Enum):
     PROPOSAL_REJECTED = "proposal_rejected"
     USER_APPROVAL_REQUIRED = "user_approval_required"
     CANVAS_DISABLED = "canvas_disabled"
+    # R2-W Amendment 01 (folder-based workspace, `r2-w/v1+a01`) — the eight codes added by
+    # §A1.10 plus the v1 codes Canvas now surfaces unchanged through the write/export path.
+    WORKSPACE_CLOSED = "workspace_closed"
+    READ_ONLY_WORKSPACE = "read_only_workspace"
+    PATH_OUTSIDE_ALLOWED_ROOT = "path_outside_allowed_root"
+    SYMLINK_ESCAPE = "symlink_escape"
+    ROOT_UNAVAILABLE = "root_unavailable"
+    PROVIDER_MISMATCH = "provider_mismatch"
+    CONTENT_CONFLICT = "content_conflict"
+    SOURCE_DELETE_NOT_PERMITTED = "source_delete_not_permitted"
+    METADATA_OVERLAP = "metadata_overlap"
+    WATCH_UNAVAILABLE = "watch_unavailable"
+    WORKSPACE_NOT_FOUND = "workspace_not_found"
+    WORKSPACE_FILE_NOT_FOUND = "file_not_found"
+    WORKSPACE_FILE_EXISTS = "file_exists"
+    INVALID_PATH = "invalid_path"
+    INDEX_NOT_READY = "index_not_ready"
 
 
 ERROR_STATUS: Dict[CanvasErrorCode, int] = {
@@ -60,6 +77,22 @@ ERROR_STATUS: Dict[CanvasErrorCode, int] = {
     CanvasErrorCode.PROPOSAL_REJECTED: 409,
     CanvasErrorCode.USER_APPROVAL_REQUIRED: 403,
     CanvasErrorCode.CANVAS_DISABLED: 503,
+    # R2-W Amendment 01 (§A1.10 status mapping is authoritative)
+    CanvasErrorCode.WORKSPACE_CLOSED: 409,
+    CanvasErrorCode.READ_ONLY_WORKSPACE: 403,
+    CanvasErrorCode.PATH_OUTSIDE_ALLOWED_ROOT: 403,
+    CanvasErrorCode.SYMLINK_ESCAPE: 400,
+    CanvasErrorCode.ROOT_UNAVAILABLE: 409,
+    CanvasErrorCode.PROVIDER_MISMATCH: 400,
+    CanvasErrorCode.CONTENT_CONFLICT: 409,
+    CanvasErrorCode.SOURCE_DELETE_NOT_PERMITTED: 403,
+    CanvasErrorCode.METADATA_OVERLAP: 400,
+    CanvasErrorCode.WATCH_UNAVAILABLE: 409,
+    CanvasErrorCode.WORKSPACE_NOT_FOUND: 404,
+    CanvasErrorCode.WORKSPACE_FILE_NOT_FOUND: 404,
+    CanvasErrorCode.WORKSPACE_FILE_EXISTS: 409,
+    CanvasErrorCode.INVALID_PATH: 400,
+    CanvasErrorCode.INDEX_NOT_READY: 409,
 }
 
 

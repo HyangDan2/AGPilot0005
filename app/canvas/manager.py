@@ -27,7 +27,14 @@ from app.canvas.models import Artifact, ArtifactPage, PatchRequest, Revision
 from app.canvas.security import sanitize_title, validate_identifier, reject_scope_override
 from app.canvas.storage import CanvasStorage, iso_now, new_artifact_id
 from app.canvas.types import ArtifactTypeRegistry
-from app.canvas.workspace import WorkspaceAccess, WorkspaceGateway, normalise_required
+from app.canvas.workspace import (
+    WORKSPACE_CONTRACT_REVISION,
+    WorkspaceAccess,
+    WorkspaceGateway,
+    enforce_workspace_state,
+    normalise_required,
+    write_workspace_file,
+)
 
 
 def scope_ids(scope: Any) -> tuple[str, str, str]:
@@ -74,7 +81,9 @@ def assert_workspace_level(
                 "operation": operation,
             },
         )
-    return access
+    # Amendment 01 (r2-w/v1+a01): the level alone is not enough — a closed workspace refuses every
+    # read/write/export (409 workspace_closed) and a read-only root refuses writes (403).
+    return enforce_workspace_state(access, required=required, operation=operation)
 
 
 def owned_artifact(
@@ -515,6 +524,82 @@ class ArtifactManager:
         return self.exporter.export(
             artifact=artifact, revision=revision_row, content=content, format=format
         )
+
+    def export_to_workspace(
+        self,
+        scope: Any,
+        artifact_id: str,
+        *,
+        workspace_id: str,
+        path: Optional[str] = None,
+        revision: Optional[int] = None,
+        format: Optional[str] = None,
+        expected_content_hash: Optional[str] = None,
+        create_parents: bool = True,
+        overwrite: bool = True,
+        mime_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Write an artifact (or one of its revisions) into a workspace root (Amendment 01 §A1.5).
+
+        The bytes are produced by the same export provider the download endpoint uses, so an
+        export-to-workspace file is exactly what the user would have downloaded. The workspace
+        engine — not Canvas — performs the write, which keeps the file system, the atomic replace,
+        the revision row and the index job in its ownership.
+
+        Failure order is deliberate: the artifact is read first (``read`` on its own workspace, if
+        any), then the *target* workspace is asked for ``write`` access, whose Amendment 01 state
+        answers ``409 workspace_closed`` / ``403 read_only_workspace`` before any byte is produced.
+        """
+
+        artifact, revision_row, content = self.read_content(
+            scope, artifact_id, revision, required="read"
+        )
+        workspace_id = validate_identifier(workspace_id, "workspace_id")
+        access = assert_workspace_level(
+            self.workspace, workspace_id, scope,
+            required="write", operation="artifact.export_to_workspace",
+        )
+        exported = self.exporter.export(
+            artifact=artifact, revision=revision_row, content=content, format=format
+        )
+        target_path = path or exported.filename
+        written = write_workspace_file(
+            self.workspace,
+            scope,
+            access,
+            path=target_path,
+            content=exported.content,
+            mime_type=mime_type or exported.media_type,
+            expected_content_hash=expected_content_hash,
+            create_parents=create_parents,
+            overwrite=overwrite,
+        )
+        return {
+            "artifact_id": artifact.artifact_id,
+            "artifact_revision": revision_row.revision,
+            "artifact_type": artifact.artifact_type,
+            "format": exported.format,
+            "extension": exported.extension,
+            "media_type": exported.media_type,
+            "workspace_id": workspace_id,
+            "path": written["path"],
+            "storage_provider": written["storage_provider"],
+            "content_origin": written["content_origin"],
+            "client_write": written["client_write"],
+            "write_mode": (
+                "client_write" if written["client_write"] is not None else "server_write"
+            ),
+            "server_side_path_access": access.server_side_path_access,
+            "workspace_root_path": access.root_display_path or None,
+            "workspace_file": written["file"],
+            "workspace_file_revision": written["revision"],
+            "content_hash": written["content_hash"],
+            "written_bytes": written["written_bytes"],
+            "export_warnings": exported.warnings,
+            "content_metrics": _metrics(content),
+            "workspace_access": access.model_dump(mode="json"),
+            "contract_revision": WORKSPACE_CONTRACT_REVISION,
+        }
 
     def preview(self, scope: Any, artifact_id: str, *, revision: Optional[int] = None) -> Dict[str, Any]:
         from app.canvas.security import preview_policy, sanitize_html_for_preview

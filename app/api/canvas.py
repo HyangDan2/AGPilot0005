@@ -113,6 +113,25 @@ class LinkBody(BaseModel):
     conversation_id: Optional[str] = None
 
 
+class ExportToWorkspaceBody(BaseModel):
+    """Amendment 01 (§A1.5): write this artifact (or one revision) into a workspace root.
+
+    ``path`` is a workspace-relative path and passes the shared ``validate_relative_path`` gate;
+    when omitted the export filename derived from the artifact title is used.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: str = Field(min_length=1, max_length=64)
+    path: Optional[str] = Field(default=None, max_length=1024)
+    revision: Optional[int] = Field(default=None, ge=1)
+    format: Optional[str] = Field(default=None, max_length=32)
+    expected_content_hash: Optional[str] = Field(default=None, max_length=80)
+    create_parents: bool = True
+    overwrite: bool = True
+    mime_type: Optional[str] = Field(default=None, max_length=200)
+
+
 class EditProposalBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -409,6 +428,36 @@ async def preview_artifact(
     scope = _scope(request)
     try:
         return _service(request).manager.preview(scope, artifact_id, revision=revision)
+    except CanvasError as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/artifacts/{artifact_id}/export-to-workspace")
+async def export_artifact_to_workspace(
+    artifact_id: str, body: ExportToWorkspaceBody, request: Request
+) -> Dict[str, Any]:
+    """Export to Workspace (R2-W Amendment 01, `r2-w/v1+a01`).
+
+    Writes the artifact (or ``revision``) into ``workspace_id`` through the shared
+    ``PUT /workspaces/{id}/file`` contract: ``path``, ``content``, ``expected_content_hash``,
+    ``create_parents``, ``overwrite``. The workspace engine performs the write; for a
+    ``local_browser`` root the response carries a ``client_write`` directive instead and the
+    browser writes through its own file handle.
+    """
+    scope = _scope(request)
+    try:
+        return _service(request).manager.export_to_workspace(
+            scope,
+            artifact_id,
+            workspace_id=body.workspace_id,
+            path=body.path,
+            revision=body.revision,
+            format=body.format,
+            expected_content_hash=body.expected_content_hash,
+            create_parents=body.create_parents,
+            overwrite=body.overwrite,
+            mime_type=body.mime_type,
+        )
     except CanvasError as exc:
         raise _http(exc) from exc
 

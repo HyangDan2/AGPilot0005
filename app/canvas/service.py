@@ -23,7 +23,7 @@ from app.canvas.revisions import PatchEngine, RevisionManager
 from app.canvas.storage import SqliteCanvasStorage
 from app.canvas.tools import CANVAS_TOOL_MANIFEST
 from app.canvas.types import ArtifactTypeRegistry, default_type_registry
-from app.canvas.workspace import build_workspace_gateway
+from app.canvas.workspace import build_workspace_gateway, workspace_contract_report
 
 _service: Optional["CanvasService"] = None
 
@@ -101,10 +101,18 @@ class CanvasService:
                 "enforced": bool(getattr(self.workspace, "enforced", False)),
                 "read_requires": "read | write | admin",
                 "write_requires": "write | admin",
+                "contract": workspace_contract_report(),
                 "operations": [
                     "check_workspace_access",
                     "register_artifact_reference",
+                    "write_file (Amendment 01 / export to workspace)",
                 ],
+                "lifecycle_enforcement": {
+                    "closed": "409 workspace_closed on read / write / export (detach stays allowed)",
+                    "deleted": "404 workspace_not_found",
+                    "read_only": "403 read_only_workspace on write",
+                    "local_browser": "no server-side path access; write answered with client_write",
+                },
             },
             "ai_edit": {
                 "adapter": getattr(self.edit_adapter, "mode", "unknown"),
