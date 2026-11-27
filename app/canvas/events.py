@@ -284,6 +284,9 @@ class GenerationService:
         return session
 
     def generate(self, scope: Any, request: GenerationRequest) -> Dict[str, Any]:
+        # Fail fast on an unusable type/language before any frame is emitted.
+        self.manager.types.get(request.artifact_type)
+        self.manager.types.normalize_language(request.artifact_type, request.language)
         key = (request.idempotency_key or "").strip() or f"gen-{uuid.uuid4().hex}"
         session = self._session(scope, key)
         already = session.status
@@ -333,10 +336,12 @@ class GenerationService:
         try:
             updated_frame, artifact, revision = session.complete(change_reason=request.change_reason)
         except CanvasError as exc:
+            # Nothing was persisted; keep the original failure code (415/413/422) and say so.
             self._sessions.pop((scope_key_of(scope), key), None)
             raise CanvasError(
-                CanvasErrorCode.INVALID_REQUEST,
+                exc.code,
                 exc.message or "generation failed",
+                retryable=exc.retryable,
                 context={**exc.context, "session_id": session.session_id, "persisted": False},
             ) from exc
         return {

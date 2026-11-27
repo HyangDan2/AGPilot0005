@@ -1,5 +1,6 @@
 """Tool Registry and Specification Management."""
 import inspect
+import os
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 from pydantic import BaseModel
 from app.schemas.gateway import ToolDefinition, ToolFunctionDefinition
@@ -7,6 +8,17 @@ from app.tools.builtin.system import echo, get_datetime
 from app.tools.builtin.math import calculate
 from app.tools.builtin.document import get_outline, read_section, search, read_chunk, get_figure_info
 from app.tools.policy import tool_policy
+
+#: Opt-in switch for the R2 Canvas artifact tools. Registration (not exposure) is gated so the
+#: R1.3 runtime surface stays byte-for-byte unchanged unless an operator enables Canvas.
+CANVAS_TOOLS_ENV = "AGCORE_CANVAS_TOOLS_ENABLED"
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def canvas_tools_enabled() -> bool:
+    """Read the opt-in flag at call time (1/true/yes/on, case-insensitive)."""
+    return (os.environ.get(CANVAS_TOOLS_ENV) or "").strip().lower() in _TRUTHY
+
 
 class ToolRegistration(BaseModel):
     name: str
@@ -210,9 +222,12 @@ class ToolRegistry:
             is_read_only=True,
         )
 
-        # 9-16. R2 Canvas artifact tools (additive; exposure still governed by tool profiles)
-        from app.canvas.tools import install_canvas_tools
+        # 9-16. R2 Canvas artifact tools — opt-in only (AGCORE_CANVAS_TOOLS_ENABLED=1/true/yes/on).
+        # Without the flag the registry is exactly the R1.3 surface; exposure is additionally
+        # governed by tool profiles (no existing profile lists canvas.*).
+        if canvas_tools_enabled():
+            from app.canvas.tools import install_canvas_tools
 
-        install_canvas_tools(self)
+            install_canvas_tools(self)
 
 registry = ToolRegistry()
