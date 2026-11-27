@@ -375,6 +375,23 @@ async def test_c18_save_default_hash_blocks_an_external_overwrite(canvas):
 
 
 @pytest.mark.asyncio
+async def test_c18_two_artifacts_can_point_at_one_workspace_file(canvas):
+    workspace = _lab(canvas)
+    async with client() as c:
+        first = await _create(c, title="원본", body="첫 번째 사본")
+        second = await _create(c, title="사본", body="두 번째 사본")
+        assert (await _save(c, first, workspace_id=WS, path="shared/doc.md")).status_code == 200
+        r = await _save(c, second, workspace_id=WS, path="shared/doc.md")
+        assert r.status_code == 200, r.text
+        # each artifact keeps its own save state; the newer one is what a reload reuses
+        assert (await _link(c, first))["workspace_link"]["artifact_id"] == first
+        assert (await _link(c, second))["workspace_link"]["artifact_id"] == second
+        reloaded = await _load(c, path="shared/doc.md")
+        assert reloaded.json()["artifact"]["artifact_id"] == second
+        assert workspace.list_files(WS)["shared/doc.md"]["content"] == "두 번째 사본"
+
+
+@pytest.mark.asyncio
 async def test_c18_save_reuses_the_link_workspace_and_path(canvas):
     _lab(canvas).seed_file(WS, PATH, CONTENT)
     async with client() as c:

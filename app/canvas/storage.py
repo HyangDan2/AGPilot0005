@@ -314,8 +314,8 @@ class SqliteCanvasStorage:
                         created_at REAL NOT NULL,
                         updated_at REAL NOT NULL
                     );
-                    CREATE UNIQUE INDEX IF NOT EXISTS idx_canvas_workspace_links_target
-                        ON canvas_workspace_links(tenant_id, owner_id, service_id, workspace_id, relative_path);
+                    CREATE INDEX IF NOT EXISTS idx_canvas_workspace_links_lookup
+                        ON canvas_workspace_links(tenant_id, owner_id, service_id, workspace_id, relative_path, updated_at DESC);
                     """
                 )
                 conn.execute(
@@ -941,14 +941,18 @@ class SqliteCanvasStorage:
         workspace_id: str,
         relative_path: str,
     ) -> Optional[WorkspaceFileLink]:
-        """The artifact already bound to this workspace file in this execution scope, if any."""
+        """The artifact most recently bound to this workspace file in this scope, if any.
+
+        Not unique on purpose: two artifacts may legitimately point at the same file (a copy the
+        user saved elsewhere), and each keeps its own save state.
+        """
 
         conn = self._connect()
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM canvas_workspace_links WHERE tenant_id=? AND owner_id=? AND service_id=? "
-                "AND workspace_id=? AND relative_path=?",
+                "AND workspace_id=? AND relative_path=? ORDER BY updated_at DESC LIMIT 1",
                 (tenant_id, owner_id, service_id, workspace_id, relative_path),
             ).fetchone()
             return self._row_to_workspace_link(row) if row else None
