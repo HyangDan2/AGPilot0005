@@ -210,4 +210,9 @@ class ToolRegistry:
             is_read_only=True,
         )
 
+        # 9-16. R2 Canvas artifact tools (additive; exposure still governed by tool profiles)
+        from app.canvas.tools import install_canvas_tools
+
+        install_canvas_tools(self)
+
 registry = ToolRegistry()
