@@ -1045,9 +1045,10 @@ def install_workspace_tools(tool_registry: Any) -> List[str]:
     from app.workspace.runtime import get_runtime as _get_workspace_runtime
 
     installed: List[str] = []
+    existing_tools = getattr(tool_registry, "_tools", {})
     for spec in TOOL_MANIFEST["tools"]:
         tool_name = spec["name"]
-        if tool_registry.get_registration(tool_name) is not None:
+        if tool_name in existing_tools:
             installed.append(tool_name)
             continue
 

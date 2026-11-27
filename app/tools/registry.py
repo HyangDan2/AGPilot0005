@@ -60,18 +60,24 @@ class ToolRegistry:
 
     def _ensure_r2_tools(self) -> None:
         """CP-03: Lazily register R2 Workspace & Canvas tools when their feature flags are ON."""
-        from app.config import is_workspace_enabled
+        if getattr(self, "_syncing_r2", False):
+            return
+        self._syncing_r2 = True
+        try:
+            from app.config import is_workspace_enabled
 
-        if is_workspace_enabled():
-            from app.workspace.tools import install_workspace_tools
-
-            install_workspace_tools(self)
-        if canvas_tools_enabled():
-            from app.canvas.tools import install_canvas_tools, install_canvas_workspace_tools
-
-            install_canvas_tools(self)
             if is_workspace_enabled():
-                install_canvas_workspace_tools(self)
+                from app.workspace.tools import install_workspace_tools
+
+                install_workspace_tools(self)
+            if canvas_tools_enabled():
+                from app.canvas.tools import install_canvas_tools, install_canvas_workspace_tools
+
+                install_canvas_tools(self)
+                if is_workspace_enabled():
+                    install_canvas_workspace_tools(self)
+        finally:
+            self._syncing_r2 = False
 
     def get_handler(self, name: str) -> Optional[Callable[..., Any]]:
         if name not in self._handlers:

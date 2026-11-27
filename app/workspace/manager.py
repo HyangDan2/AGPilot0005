@@ -1629,11 +1629,11 @@ class WorkspaceManager:
             return None
         parent_id: Optional[str] = None
         for seg in parts[:-1]:
-            folder_row = self.store.find_child(workspace_id, parent_id, seg)
+            folder_row = self.store.find_file_by_name(workspace_id, parent_id, seg)
             if folder_row is None or folder_row.get("kind") != FileKind.FOLDER.value:
                 return None
             parent_id = folder_row["file_id"]
-        leaf = self.store.find_child(workspace_id, parent_id, parts[-1])
+        leaf = self.store.find_file_by_name(workspace_id, parent_id, parts[-1])
         if leaf is None or leaf.get("kind") != FileKind.FILE.value:
             return None
         return leaf

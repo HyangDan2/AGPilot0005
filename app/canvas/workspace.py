@@ -552,6 +552,20 @@ def _provider_error(exc: BaseException) -> Tuple[Optional[str], Any]:
     """Extract ``(workspace_error_code, detail)`` from a provider exception."""
 
     detail = getattr(exc, "detail", None)
+    if detail is None:
+        err_obj = getattr(exc, "error", None)
+        if err_obj is not None:
+            if hasattr(err_obj, "model_dump"):
+                detail = err_obj.model_dump(mode="json")
+            elif isinstance(err_obj, dict):
+                detail = err_obj
+            else:
+                detail = {
+                    "code": getattr(getattr(err_obj, "code", None), "value", getattr(err_obj, "code", None)),
+                    "message": getattr(err_obj, "message", None),
+                    "retryable": bool(getattr(err_obj, "retryable", False)),
+                    "context": getattr(err_obj, "context", None) or {},
+                }
     if detail is None and isinstance(exc, dict):
         detail = exc
     candidate = None
