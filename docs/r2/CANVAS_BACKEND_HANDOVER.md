@@ -1,4 +1,4 @@
-# AGCore R2 — Canvas Backend Handover (CP-06 / WO-C15 · WO-C16 · WO-C17 · R2-W Amendment 01)
+# AGCore R2 — Canvas Backend Handover (CP-06 / WO-C15 · WO-C16 · WO-C17 · WO-C18 · R2-W Amendment 01)
 
 Recorded 2026-11-27 (KST) by the Canvas Engineer (피클 / 향단이), branch `feat/r2-canvas`.
 Status: **backend complete and locally verified, not merged, not deployed, no production change.**
@@ -11,6 +11,11 @@ workspace lifecycle (`open`/`closed`/`deleted`), read-only roots, the three stor
 including `local_browser`, and "export to workspace" through the shared
 `PUT /workspaces/{id}/file` write contract. v1 behaviour is unchanged and the frozen v1 surface
 keeps its meaning.
+**WO-C18 (Omni Agent Canvas Architecture Amendment)** is consumed on top of that (§18): the two
+workspace-aware tools `canvas.save_to_workspace` / `canvas.load_from_workspace`, *Save to Workspace*
+semantics with `workspace_file_id` / `relative_path` / `last_saved_content_hash` (optimistic
+concurrency against external edits), *Load from Workspace* as an external reference plus edit
+buffer, and the single contract switch point for the Workspace SSoT (`907482c`).
 `main` was not touched, no pull request was opened, and no operating AGCore store, `Server-HQ`
 configuration or gateway was modified.
 
@@ -46,6 +51,10 @@ Companion documents:
 | `f383aff` | WO-C17 tests | `tests/test_r2_canvas_correction.py` (18) plus the corrected existing Canvas expectations |
 | `769d6e8` | R2-W Amendment 01 | `r2-w/v1+a01` consumer: lifecycle/read-only/storage-provider, export-to-workspace, contract error bridge (§17) |
 | `7315d73` | R2-W Amendment 01 tests | `tests/test_r2_canvas_workspace_a01.py` (27) |
+| `6b1a86e` | WO-C18-04 | Workspace file load + save state (`canvas_workspace_links`, `load_from_workspace`, `save_to_workspace`, contract switch point) — §18 |
+| `936e409` | WO-C18-02 | Omni Agent tool/Adapter contract, two workspace tools, three routes, `/capabilities` omni block |
+| `a4a8544` | WO-C18-06 | `tests/test_r2_canvas_omni_c18.py` |
+| `aa552b2` | WO-C18-04 | Per-artifact workspace link correction (+1 test) |
 
 Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover: `git ls-remote origin feat/r2-canvas`). The first push attempt returned HTTP 403 from the GitHub App write path and the immediate retry succeeded; if the connection stops accepting writes, the operator must transfer the branch — never force-push or merge `main`. No pull request was opened and `main` remains at `0d2047f`.
 
@@ -62,10 +71,10 @@ Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover:
 | `approval.py` | User-approval contract for `apply` (`UserApproval`, role rules, `require_user_approval`, policy report) | 129 |
 | `errors.py` | `CanvasError` + `CanvasErrorCode` → HTTP status map; R2-W-compatible envelope; Amendment 01 / contract error codes (§17.4) | 121 |
 | `types.py` | Extensible artifact type registry (5 enabled, 4 reserved), language → extension map | 227 |
-| `models.py` | Pydantic domain models: `Artifact`, `Revision`, `PatchRequest`, `PatchOutcome`, `EditProposal`, pages (page reports workspace exclusions) | 148 |
+| `models.py` | Pydantic domain models: `Artifact`, `Revision`, `PatchRequest`, `PatchOutcome`, `EditProposal`, `WorkspaceFileLink` (WO-C18 save state), pages (page reports workspace exclusions) | 181 |
 | `offsets.py` | UTF-16 ↔ code-point offset contract, surrogate-split rejection, content metrics | 137 |
-| `storage.py` | `CanvasStorage` protocol + SQLite implementation, blob store, atomic `apply_proposal`, retention pruning + prune audit | 1156 |
-| `manager.py` | Artifact CRUD, list/get, rename, soft delete/purge, workspace & conversation links, export/preview entry points, workspace level enforcement + list filtering | 575 |
+| `storage.py` | `CanvasStorage` protocol + SQLite implementation, blob store, atomic `apply_proposal`, retention pruning + prune audit, workspace link / save state (schema v3) | 1288 |
+| `manager.py` | Artifact CRUD, list/get, rename, soft delete/purge, workspace & conversation links, export/preview entry points, workspace level enforcement + list filtering, WO-C18 load/save | 1079 |
 | `revisions.py` | Revision history, revision diff, non-destructive restore, `PatchEngine` (workspace-aware) | 222 |
 | `patching.py` | Pure patch computation for six operations (conflict / expected-text checks) | 201 |
 | `diffing.py` | Line-based diff with a bounded line budget | 211 |
@@ -73,16 +82,17 @@ Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover:
 | `events.py` | SSE event contract, streaming generation session (dev-preview gated), idempotent replay | 417 |
 | `export.py` | Export providers (md/txt/html/json/source), safe filename + RFC 5987 disposition, office contract | 243 |
 | `security.py` | Preview sanitizer & CSP policy, title/identifier hygiene, scope-override guard, token estimate | 293 |
-| `tools.py` | Eight-tool manifest, handlers, AI-exposed subset (withholds `apply_edit`), `install_canvas_tools()` | 506 |
+| `tools.py` | Ten-tool manifest in two opt-in surfaces (frozen eight + WO-C18 workspace pair), handlers, AI-exposed subsets, `install_canvas_tools()` / `install_canvas_workspace_tools()` | 627 |
+| `omni.py` | **WO-C18** Omni Agent adapter/contract surface: workspace tool manifest & JSON schemas, action classes, capability gates, adapters, integration-patch list, save/load contract, `/capabilities` report | 453 |
 | `service.py` | `CanvasService` singleton wiring storage/types/workspace/exporter/adapter/managers; feature gate; isolation report | 155 |
 | `schemas.py` | Re-exported event-type constants | 16 |
-| `workspace.py` | `WorkspaceGateway` protocol, providers, `WorkspaceAccess` with read/write levels, dev `set_level`; Amendment 01: storage provider / lifecycle / read-only, path gate, write contract, contract error bridge, export (§17) | 1232 |
+| `workspace.py` | `WorkspaceGateway` protocol, providers, `WorkspaceAccess` with read/write levels, dev `set_level`; Amendment 01: storage provider / lifecycle / read-only, path gate, write contract, contract error bridge, export (§17); WO-C18: contract switch point, `read_file`/`get_file_metadata`/`list_workspace_files` consumption (§18.4) | 1757 |
 
 ### 2.2 API and tests
 
 | File | Content |
 | --- | --- |
-| `app/api/canvas.py` | `/api/v1/canvas` router (25 endpoints, incl. `export-to-workspace`), feature-flag gate, approval body on apply, request models with `extra="forbid"`, structured errors (589 LOC) |
+| `app/api/canvas.py` | `/api/v1/canvas` router (28 endpoints: 25 + `from-workspace`, `save-to-workspace`, `workspace-link`), feature-flag gate, approval body on apply, request models with `extra="forbid"`, structured errors (692 LOC) |
 | `tests/conftest.py` | `canvas` / `configured` fixtures (throw-away data dir + service reset) — new file, 36 LOC |
 | `tests/r2_canvas_support.py` | Scope/header/client helpers, `configure()` (feature flag + dev preview on) (77 LOC) |
 | `tests/test_r2_canvas_foundation.py` | CP-01: types, manager, persistence, restart recovery, limits (11 tests) |
@@ -91,6 +101,7 @@ Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover:
 | `tests/test_r2_canvas_export_security.py` | CP-05: export formats, filename/header hardening, sanitizer, isolation, limits (10 tests) |
 | `tests/test_r2_canvas_correction.py` | WO-C17: C-FIX-01…06 verification (18 tests) |
 | `tests/test_r2_canvas_workspace_a01.py` | R2-W Amendment 01: lifecycle, read-only, export-to-workspace, error bridge (27 tests) |
+| `tests/test_r2_canvas_omni_c18.py` | WO-C18 minimum verification: load external reference, save link state + expected-hash conflict, read-only/closed/local_browser refusals, Omni tool contract & gates, R1.3 invariance (20 tests) |
 
 ### 2.3 Shared files touched (merge targets, see §14)
 
@@ -99,7 +110,7 @@ Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover:
 | `app/main.py` | +1 import, +1 `include_router(canvas_router, prefix="/api/v1")` |
 | `app/schemas/events.py` | +7 literal values in `EventType` (`artifact.*`); nothing renamed/removed |
 | `app/tools/registry.py` | opt-in registration block + `CANVAS_TOOLS_ENABLED` / `canvas_tools_enabled()` |
-| `app/tools/policy.py` | +8 names in `BUILTIN_TOOLS`; no profile and no `service_bindings` change |
+| `app/tools/policy.py` | +10 names in `BUILTIN_TOOLS` (8 frozen + 2 WO-C18 workspace tools); no profile and no `service_bindings` change |
 | `.gitignore` | +`data/canvas/` (development store) |
 
 No file under `app/runtime/`, `app/runtime/policy/`, `app/api/agent.py`,
@@ -219,12 +230,15 @@ no schema migration because `artifact_type` is a textual key validated against t
 `ai_integration_verified` (always `false` in R2), `created_at`, `updated_at`, `applied_revision`,
 `request`, `context_budget`, `preview`.
 
-### 4.5 Storage tables (SQLite, schema version 1)
+### 4.5 Storage tables (SQLite, schema version 3)
 
 `canvas_meta` (schema_version), `canvas_artifacts`, `canvas_revisions` (PK
 `artifact_id, revision`, FK cascade), `canvas_events` (PK `scope_key, idempotency_key`),
-`canvas_edit_proposals`. Indexes cover owner/scope ordering, conversation and workspace lookups,
-and proposal listing.
+`canvas_edit_proposals`, `canvas_revision_prunes` (v2), `canvas_workspace_links` (v3, WO-C18:
+one row per artifact holding `workspace_file_id` / `relative_path` / `source_content_hash` /
+`last_saved_content_hash` / `save_state`). Indexes cover owner/scope ordering, conversation and
+workspace lookups, proposal listing, and the unique `(scope, workspace, relative_path)` target of a
+workspace file link.
 
 ---
 
@@ -485,7 +499,7 @@ The wire layer translates `canvas.create_artifact` to the provider-safe
 | Pragmas | `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5000ms` |
 | Transactions | `BEGIN IMMEDIATE`; metadata + revision + head pointer commit together |
 | Blob write | temp file → `fsync` → `os.replace` (atomic), immutable once named by its hash |
-| Schema version | `2` in `canvas_meta`; created idempotently with `CREATE TABLE IF NOT EXISTS` (v2 adds `canvas_revision_prunes`) |
+| Schema version | `3` in `canvas_meta`; created idempotently with `CREATE TABLE IF NOT EXISTS` (v2 adds `canvas_revision_prunes`, v3 adds `canvas_workspace_links`) |
 | Soft delete | `deleted_at` set; hidden from reads/lists; data retained |
 | Purge | deletes artifact/revision/proposal/event/prune rows; content-addressed blobs stay (shared, no GC in R2) |
 | Limits | content ≤ 512 KiB, revisions ≤ 100 (pruned at the cap), list ≤ 100/page, diff ≤ 2000 lines, context ≤ 3000 tokens (all `AGCORE_CANVAS_*` overridable) |
@@ -501,6 +515,7 @@ Environment variables:
 | `AGCORE_CANVAS_DATA_DIR` | `<repo>/data/canvas` | DB + blob root |
 | `AGCORE_CANVAS_DB_PATH` | `<data_dir>/canvas.db` | explicit DB file |
 | `AGCORE_CANVAS_TOOLS_ENABLED` | unset (off) | register the Canvas tools in the tool registry (seven AI-exposed; `canvas.apply_edit` withheld) |
+| `AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED` | unset (off) | WO-C18: additionally expose `canvas.save_to_workspace` / `canvas.load_from_workspace`; needs `AGCORE_CANVAS_TOOLS_ENABLED` too |
 | `AGCORE_CANVAS_WORKSPACE_PROVIDER` | `dev` | `dev` \| `workspace` \| `unavailable` |
 | `AGCORE_CANVAS_AI_ADAPTER` | `dev` | `dev` \| `runtime` |
 | `AGCORE_CANVAS_DEV_ADAPTERS` | `true` | second gate on the dev adapters; can only shrink the surface, forced off in production |
@@ -1145,3 +1160,259 @@ amendment.
    conflict → 409.
 4. Frontend: consume `write_mode` / `client_write` / the Amendment 01 error codes (sibling task on
    `AGPilot0011`).
+
+---
+
+## 18. WO-C18 — Omni Agent Canvas Architecture Amendment
+
+Scope of this amendment: **only the connection boundary** between Canvas and the Omni Agent.
+The Canvas engine (Manager, Type Registry, Revision, Patch & Diff, Edit Proposal, Apply/Reject,
+Export, Streaming, Workspace A01 Adapter) is not redesigned, not moved and not re-verified: its
+90-test evidence stays as recorded, and the new suite is additive. No file under `app/runtime/**`,
+`app/workspace/**`, `app/gateway/**` or `app/adapters/**` is imported-and-changed, `main` is not
+merged and nothing is deployed.
+
+### 18.1 Commits
+
+| Commit | WO | Content |
+| --- | --- | --- |
+| `6b1a86e` | WO-C18-04 | Workspace file load + save state: `WorkspaceFileLink`, `canvas_workspace_links` (schema v3), `ArtifactManager.load_from_workspace()` / `save_to_workspace()`, contract switch point, provider read surface |
+| `936e409` | WO-C18-02 | Omni Agent tool/Adapter contract (`app/canvas/omni.py`), two workspace tools + handlers, `from-workspace` / `save-to-workspace` / `workspace-link` routes, `/capabilities` omni block, `policy.py` names |
+| `a4a8544` | WO-C18-06 | `tests/test_r2_canvas_omni_c18.py` (19 tests) |
+| `aa552b2` | WO-C18-04 | Correction: a workspace link is per-artifact state, so two artifacts may point at one file without deleting each other's save state (+1 test) |
+| this commit | WO-C18-07/08 | This section (§18) |
+
+### 18.2 유지 범위 vs 변경 범위 (what was kept, what was added)
+
+| Kept exactly as it was | Added by WO-C18 |
+| --- | --- |
+| The eight `canvas.*` tools, `CANVAS_TOOL_MANIFEST`, `AI_EXPOSED_TOOL_NAMES` (7) and `manifest()["tools"] == 8` | `canvas.save_to_workspace`, `canvas.load_from_workspace` — reported under `manifest()["workspace_tools"]`, never inside the frozen eight |
+| `canvas.apply_edit` withheld from the model, `403 user_approval_required`, `approval.py` unchanged (C-FIX-06) | — |
+| C-FIX-01…C-FIX-07 (read/write separation, live revocation re-check, atomic apply, retention pruning, feature isolation) | `workspace_link` is dropped on detach (`DELETE …/links/workspace`) and on purge |
+| A01 lifecycle / read-only / `local_browser` enforcement on every workspace-linked path | Load and save go through the same choke point (`assert_workspace_level`) |
+| `POST …/export-to-workspace` semantics (stateless export) | `POST …/save-to-workspace` (stateful save) beside it — the A01 route is untouched |
+| `app/runtime/**`, `app/gateway/**`, `app/adapters/**`, `app/workspace/**`, `app/schemas/events.py`, `app/main.py` | — |
+| Schema v2 tables (`canvas_artifacts`/`canvas_revisions`/`canvas_events`/`canvas_edit_proposals`/`canvas_revision_prunes`) unchanged | `canvas_workspace_links` (v3), additive `CREATE TABLE IF NOT EXISTS` |
+| Existing 90 canvas tests (6 modules) | `tests/test_r2_canvas_omni_c18.py` (20 tests) |
+
+### 18.3 WO-C18-02 — Omni Agent capability integration
+
+Ten tools, two gates, one approval boundary:
+
+| Tool | Action class | AI-exposed | Gate |
+| --- | --- | --- | --- |
+| `canvas.create_artifact` · `propose_edit` · `restore_revision` | `canvas_write` | yes | `AGCORE_CANVAS_TOOLS_ENABLED` |
+| `canvas.read_artifact` · `list_artifacts` · `list_revisions` · `export_artifact` | `canvas_read` | yes | `AGCORE_CANVAS_TOOLS_ENABLED` |
+| `canvas.apply_edit` | `canvas_write_user_approved` | **no** | `AGCORE_CANVAS_TOOLS_ENABLED` (a call returns `403 user_approval_required`) |
+| `canvas.save_to_workspace` | `workspace_write` | yes | `AGCORE_CANVAS_TOOLS_ENABLED` **+** `AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED` |
+| `canvas.load_from_workspace` | `workspace_read` | yes | `AGCORE_CANVAS_TOOLS_ENABLED` **+** `AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED` |
+
+Why a second gate: these two tools read from and write into a folder the user actually owns, so they
+must not appear merely because the artifact tools were switched on. `install_canvas_tools()` keeps its
+exact return value (the core surface) and installs the pair in addition when both switches are on;
+`install_canvas_workspace_tools()` is the explicit installer.
+
+Adapters (§ `omni.omni_adapters()`):
+
+| Adapter | Module | Binds |
+| --- | --- | --- |
+| `CanvasToolAdapter` | `app.canvas.tools` | the eight core handlers → Dynamic Tool Registry (unchanged) |
+| `CanvasWorkspaceToolAdapter` | `app.canvas.tools` + `app.canvas.omni` | `canvas.save_to_workspace` → `ArtifactManager.save_to_workspace`, `canvas.load_from_workspace` → `ArtifactManager.load_from_workspace` |
+| `WorkspaceReadAdapter` | `app.canvas.workspace::read_workspace_file` | `get_file_metadata` / `list_workspace_files` / `read_file` → one text buffer |
+| `WorkspaceWriteAdapter` | `app.canvas.workspace::write_workspace_file` | `WorkspaceWriteRequest` → provider `write_file` (A01, reused) |
+| `ExecutionScopeAdapter` | `app.core.auth::current_execution_scope` | identity for every handler (no schema carries an id field) |
+| `ApprovalBoundaryAdapter` | `app.canvas.approval` | C-FIX-06 for `apply_edit` (unchanged) |
+
+Integration patch list (§ `omni.omni_integration_patches()`):
+
+| Target | Change |
+| --- | --- |
+| `app/runtime/**` (runner, dispatcher, **`ActionValidator`**) | **none** — the runner asks the registry for definitions, the dispatcher resolves `canvas.*` handlers, and `ActionValidator` still mints `ValidatedAction` per `tool_call_id`. Canvas imports no runtime module (asserted by a test) |
+| `app/tools/registry.py` | none — the opt-in block from WO-C08 already calls `install_canvas_tools()` |
+| `app/tools/policy.py` | `+2` `BUILTIN_TOOLS` names; an operator must still add them to a profile (no shipped profile lists a `canvas.*` tool) |
+| `app/api/canvas.py` | `+3` routes (see §18.4) |
+| `app/schemas/events.py` | none |
+| `app/workspace/**` | none (read-only reference, SSoT `907482c`) |
+
+### 18.4 WO-C18-04 — Workspace native save & load
+
+**Load — `POST /api/v1/canvas/artifacts/from-workspace`** (`canvas.load_from_workspace`)
+
+```json
+{ "workspace_id": "ws_7f3c1a9e2b04", "path": "notes/plan.md",
+  "workspace_file_id": null, "title": null, "artifact_type": null,
+  "language": null, "conversation_id": null, "revision": null, "force": false }
+```
+
+`workspace_file_id` **or** `path` is required (a path is resolved through `list_workspace_files`).
+The file is read through the contract (`read_file`) and the response carries
+`copy_semantics: "external_reference_with_edit_buffer"`:
+
+```json
+{ "artifact": { "artifact_id": "art_…", "workspace_id": "ws_…", "creation_source": "import", "artifact_type": "markdown", "current_revision": 1, "…": "…" },
+  "revision": { "revision": 1, "operation": "create", "actor": "import", "…": "…" },
+  "content": "# 계획\n…",
+  "reused": false, "refreshed": false,
+  "source": { "workspace_file_id": "wf_…", "relative_path": "notes/plan.md", "content_hash": "sha256:…", "revision": 1, "mime_type": "text/markdown", "size_bytes": 812 },
+  "workspace_link": { "workspace_file_id": "wf_…", "relative_path": "notes/plan.md", "last_saved_content_hash": "sha256:…", "save_state": "linked", "…": "…" },
+  "copy_semantics": "external_reference_with_edit_buffer",
+  "contract_revision": "r2-w/v1+a01" }
+```
+
+Semantics:
+
+* The **workspace file is the source of truth.** Canvas stores an edit buffer (its revisions) plus
+  one `canvas_workspace_links` row; it never claims to own the file.
+* **One artifact per (scope, workspace, relative_path)**: reloading the same file returns the same
+  artifact (`reused: true`) and adds a revision only when the buffer must change (`refreshed: true`).
+  Two artifacts may point at one file (a user copy); a reload reuses the most recently reconciled one.
+* **Unsaved edits are never discarded**: if the workspace file changed while the Canvas buffer holds
+  edits that were not saved, the load answers `409 content_conflict` with both hashes and
+  `recovery: save first or force=true`. `force: true` refreshes the buffer and discards them.
+* Type inference: `.md`→`markdown`, `.html`→`html`, `.json`→`structured_json`, source extensions →
+  `source_code` + language, anything else → `plain_text` (an explicit `artifact_type`/`language` wins).
+
+| Refusal | Code |
+| --- | --- |
+| workspace `closed` | `409 workspace_closed` (retryable) |
+| root `read_only` | `403 read_only_workspace` |
+| grant is only `read` | `403 workspace_access_denied` (`required_level: write`) |
+| workspace `deleted` | `404 workspace_not_found` |
+| no such file | `404 file_not_found` |
+| `local_browser` root | `400 provider_mismatch` + `client_read_required: true` (the server has no path access) |
+| non-UTF-8 file | `415 unsupported_artifact_type` (no mojibake buffer) |
+| bad path / no selector | `400 invalid_path` / `422 invalid_request` |
+
+`write` level is required on purpose: the session is workspace-linked (a revoked workspace hides it
+immediately, C-FIX-02) and is opened to be saved back. A read-only workspace therefore cannot be
+loaded — see §18.7.
+
+**Save — `POST /api/v1/canvas/artifacts/{artifact_id}/save-to-workspace`** (`canvas.save_to_workspace`)
+
+```json
+{ "workspace_id": null, "path": null, "revision": null, "format": null,
+  "expected_content_hash": null, "create_parents": true, "overwrite": true, "mime_type": null }
+```
+
+Both `workspace_id` and `path` may be omitted once the artifact is linked (the linked values are
+used). The bytes and the write contract are exactly those of `export-to-workspace`; what is added is
+the **save state**:
+
+| Response field | Meaning |
+| --- | --- |
+| `workspace_link.workspace_file_id` | `FileIdentity.file_id` of the written file |
+| `workspace_link.relative_path` | the path actually written |
+| `workspace_link.last_saved_content_hash` | hash of the workspace file Canvas last reconciled with — the default `expected_content_hash` of the next save |
+| `workspace_link.source_content_hash` | hash the buffer was last loaded from |
+| `workspace_link.last_saved_revision` / `last_saved_at` | the Canvas revision written and when |
+| `save_state` | `saved` \| `client_write_pending` \| `linked` |
+| `expected_content_hash_defaulted` | `true` when the server supplied the hash (external-edit protection was active) |
+
+Rules:
+
+1. If the caller omits `expected_content_hash`, the linked hash is used **for the same path** — a
+   file another agent or the user changed in the meantime answers `409 content_conflict` and the
+   workspace file is left untouched.
+2. A save failure changes **nothing** in Canvas: the artifact's revisions are only read, so the
+   editing content survives every refusal (`canvas_content_preserved: true`), and the link row keeps
+   the previous hash (verified by a test).
+3. A save makes the artifact workspace-linked (the C-FIX-02 re-check then applies to it) and
+   registers the workspace artifact reference.
+4. `local_browser`: the server writes nothing. The response carries
+   `write_mode: "client_write"`, `client_write: {client_handle_id, relative_path, reason}`, `written_bytes: 0`,
+   `save_state: "client_write_pending"` and `last_saved_content_hash` keeps its previous value (the
+   server cannot confirm the write). `completion_contract` says
+   `unverified: r2-w/v1+a01 defines no client write completion report`.
+5. Detaching the link (`DELETE …/links/workspace`) or purging the artifact drops the link row; the
+   workspace file itself is never deleted or modified by Canvas.
+
+### 18.5 WO-C18-05 — Shared contract synchronization
+
+| Item | Value |
+| --- | --- |
+| Workspace/RAG SSoT | `origin/feat/r2-workspace-rag` = **`907482c`** (`feat(workspace): freeze Amendment 01 folder-based workspace contract`) |
+| Contract module | `app/workspace/contracts.py` (read-only reference; not importable on this branch) |
+| Canvas switch point | `app/canvas/workspace.py::_resolve_contract_module()` → `contract_source()`, `contract_switch_point()` |
+| Mirror surface | `validate_relative_path`, `WorkspaceWriteRequest/Result`, `ClientWriteDirective`, `WorkspaceRootInfo`, `WorkspaceStorageProvider`, `WorkspaceLifecycleState`, `ContentOrigin` |
+| What to change at integration | **nothing** — the resolver prefers `app.workspace.contracts` and falls back to the mirror, so merging the Workspace branch switches both the path gate and the write-request model by import availability |
+| How to see which side ran | `GET /api/v1/canvas/capabilities` → `omni.switch_point.active_source` (`canvas_mirror` today, `app.workspace.contracts` after the merge) and `…delegates_to_contract` |
+
+`validate_relative_path()` delegates to `app.workspace.contracts.validate_relative_path` when it is
+importable and maps `InvalidRelativePath` to the Canvas envelope (`400 invalid_path`, `context.path`)
+so the code and the call sites do not change. Until then the mirror runs — the rules are identical
+(absolute/`~`/drive/UNC prefixes, backslashes, control characters, empty/`.`/`..` segments, 255-byte
+segment and 1024-byte total limits), which both suites already exercise.
+
+### 18.6 WO-C18-06 — Minimum verification
+
+```bash
+cd /workspace/repos/AGPilot0005
+/workspace/.venv-r2canvas/bin/python -m pytest tests/test_r2_canvas_omni_c18.py -q
+# 20 passed
+```
+
+| Test | Verifies |
+| --- | --- |
+| `…load_opens_an_external_reference_not_a_second_copy` | existing file load, `workspace_file_id`/`relative_path`/hash in the link, reload reuses the artifact, one artifact only |
+| `…load_infers_type_from_extension` | `.py` → `source_code`/`python`, `.log` → `plain_text` |
+| `…load_refreshes_the_buffer_after_an_external_change` | external change + no unsaved edits → `refreshed: true`, new revision |
+| `…load_refuses_to_discard_unsaved_canvas_edits` | `409 content_conflict`, buffer untouched, `force` discards |
+| `…load_refuses_closed_read_only_and_unknown` | 409 closed / 403 read-only / 403 read-grant / 404 missing, nothing created |
+| `…load_refuses_local_browser_and_non_text` | 400 `provider_mismatch` + `client_read_required`, 415 non-UTF-8 |
+| `…load_requires_a_file_selector_and_a_safe_path` | 422 `invalid_request`, 400 `invalid_path` |
+| `…load_is_scoped_per_user` | a second user gets their own artifact and cannot read the first |
+| `…save_links_workspace_file_id_path_and_hash` | new save links file id/path/hash, artifact becomes migrated to C-FIX-02 |
+| `…save_default_hash_blocks_an_external_overwrite` | 409 with both hashes, workspace file + Canvas content + link preserved, retry after restore succeeds |
+| `…two_artifacts_can_point_at_one_workspace_file` | link is per-artifact; both keep their save state |
+| `…save_reuses_the_link_workspace_and_path` | `{}` save uses the linked target; an explicit other path sends no default hash |
+| `…save_refuses_read_only_closed_and_missing_workspace` | 403/409/400 refusals leave no link and no file |
+| `…save_to_local_browser_returns_client_write_pending` | `client_write_pending`, no hash claimed, completion contract unverified |
+| `…detach_drops_the_save_state_and_link_survives_a_restart` | detach clears the row; a second storage instance reads the link |
+| `…manifest_declares_the_workspace_surface_separately` | 8 frozen tools + 2 reported separately, closed schemas, action classes, adapters/patches |
+| `…workspace_tools_need_their_own_opt_in_gate` | core gate alone does not expose the pair; both gates do |
+| `…tool_dispatch_loads_and_saves_end_to_end` | dispatcher load → save → closed refusal → `unauthenticated` → injected `owner_id` rejected |
+| `…apply_edit_boundary_and_r1_3_surface_are_unchanged` | default registry is the 8 R1.3 tools, `apply_edit` → 403, Canvas imports no runtime module |
+| `…capabilities_report_the_switch_point_and_omni_contract` | schema v3, SSoT `907482c`, switch point, save/load contract, no secret words |
+
+Regression evidence for the untouched engine (same run, same venv):
+
+```bash
+/workspace/.venv-r2canvas/bin/python -m pytest tests/test_r2_canvas_foundation.py tests/test_r2_canvas_ai.py \
+  tests/test_r2_canvas_correction.py tests/test_r2_canvas_export_security.py \
+  tests/test_r2_canvas_revision_patch.py tests/test_r2_canvas_workspace_a01.py \
+  tests/test_r2_canvas_omni_c18.py -q
+# 110 passed
+```
+
+Shared-file smoke (`tools`/`runtime`/token contract/beta baseline/R1 gates):
+`pytest tests/test_tools.py tests/test_runtime_and_api.py tests/test_token_contract_sync.py tests/test_beta_baseline.py tests/test_r1_amendment02_gates.py -q` → **37 passed**. No test outside
+`tests/test_r2_canvas_omni_c18.py` was modified by WO-C18.
+
+### 18.7 Not verified / Blocker
+
+| Item | State |
+| --- | --- |
+| Live workspace engine reads (`read_file` / `get_file_metadata` / `list_workspace_files`) | **Not verified**: `feat/r2-workspace-rag` (`907482c`) is not merged; exercised through the dev provider only. The `RuntimeWorkspaceProvider` methods exist and translate contract errors, but no real engine answered them |
+| `local_browser` **load** | **Blocker (contract gap):** `r2-w/v1+a01` defines `client_write` but no client *read* directive or ingestion path, so Canvas refuses with `400 provider_mismatch` + `client_read_required: true`. A client-read contract (and its completion report) must be added to the Workspace contract before this can work |
+| `local_browser` **save completion** | **Blocker (contract gap):** the browser performs the write, but `r2-w/v1+a01` has no completion/verification report. Canvas records `client_write_pending` and never claims the file changed; `last_saved_content_hash` stays at the previous value, so the next save keeps normal conflict protection |
+| Read-only workspace **cannot be loaded** | Deliberate: opening a session requires `write` because the session is workspace-linked and meant to be saved back. A "read-only copy into a detached artifact" mode is **not implemented** — product decision needed |
+| External rename/move of a workspace file | Canvas has no watcher (`sync_workspace` is Workspace-owned and not consumed); a renamed file leaves the link pointing at the old path, and the next save either creates that path again or answers `409 content_conflict` |
+| Real LLM tool-calling | Not run: the tools were exercised through `ToolDispatcher` and the REST API, with no model in the loop |
+| `app/runtime/**` integration | None needed and none made; `ActionValidator` unchanged |
+| Frontend (`AGPilot0011`) | Not touched: `from-workspace` / `save-to-workspace` / `workspace-link` and the `client_write` completion flow are frontend work |
+| Load/performance of large files | The buffer is bounded by `AGCORE_CANVAS_MAX_CONTENT_BYTES` (413 `content_too_large` above it); no large-file or concurrent-save load test was run |
+
+### 18.8 Next actions
+
+1. Merge `feat/r2-workspace-rag` (`907482c`) first, then this branch; confirm
+   `omni.switch_point.active_source == "app.workspace.contracts"` (the switch flips by import, no code
+   change) and re-run §18.6 against the live engine.
+2. Ask the Workspace/RAG owner for two contract additions: a **client read** path for
+   `local_browser` and a **client write completion report**; until then both stay refused/unverified.
+3. Decide the read-only load question (§18.7) before the frontend offers "open from workspace" on a
+   read-only root.
+4. Frontend: `POST /artifacts/from-workspace`, `POST /artifacts/{id}/save-to-workspace`,
+   `GET /artifacts/{id}/workspace-link`, `409 content_conflict` recovery (reload/force) and the
+   `client_write` completion handling.
+5. Operator: add the ten `canvas.*` names to a tool profile only after review, and enable
+   `AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED` separately from `AGCORE_CANVAS_TOOLS_ENABLED`.
