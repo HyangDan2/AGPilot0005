@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0] - 2026-11-27 (main)
+### Phase B — Runtime Parity, LangGraph Single Runtime & Legacy Retirement (`WO-05` B1~B3, `AM-05`, `AM-06`)
+- Added 14-scenario Runtime Parity suite (`tests/test_r1_3_runtime_parity.py`) and closed LangGraph parity defects: non-delta streaming `answer.delta` & `legacy_citations` emission, `COMPACT_CONTEXT` fallback `rejected_signatures` loop fix, `GatewayStreamError` normalization, cancelled early-return error guard, pseudo-tool markup stream block, and `SAFE_RESPOND` fallback reason preservation.
+- Retired Legacy runtime execution loop (`app/runtime/runner.py`) and unused legacy graph builders (`app/runtime/graph.py`), establishing `LangGraphR1Runtime` as the single execution entrypoint while preserving `TaskOrchestrator`, `DocumentAnalysisManager`, `AGPolicy`, `ActionValidator`, `ExecutionScope`, Context Budget, SSE EventBus, and Trajectory/Feedback contracts.
+- Enforced `AM-06` Boot Fail-Fast for explicit `AGCORE_RUNTIME_ENGINE=legacy` and unrecognized engine values (`validate_runtime_engine_config()`), defaulting `RUNTIME_ENGINE` to `langgraph_r1`.
+- Registered `demo-console` service binding (`public-safe`) and updated `/api/v1/health` to report `version: "1.3.0"` and `runtime_engine: "langgraph_r1"`.
+
 ## [1.2.0] - 2026-11-27 (main)
 ### Release Gate & Final Defect Closure (`HF-01` ~ `HF-07`, `ADD-01` ~ `ADD-02`, `RB-01` ~ `RB-02`)
 - Removed legacy `SERVICE_TOKENS` / `ADMIN_SERVICE_TOKENS` scope-bypass branches; unified caller auth to `AGCORE_CREDENTIAL_SCOPES` + `AGCORE_CREDENTIAL_SECRETS` and verified Trusted Proxy (`X-Trusted-Proxy-Secret`); blocked invalid credential → Trusted Proxy fallback and unregistered service API/tool fallback (`HF-01`, `ADD-01`).

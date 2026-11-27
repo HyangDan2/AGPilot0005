@@ -38,7 +38,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="HD2Lab Agent Core Platform (AGCore)",
-    version="1.1.0",
+    version="1.3.0",
     description="범용 Agentic AI Runtime 및 Tool Execution 백엔드 서비스",
     docs_url=None,
     redoc_url=None,
