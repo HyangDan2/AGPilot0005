@@ -478,6 +478,10 @@ Environment variables:
 | `AGCORE_CANVAS_MAX_DIFF_LINES` | `2000` | diff line budget |
 | `AGCORE_CANVAS_CONTEXT_TOKENS` | `3000` | AI edit context budget |
 
+WO-C17 push: `c615874` … `c25a9a5` were pushed to `origin/feat/r2-canvas` on 2026-11-27
+(`git ls-remote origin feat/r2-canvas` → `c25a9a5`, `main` still `0d2047f`). No force push, no
+merge, no pull request.
+
 Migration policy:
 
 * **No production migration in R2.** R1.3 has no artifact data, so there is nothing to migrate
