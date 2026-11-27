@@ -186,6 +186,10 @@ Screenshots: `/workspace/downloads/r2-w-qa/` (`01-home` … `09-mobile`).
 - Read `docs/r2/WORKSPACE_CONTRACT.md`; use `WorkspaceProvider` (`app/workspace/contracts.py`) or `WorkspaceProvider`/`createMockWorkspaceProvider()` (`clients/workspace-contract.ts`).
 - Artifact references only: `POST /workspaces/{id}/artifact-references` with `{artifact_id, kind, file_id?, metadata?}`; Workspace never reads artifact content.
 - Workspace does not touch `Artifact Content/Revision/Patch/Canvas Editor/Export`; no Canvas file was modified.
+- **Amendment 02 / WO-C18 handoff**: `POST /artifacts/from-workspace`, `POST /artifacts/{id}/save-to-workspace`,
+  `GET /artifacts/{id}/workspace-link`; the workspace file's `content_hash` is the Canvas
+  `last_saved_content_hash`. Field mapping and the two open gaps (`client_read`, `client_write` ack)
+  are in §11c.7.
 
 ## 11. R1.3 runtime integration targets (do **not** apply before R1.3 closes)
 
@@ -402,7 +406,7 @@ workspaces can be full agent targets.
 cd /workspace/repos/AGPilot0005
 python -m pytest tests/test_r2_workspace_am02_agent.py -q   # 11 passed (6 scenarios + security + chat scope + HTTP)
 python -m pytest tests/test_r2_workspace_*.py -q            # 102 passed
-python -m pytest -q                                         # 275 passed
+python -m pytest -q                                         # 276 passed
 cd /workspace/repos/AGPilot0011/hd2ai-admin
 npx tsc -p tsconfig.app.json --noEmit && npx vite build    # clean
 ```

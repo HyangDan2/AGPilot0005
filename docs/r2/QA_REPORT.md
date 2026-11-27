@@ -193,7 +193,7 @@ Lean Engineering Policy v1.1: only the changed surface was tested; the pre-exist
 | --- | --- | --- |
 | Amendment 02 (11 tools, chat scope, 6 acceptance scenarios, approval, injection, HTTP) | `pytest tests/test_r2_workspace_am02_agent.py -q` | **11 passed** |
 | R2-W workspace suites (contract → A02) | `pytest tests/test_r2_workspace_*.py -q` | **102 passed** |
-| Full AGCore suite | `pytest -q` | **275 passed** (previously 226; +11 new, 0 regressions) |
+| Full AGCore suite | `pytest -q` | **276 passed** (previously 226; +11 new, 0 regressions) |
 | Frontend types/build | `tsc -p tsconfig.app.json --noEmit`, `vite build` | pass (no type errors) |
 
 Covered by `test_r2_workspace_am02_agent.py`:
