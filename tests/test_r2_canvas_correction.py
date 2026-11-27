@@ -10,7 +10,7 @@ import asyncio
 import pytest
 
 from app.canvas.errors import CanvasError, CanvasErrorCode
-from app.canvas.service import get_canvas_service, reset_canvas_service
+from app.canvas.service import get_canvas_service
 from app.canvas.workspace import LocalDevWorkspaceProvider, UnavailableWorkspaceProvider
 from app.core.auth import current_execution_scope
 from tests.r2_canvas_support import BASE, client, configure, headers, scope

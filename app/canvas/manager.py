@@ -18,7 +18,7 @@ Two authorization boundaries are enforced here (WO-C17):
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from app.canvas.config import CanvasSettings
 from app.canvas.errors import CanvasError, CanvasErrorCode
