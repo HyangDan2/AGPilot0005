@@ -4,7 +4,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+
+from app.workspace.rootfs import AllowedRoot, parse_allowed_roots
 
 _ENV_PREFIX = "AGCORE_WORKSPACE_"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -137,6 +139,31 @@ class WorkspaceSettings:
     # Number of content revisions kept on disk per file (older blobs are pruned)
     revision_keep: int = field(default_factory=lambda: _env_int("REVISION_KEEP", 3))
 
+    # ------------------------------------------------------------------ Amendment 01
+    # Allowed roots for server-side folder workspaces: `id:/abs/path:owner|tenant|global[:ro]`.
+    # Empty value → one personal default root under the state directory ({owner} expanded).
+    allowed_roots: Tuple[AllowedRoot, ...] = field(
+        default_factory=lambda: parse_allowed_roots(_env("ALLOWED_ROOTS", ""), default_root=_default_state_dir())
+    )
+    # Folder scan (watcher) settings
+    watch_enabled: bool = field(default_factory=lambda: _env_bool("WATCH_ENABLED", True))
+    watch_interval_seconds: float = field(default_factory=lambda: _env_float("WATCH_INTERVAL_SECONDS", 2.0))
+    watch_max_workspaces_per_pass: int = field(default_factory=lambda: _env_int("WATCH_MAX_WORKSPACES_PER_PASS", 25))
+    scan_excludes: Tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            name.strip()
+            for name in _env("SCAN_EXCLUDES", ".git,node_modules,__pycache__,.venv,venv,dist,build").split(",")
+            if name.strip()
+        )
+    )
+    scan_max_entries: int = field(default_factory=lambda: _env_int("SCAN_MAX_ENTRIES", 20000))
+    scan_max_depth: int = field(default_factory=lambda: _env_int("SCAN_MAX_DEPTH", 24))
+    # Disconnecting a workspace must never delete the user's folder unless the operator opts in
+    # *and* the request carries an explicit confirmation.
+    allow_source_delete: bool = field(default_factory=lambda: _env_bool("ALLOW_SOURCE_DELETE", False))
+    # Root admin surface (create folders under an allowed root) is separate from opening.
+    allow_new_workspace_folder: bool = field(default_factory=lambda: _env_bool("ALLOW_NEW_WORKSPACE_FOLDER", True))
+
     # Event log retention
     max_events_per_workspace: int = field(default_factory=lambda: _env_int("MAX_EVENTS_PER_WORKSPACE", 5000))
 
@@ -167,6 +194,16 @@ class WorkspaceSettings:
             agtools_enabled=False,
             parser_poll_interval_seconds=0.01,
             parser_max_wait_seconds=5.0,
+            allowed_roots=(
+                AllowedRoot(
+                    root_id="test",
+                    path=str(base / "allowed"),
+                    scope="global",
+                    writable=True,
+                    is_default=True,
+                ),
+            ),
+            watch_interval_seconds=0.05,
         )
         values.update(overrides)
         return cls(**values)

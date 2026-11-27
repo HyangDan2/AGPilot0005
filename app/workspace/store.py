@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workspace_meta (
@@ -33,7 +33,18 @@ CREATE TABLE IF NOT EXISTS workspace (
     status TEXT NOT NULL DEFAULT 'active',
     revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    -- Amendment 01: folder root and connection lifecycle
+    storage_provider TEXT NOT NULL DEFAULT 'server_managed',
+    root_id TEXT,
+    root_path TEXT,
+    display_path TEXT,
+    lifecycle_state TEXT NOT NULL DEFAULT 'open',
+    read_only INTEGER NOT NULL DEFAULT 0,
+    zero_copy INTEGER NOT NULL DEFAULT 0,
+    client_handle_id TEXT,
+    opened_at TEXT,
+    closed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_workspace_scope ON workspace(tenant_id, owner_id, service_id, status);
 
@@ -53,6 +64,11 @@ CREATE TABLE IF NOT EXISTS workspace_file (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     deleted_at TEXT,
+    -- Amendment 01: zero-copy files keep their real relative path in the root
+    origin TEXT NOT NULL DEFAULT 'blob',
+    rel_path TEXT,
+    ext_mtime REAL,
+    synced_at TEXT,
     FOREIGN KEY (workspace_id) REFERENCES workspace(workspace_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_file_workspace ON workspace_file(workspace_id, parent_id, deleted_at);
@@ -177,7 +193,68 @@ CREATE TABLE IF NOT EXISTS workspace_chunk_vector (
     PRIMARY KEY (chunk_id, index_key)
 );
 CREATE INDEX IF NOT EXISTS idx_vector_workspace ON workspace_chunk_vector(workspace_id, index_key);
+
+CREATE TABLE IF NOT EXISTS workspace_watch_state (
+    workspace_id TEXT PRIMARY KEY,
+    last_scan_at TEXT,
+    last_change_at TEXT,
+    changes_total INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    watching INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT
+);
+
+-- Browser-picked folders (`local_browser`): the text the browser captured for indexing. The
+-- server owns no path and keeps no file body; chunks are built from this text only.
+CREATE TABLE IF NOT EXISTS workspace_file_capture (
+    file_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (file_id, revision)
+);
 """
+
+# Columns added after the v1 schema; applied on an existing database too (idempotent).
+_COLUMN_MIGRATIONS = (
+    ("workspace", "storage_provider", "storage_provider TEXT NOT NULL DEFAULT 'server_managed'"),
+    ("workspace", "root_id", "root_id TEXT"),
+    ("workspace", "root_path", "root_path TEXT"),
+    ("workspace", "display_path", "display_path TEXT"),
+    ("workspace", "lifecycle_state", "lifecycle_state TEXT NOT NULL DEFAULT 'open'"),
+    ("workspace", "read_only", "read_only INTEGER NOT NULL DEFAULT 0"),
+    ("workspace", "zero_copy", "zero_copy INTEGER NOT NULL DEFAULT 0"),
+    ("workspace", "client_handle_id", "client_handle_id TEXT"),
+    ("workspace", "opened_at", "opened_at TEXT"),
+    ("workspace", "closed_at", "closed_at TEXT"),
+    ("workspace_file", "origin", "origin TEXT NOT NULL DEFAULT 'blob'"),
+    ("workspace_file", "rel_path", "rel_path TEXT"),
+    ("workspace_file", "ext_mtime", "ext_mtime REAL"),
+    ("workspace_file", "synced_at", "synced_at TEXT"),
+)
+
+_FILE_COLUMNS = (
+    "file_id",
+    "workspace_id",
+    "parent_id",
+    "kind",
+    "name",
+    "mime_type",
+    "size_bytes",
+    "content_hash",
+    "revision",
+    "index_status",
+    "index_error",
+    "index_updated_at",
+    "created_at",
+    "updated_at",
+    "deleted_at",
+    "origin",
+    "rel_path",
+    "ext_mtime",
+    "synced_at",
+)
 
 
 def _row(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
@@ -229,6 +306,7 @@ class WorkspaceStore:
         conn = self._connect()
         try:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
             conn.execute(
                 "INSERT INTO workspace_meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -236,6 +314,18 @@ class WorkspaceStore:
             )
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add Amendment 01 columns to a database created by the v1 schema."""
+
+        for table, column, ddl in _COLUMN_MIGRATIONS:
+            try:
+                existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.Error:  # pragma: no cover - corrupt database
+                continue
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
     def schema_version(self) -> int:
         with self.read() as conn:
@@ -251,14 +341,31 @@ class WorkspaceStore:
             return False
 
     # -- workspaces ---------------------------------------------------------------
+    _WORKSPACE_DEFAULTS = {
+        "storage_provider": "server_managed",
+        "root_id": None,
+        "root_path": None,
+        "display_path": None,
+        "lifecycle_state": "open",
+        "read_only": 0,
+        "zero_copy": 0,
+        "client_handle_id": None,
+        "opened_at": None,
+        "closed_at": None,
+    }
+
     def create_workspace(self, record: Dict[str, Any]) -> None:
+        payload = {**self._WORKSPACE_DEFAULTS, **record}
+        columns = (
+            "workspace_id, tenant_id, owner_id, service_id, name, description, status, revision, "
+            "created_at, updated_at, storage_provider, root_id, root_path, display_path, "
+            "lifecycle_state, read_only, zero_copy, client_handle_id, opened_at, closed_at"
+        )
         with self.write() as conn:
             conn.execute(
-                """INSERT INTO workspace(workspace_id, tenant_id, owner_id, service_id, name, description,
-                        status, revision, created_at, updated_at)
-                   VALUES(:workspace_id, :tenant_id, :owner_id, :service_id, :name, :description,
-                        :status, :revision, :created_at, :updated_at)""",
-                record,
+                f"INSERT INTO workspace({columns}) VALUES("
+                f"{', '.join(':' + c.strip() for c in columns.split(','))})",
+                payload,
             )
 
     def get_workspace(self, workspace_id: str) -> Optional[Dict[str, Any]]:
@@ -289,6 +396,71 @@ class WorkspaceStore:
             ).fetchone()
         return int(row["c"])
 
+    # -- Amendment 01: folder roots and watcher state ------------------------------
+    def list_watchable_workspaces(self, limit: int = 25) -> List[Dict[str, Any]]:
+        """Open, non-deleted folder-backed workspaces (the watcher's work list)."""
+
+        with self.read() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM workspace WHERE status != 'deleted' AND lifecycle_state='open' "
+                    "AND root_path IS NOT NULL AND root_path != '' AND read_only = 0 "
+                    "ORDER BY updated_at ASC LIMIT ?",
+                    (max(1, int(limit)),),
+                ).fetchall()
+            ]
+
+    def get_file_by_rel_path(self, workspace_id: str, rel_path: str) -> Optional[Dict[str, Any]]:
+        with self.read() as conn:
+            return _row(
+                conn.execute(
+                    "SELECT * FROM workspace_file WHERE workspace_id=? AND rel_path=? AND deleted_at IS NULL",
+                    (workspace_id, rel_path),
+                ).fetchone()
+            )
+
+    def list_external_files(self, workspace_id: str) -> List[Dict[str, Any]]:
+        with self.read() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM workspace_file WHERE workspace_id=? AND deleted_at IS NULL "
+                    "AND origin='external' ORDER BY rel_path ASC",
+                    (workspace_id,),
+                ).fetchall()
+            ]
+
+    def get_watch_state(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+        with self.read() as conn:
+            return _row(
+                conn.execute("SELECT * FROM workspace_watch_state WHERE workspace_id=?", (workspace_id,)).fetchone()
+            )
+
+    def upsert_watch_state(self, workspace_id: str, fields: Dict[str, Any]) -> None:
+        current = self.get_watch_state(workspace_id) or {}
+        payload = {
+            "workspace_id": workspace_id,
+            "last_scan_at": fields.get("last_scan_at", current.get("last_scan_at")),
+            "last_change_at": fields.get("last_change_at", current.get("last_change_at")),
+            "changes_total": int(fields.get("changes_total", current.get("changes_total") or 0)),
+            "last_error": fields.get("last_error", current.get("last_error")),
+            "watching": int(fields.get("watching", current.get("watching") or 0)),
+            "updated_at": fields.get("updated_at", current.get("updated_at")),
+        }
+        with self.write() as conn:
+            conn.execute(
+                """INSERT INTO workspace_watch_state(workspace_id, last_scan_at, last_change_at,
+                        changes_total, last_error, watching, updated_at)
+                   VALUES(:workspace_id, :last_scan_at, :last_change_at, :changes_total, :last_error,
+                        :watching, :updated_at)
+                   ON CONFLICT(workspace_id) DO UPDATE SET
+                        last_scan_at=excluded.last_scan_at, last_change_at=excluded.last_change_at,
+                        changes_total=excluded.changes_total, last_error=excluded.last_error,
+                        watching=excluded.watching, updated_at=excluded.updated_at""",
+                payload,
+            )
+
     def update_workspace(self, workspace_id: str, fields: Dict[str, Any]) -> None:
         if not fields:
             return
@@ -296,21 +468,47 @@ class WorkspaceStore:
         with self.write() as conn:
             conn.execute(f"UPDATE workspace SET {columns} WHERE workspace_id=:workspace_id", {**fields, "workspace_id": workspace_id})
 
+    # -- browser capture (local_browser provider) ---------------------------------
+    def put_capture(self, workspace_id: str, file_id: str, revision: int, text: str, at: str) -> None:
+        with self.write() as conn:
+            conn.execute(
+                """INSERT INTO workspace_file_capture(file_id, workspace_id, revision, text, created_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(file_id, revision) DO UPDATE SET text=excluded.text""",
+                (file_id, workspace_id, int(revision), text, at),
+            )
+
+    def get_capture(self, file_id: str, revision: int) -> Optional[str]:
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT text FROM workspace_file_capture WHERE file_id=? AND revision=?", (file_id, int(revision))
+            ).fetchone()
+        return row["text"] if row else None
+
+    def get_capture_latest(self, file_id: str) -> Optional[str]:
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT text FROM workspace_file_capture WHERE file_id=? ORDER BY revision DESC LIMIT 1", (file_id,)
+            ).fetchone()
+        return row["text"] if row else None
+
     def mark_workspace_deleted(self, workspace_id: str, at: str) -> None:
         with self.write() as conn:
             conn.execute("UPDATE workspace SET status='deleted', updated_at=? WHERE workspace_id=?", (at, workspace_id))
 
     # -- files --------------------------------------------------------------------
     def insert_file(self, record: Dict[str, Any]) -> None:
-        columns = (
-            "file_id, workspace_id, parent_id, kind, name, mime_type, size_bytes, content_hash, revision, "
-            "index_status, index_error, index_updated_at, created_at, updated_at, deleted_at"
-        )
+        payload = {column: record.get(column) for column in _FILE_COLUMNS}
+        if payload.get("origin") is None:
+            payload["origin"] = "blob"
+        for column in ("size_bytes", "revision"):
+            if payload.get(column) is None:
+                payload[column] = 0 if column == "size_bytes" else 1
         with self.write() as conn:
             conn.execute(
-                f"INSERT INTO workspace_file({columns}) VALUES("
-                f"{', '.join(':' + c.strip() for c in columns.split(','))})",
-                record,
+                f"INSERT INTO workspace_file({', '.join(_FILE_COLUMNS)}) VALUES("
+                f"{', '.join(':' + column for column in _FILE_COLUMNS)})",
+                payload,
             )
 
     def get_file(self, workspace_id: str, file_id: str, include_deleted: bool = False) -> Optional[Dict[str, Any]]:
@@ -1008,6 +1206,7 @@ class WorkspaceStore:
             conn.execute("DELETE FROM workspace_artifact_ref WHERE workspace_id=?", (workspace_id,))
             conn.execute("DELETE FROM workspace_citation WHERE workspace_id=?", (workspace_id,))
             conn.execute("DELETE FROM workspace_conversation_ref WHERE workspace_id=?", (workspace_id,))
+            conn.execute("DELETE FROM workspace_file_capture WHERE workspace_id=?", (workspace_id,))
             cursor = conn.execute("DELETE FROM workspace_file WHERE workspace_id=?", (workspace_id,))
             return cursor.rowcount
 

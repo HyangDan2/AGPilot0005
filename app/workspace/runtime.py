@@ -15,6 +15,7 @@ from app.workspace.retrieval import WorkspaceRetriever
 from app.workspace.storage import WorkspaceStorage
 from app.workspace.store import WorkspaceStore
 from app.workspace.tools import WorkspaceToolAdapter
+from app.workspace.watcher import WorkspaceWatcher
 
 
 @dataclass
@@ -29,6 +30,7 @@ class WorkspaceRuntime:
     citations: CitationService
     embedder: Optional[EmbeddingProvider]
     tools: WorkspaceToolAdapter
+    watcher: Optional[WorkspaceWatcher] = None
 
     @classmethod
     def build(cls, settings: Optional[WorkspaceSettings] = None, *, start_worker: bool = False) -> "WorkspaceRuntime":
@@ -47,6 +49,7 @@ class WorkspaceRuntime:
         citations = CitationService(store)
         assembler = ContextAssembler(store, settings, retriever, citations)
         tools = WorkspaceToolAdapter(manager, retriever, assembler)
+        watcher = WorkspaceWatcher(manager, settings)
         runtime = cls(
             settings=settings,
             store=store,
@@ -58,14 +61,18 @@ class WorkspaceRuntime:
             citations=citations,
             embedder=embedder,
             tools=tools,
+            watcher=watcher,
         )
         manager.recover()
         if start_worker:
             indexer.start()
+            watcher.start()
         return runtime
 
     def shutdown(self) -> None:
         self.indexer.stop()
+        if self.watcher is not None:
+            self.watcher.stop()
 
 
 _RUNTIME: Optional[WorkspaceRuntime] = None

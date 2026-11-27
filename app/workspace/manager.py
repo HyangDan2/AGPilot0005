@@ -1,33 +1,54 @@
 """Workspace manager: identity, file lifecycle, access policy and storage orchestration."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import hashlib
 import mimetypes
+import os
 import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from app.workspace import folder as folderfs
 from app.workspace.config import WorkspaceSettings
 from app.workspace.contracts import (
     AccessLevel,
     AccessResult,
+    AllowedRootInfo,
     ArtifactReference,
     ArtifactReferenceInput,
+    ClientWriteDirective,
+    ContentOrigin,
     FileContent,
     FileIdentity,
     FileKind,
     IndexState,
+    IndexStorageInfo,
+    InvalidRelativePath,
     RevisionStatus,
+    RootStatus,
     ScopeView,
     WorkspaceError,
     WorkspaceErrorCode,
     WorkspaceIdentity,
+    WorkspaceLifecycleState,
+    WorkspaceRootInfo,
     WorkspaceStatus,
+    WorkspaceStorageProvider,
+    WorkspaceSyncResult,
+    WorkspaceWatchStatus,
+    WorkspaceWriteRequest,
+    WorkspaceWriteResult,
+    validate_relative_path,
 )
+from app.workspace.rootfs import AllowedRootPolicy, RootPolicyError
 from app.workspace.storage import StorageError, WorkspaceStorage
 from app.workspace.store import WorkspaceStore
+from app.workspace.sync import FolderSyncService
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _RESERVED_NAMES = {"", ".", ".."}
@@ -66,6 +87,36 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(6)}"
 
 
+def _collect(chunks: Iterable[bytes], limit: int) -> bytes:
+    """Join an upload stream, refusing anything over the per-file limit."""
+
+    total = 0
+    blocks: List[bytes] = []
+    for chunk in chunks:
+        if not chunk:
+            continue
+        total += len(chunk)
+        if limit and total > limit:
+            raise WorkspaceFailure(WorkspaceErrorCode.FILE_TOO_LARGE, limit_bytes=limit)
+        blocks.append(chunk)
+    if not blocks:
+        raise WorkspaceFailure(WorkspaceErrorCode.INVALID_REQUEST, "empty file")
+    return b"".join(blocks)
+
+
+def _write_payload(request: WorkspaceWriteRequest) -> bytes:
+    if request.content is not None and request.content_base64 is not None:
+        raise WorkspaceFailure(WorkspaceErrorCode.INVALID_REQUEST, "provide content or content_base64, not both")
+    if request.content is not None:
+        return request.content.encode("utf-8")
+    if request.content_base64 is not None:
+        try:
+            return base64.b64decode(request.content_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise WorkspaceFailure(WorkspaceErrorCode.INVALID_REQUEST, "content_base64 is not valid base64") from exc
+    raise WorkspaceFailure(WorkspaceErrorCode.INVALID_REQUEST, "content required")
+
+
 class WorkspaceManager:
     """Implements the shared provider interface plus the file/index facing operations."""
 
@@ -82,6 +133,8 @@ class WorkspaceManager:
         self.settings = settings
         self.clock = clock
         self._file_listeners: List[Callable[[str, Optional[Dict[str, Any]]], None]] = []
+        self._policy: Optional[AllowedRootPolicy] = None
+        self._sync_service: Optional[FolderSyncService] = None
 
     # ------------------------------------------------------------------ helpers
     def add_file_listener(self, listener: Callable[[str, Optional[Dict[str, Any]]], None]) -> None:
@@ -130,6 +183,32 @@ class WorkspaceManager:
             revision=int(record["revision"]),
             created_at=record["created_at"],
             updated_at=record["updated_at"],
+            lifecycle_state=WorkspaceLifecycleState(record.get("lifecycle_state") or "open"),
+            root=self._root_info(record),
+            closed_at=record.get("closed_at"),
+        )
+
+    def _root_info(self, record: Dict[str, Any]) -> WorkspaceRootInfo:
+        provider = WorkspaceStorageProvider(record.get("storage_provider") or WorkspaceStorageProvider.SERVER_MANAGED.value)
+        root_path = record.get("root_path") or ""
+        status = RootStatus.AVAILABLE
+        if record.get("lifecycle_state") == WorkspaceLifecycleState.DELETED.value:
+            status = RootStatus.MISSING
+        elif provider is not WorkspaceStorageProvider.LOCAL_BROWSER and root_path:
+            candidate = Path(root_path)
+            if not candidate.exists() or not candidate.is_dir():
+                status = RootStatus.MISSING
+        return WorkspaceRootInfo(
+            storage_provider=provider,
+            root_id=record.get("root_id"),
+            display_path=record.get("display_path") or root_path or "",
+            allowed_root_id=record.get("root_id") if provider is not WorkspaceStorageProvider.SERVER_MANAGED else None,
+            read_only=bool(record.get("read_only")),
+            zero_copy=bool(record.get("zero_copy")) or provider is not WorkspaceStorageProvider.SERVER_MANAGED,
+            server_side_path_access=provider is not WorkspaceStorageProvider.LOCAL_BROWSER,
+            client_handle_id=record.get("client_handle_id"),
+            opened_at=record.get("opened_at"),
+            status=status,
         )
 
     def _display_path(self, workspace_id: str, record: Dict[str, Any]) -> str:
@@ -145,9 +224,15 @@ class WorkspaceManager:
             guard += 1
         return "/" + "/".join(reversed(parts))
 
-    def file_identity(self, record: Dict[str, Any]) -> FileIdentity:
+    def file_identity(self, record: Dict[str, Any], provider: Optional[WorkspaceStorageProvider] = None) -> FileIdentity:
         workspace_id = record["workspace_id"]
         status = record.get("index_status")
+        origin = record.get("origin") or ContentOrigin.BLOB.value
+        if provider is None:
+            workspace = self.store.get_workspace(workspace_id)
+            provider = WorkspaceStorageProvider(
+                (workspace or {}).get("storage_provider") or WorkspaceStorageProvider.SERVER_MANAGED.value
+            )
         return FileIdentity(
             file_id=record["file_id"],
             workspace_id=workspace_id,
@@ -162,6 +247,10 @@ class WorkspaceManager:
             index_status=IndexState(status) if status else None,
             created_at=record["created_at"],
             updated_at=record["updated_at"],
+            storage_provider=provider,
+            content_origin=ContentOrigin(origin),
+            relative_path=record.get("rel_path"),
+            synced_at=record.get("synced_at"),
         )
 
     def _emit(
@@ -195,6 +284,16 @@ class WorkspaceManager:
             "revision": 1,
             "created_at": stamp,
             "updated_at": stamp,
+            "storage_provider": WorkspaceStorageProvider.SERVER_MANAGED.value,
+            "root_id": None,
+            "root_path": None,
+            "display_path": "",
+            "lifecycle_state": WorkspaceLifecycleState.OPEN.value,
+            "read_only": 0,
+            "zero_copy": 0,
+            "client_handle_id": None,
+            "opened_at": stamp,
+            "closed_at": None,
         }
         self.store.create_workspace(record)
         self.storage.workspace_dir(tenant, record["workspace_id"]).mkdir(parents=True, exist_ok=True)
@@ -244,20 +343,609 @@ class WorkspaceManager:
         return self.get_workspace(workspace_id, scope)
 
     def delete_workspace(self, workspace_id: str, scope: ScopeView) -> Dict[str, Any]:
+        """Delete a workspace. For an external root this only releases the binding (§A1.6)."""
+
+        return self.disconnect_workspace(workspace_id, scope, delete_source_files=False)
+
+    # ------------------------------------------------------------------ Amendment 01
+    # Allowed roots, folder lifecycle, zero-copy sync and the common write contract.
+    @property
+    def allowed_root_policy(self) -> AllowedRootPolicy:
+        if self._policy is None:
+            protected = [self.settings.resolved_db_path(), self.settings.resolved_storage_root()]
+            self._policy = AllowedRootPolicy(self.settings.allowed_roots, protected_paths=protected)
+        return self._policy
+
+    @property
+    def sync_service(self) -> FolderSyncService:
+        if self._sync_service is None:
+            self._sync_service = FolderSyncService(self, self.settings)
+        return self._sync_service
+
+    def allowed_roots(self, scope: ScopeView) -> List[AllowedRootInfo]:
+        tenant, owner, _service = self._scope_ids(scope)
+        return self.allowed_root_policy.describe(tenant, owner)
+
+    @staticmethod
+    def _root_failure(exc: RootPolicyError) -> WorkspaceFailure:
+        try:
+            code = WorkspaceErrorCode(exc.code)
+        except ValueError:
+            code = WorkspaceErrorCode.INVALID_PATH
+        return WorkspaceFailure(code, str(exc))
+
+    @staticmethod
+    def _folder_failure(exc: Exception) -> WorkspaceFailure:
+        code = getattr(exc, "code", "invalid_path")
+        try:
+            mapped = WorkspaceErrorCode(code)
+        except ValueError:
+            mapped = WorkspaceErrorCode.INVALID_REQUEST
+        return WorkspaceFailure(mapped, str(exc))
+
+    @staticmethod
+    def _is_folder_backed(record: Dict[str, Any]) -> bool:
+        return bool(record.get("root_path")) and WorkspaceStorageProvider(
+            record.get("storage_provider") or WorkspaceStorageProvider.SERVER_MANAGED.value
+        ) in {
+            WorkspaceStorageProvider.SERVER_MANAGED,
+            WorkspaceStorageProvider.SERVER_MOUNTED_FOLDER,
+        }
+
+    @staticmethod
+    def _is_local_browser(record: Dict[str, Any]) -> bool:
+        return (
+            WorkspaceStorageProvider(record.get("storage_provider") or WorkspaceStorageProvider.SERVER_MANAGED.value)
+            is WorkspaceStorageProvider.LOCAL_BROWSER
+        )
+
+    def _require_open(self, record: Dict[str, Any]) -> None:
+        if record.get("lifecycle_state") == WorkspaceLifecycleState.CLOSED.value:
+            raise WorkspaceFailure(WorkspaceErrorCode.WORKSPACE_CLOSED, workspace_id=record.get("workspace_id"))
+
+    def _require_writable(self, record: Dict[str, Any]) -> None:
+        self._require_open(record)
+        if int(record.get("read_only") or 0):
+            raise WorkspaceFailure(WorkspaceErrorCode.READ_ONLY_WORKSPACE, workspace_id=record.get("workspace_id"))
+
+    def _root_path(self, record: Dict[str, Any]) -> Path:
+        root_path = record.get("root_path") or ""
+        if not root_path:
+            raise WorkspaceFailure(WorkspaceErrorCode.ROOT_UNAVAILABLE, workspace_id=record.get("workspace_id"))
+        return Path(root_path)
+
+    # -- open / new / local browser ------------------------------------------------
+    def open_folder(
+        self,
+        scope: ScopeView,
+        path: str,
+        *,
+        name: Optional[str] = None,
+        read_only: bool = False,
+        root_id: Optional[str] = None,
+    ) -> WorkspaceIdentity:
+        tenant, owner, service = self._scope_ids(scope)
+        try:
+            resolved = self.allowed_root_policy.resolve(
+                tenant, owner, path, root_id=root_id, must_exist=True, for_write=not read_only
+            )
+        except RootPolicyError as exc:
+            raise self._root_failure(exc) from exc
+
+        # Idempotent open: the same folder for the same owner returns the live workspace.
+        for existing in self.store.list_workspaces(tenant, owner, None if not self.settings.service_isolation else service):
+            if existing.get("root_path") == str(resolved.path) and existing.get("lifecycle_state") != "deleted":
+                return self.workspace_identity(existing)
+
+        if self.store.count_workspaces(tenant, owner) >= self.settings.max_workspaces_per_owner:
+            raise WorkspaceFailure(WorkspaceErrorCode.QUOTA_EXCEEDED, "workspace limit reached")
+
+        clean_name = validate_name(
+            name or Path(resolved.path).name or resolved.root.root_id,
+            field="workspace name",
+            max_length=120,
+        )
+        stamp = self.clock()
+        record = {
+            "workspace_id": _new_id("ws"),
+            "tenant_id": tenant,
+            "owner_id": owner,
+            "service_id": service,
+            "name": clean_name,
+            "description": "",
+            "status": WorkspaceStatus.ACTIVE.value,
+            "revision": 1,
+            "created_at": stamp,
+            "updated_at": stamp,
+            "storage_provider": WorkspaceStorageProvider.SERVER_MOUNTED_FOLDER.value,
+            "root_id": resolved.root.root_id,
+            "root_path": str(resolved.path),
+            "display_path": resolved.display_path,
+            "lifecycle_state": WorkspaceLifecycleState.OPEN.value,
+            "read_only": 1 if (read_only or not resolved.writable) else 0,
+            "zero_copy": 1,
+            "client_handle_id": None,
+            "opened_at": stamp,
+            "closed_at": None,
+        }
+        self.store.create_workspace(record)
+        self._emit(record["workspace_id"], None, "workspace.opened", 1, {"provider": record["storage_provider"], "path": str(resolved.path)})
+        self._initial_sync(record)
+        return self.get_workspace(record["workspace_id"], scope)
+
+    def new_workspace(
+        self,
+        scope: ScopeView,
+        name: str,
+        *,
+        description: str = "",
+        parent_path: Optional[str] = None,
+        root_id: Optional[str] = None,
+    ) -> WorkspaceIdentity:
+        tenant, owner, service = self._scope_ids(scope)
+        if not self.settings.allow_new_workspace_folder:
+            raise WorkspaceFailure(WorkspaceErrorCode.FORBIDDEN, "new folder workspace disabled")
+        clean_name = validate_name(name, field="workspace name", max_length=120)
+        policy = self.allowed_root_policy
+        if parent_path:
+            try:
+                resolved = policy.resolve(
+                    tenant, owner, parent_path, root_id=root_id, must_exist=False, for_write=True
+                )
+            except RootPolicyError as exc:
+                raise self._root_failure(exc) from exc
+            base = resolved.path
+        else:
+            roots = policy.visible_roots(tenant, owner)
+            if not roots:
+                raise WorkspaceFailure(WorkspaceErrorCode.PATH_OUTSIDE_ALLOWED_ROOT, "no allowed root configured")
+            default = next((item for item in roots if item.root.is_default), roots[0])
+            if not default.writable:
+                raise WorkspaceFailure(WorkspaceErrorCode.READ_ONLY_WORKSPACE, "default root is read-only")
+            base = default.path
+            resolved = default
+        try:
+            policy.assert_inside(base, clean_name)
+        except RootPolicyError as exc:
+            raise self._root_failure(exc) from exc
+        target = Path(base) / clean_name
+        if target.exists():
+            raise WorkspaceFailure(WorkspaceErrorCode.FILE_EXISTS, name=clean_name)
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            target.mkdir(mode=0o755, exist_ok=True)
+        except OSError as exc:
+            raise WorkspaceFailure(WorkspaceErrorCode.ROOT_UNAVAILABLE, str(exc)[:200]) from exc
+        if not target.is_dir():
+            raise WorkspaceFailure(WorkspaceErrorCode.FILE_EXISTS, name=clean_name)
+
+        if self.store.count_workspaces(tenant, owner) >= self.settings.max_workspaces_per_owner:
+            raise WorkspaceFailure(WorkspaceErrorCode.QUOTA_EXCEEDED, "workspace limit reached")
+        stamp = self.clock()
+        record = {
+            "workspace_id": _new_id("ws"),
+            "tenant_id": tenant,
+            "owner_id": owner,
+            "service_id": service,
+            "name": clean_name,
+            "description": (description or "").strip()[:2000],
+            "status": WorkspaceStatus.ACTIVE.value,
+            "revision": 1,
+            "created_at": stamp,
+            "updated_at": stamp,
+            "storage_provider": WorkspaceStorageProvider.SERVER_MANAGED.value,
+            "root_id": resolved.root.root_id,
+            "root_path": str(target),
+            "display_path": str(target),
+            "lifecycle_state": WorkspaceLifecycleState.OPEN.value,
+            "read_only": 0,
+            "zero_copy": 1,
+            "client_handle_id": None,
+            "opened_at": stamp,
+            "closed_at": None,
+        }
+        self.store.create_workspace(record)
+        self._emit(record["workspace_id"], None, "workspace.created", 1, {"provider": record["storage_provider"], "path": str(target)})
+        self._initial_sync(record)
+        return self.get_workspace(record["workspace_id"], scope)
+
+    def create_local_browser_workspace(
+        self,
+        scope: ScopeView,
+        name: str,
+        *,
+        client_handle_id: str,
+        entries: Sequence[Any] = (),
+        display_path: str = "",
+        description: str = "",
+        read_only: bool = True,
+    ) -> WorkspaceIdentity:
+        """Register a browser-picked folder. The server never learns a server-side path (§A1.8)."""
+
+        tenant, owner, service = self._scope_ids(scope)
+        clean_name = validate_name(name, field="workspace name", max_length=120)
+        handle = (client_handle_id or "").strip()
+        if not handle or len(handle) > 128 or _CONTROL_CHARS.search(handle):
+            raise WorkspaceFailure(WorkspaceErrorCode.INVALID_REQUEST, "invalid client_handle_id")
+        if self.store.count_workspaces(tenant, owner) >= self.settings.max_workspaces_per_owner:
+            raise WorkspaceFailure(WorkspaceErrorCode.QUOTA_EXCEEDED, "workspace limit reached")
+        stamp = self.clock()
+        record = {
+            "workspace_id": _new_id("ws"),
+            "tenant_id": tenant,
+            "owner_id": owner,
+            "service_id": service,
+            "name": clean_name,
+            "description": (description or "").strip()[:2000],
+            "status": WorkspaceStatus.ACTIVE.value,
+            "revision": 1,
+            "created_at": stamp,
+            "updated_at": stamp,
+            "storage_provider": WorkspaceStorageProvider.LOCAL_BROWSER.value,
+            "root_id": None,
+            "root_path": None,
+            "display_path": (display_path or clean_name)[:512],
+            "lifecycle_state": WorkspaceLifecycleState.OPEN.value,
+            "read_only": 1 if read_only else 0,
+            "zero_copy": 1,
+            "client_handle_id": handle,
+            "opened_at": stamp,
+            "closed_at": None,
+        }
+        self.store.create_workspace(record)
+        self._emit(record["workspace_id"], None, "workspace.opened", 1, {"provider": record["storage_provider"]})
+        for entry in entries:
+            self._register_browser_entry(record, entry)
+        return self.get_workspace(record["workspace_id"], scope)
+
+    def _register_browser_entry(self, workspace: Dict[str, Any], entry: Any) -> Optional[str]:
+        rel_raw = getattr(entry, "path", None) if not isinstance(entry, dict) else entry.get("path")
+        try:
+            rel = validate_relative_path(str(rel_raw or ""))
+        except InvalidRelativePath:
+            return None
+        kind = (getattr(entry, "kind", None) if not isinstance(entry, dict) else entry.get("kind")) or FileKind.FILE
+        if hasattr(kind, "value"):
+            kind = kind.value
+        if len(rel) > 1024:
+            return None
+        parent_id = self._ensure_folder_rows(workspace["workspace_id"], rel.rsplit("/", 1)[0] if "/" in rel else "")
+        if kind == FileKind.FOLDER.value:
+            if self.store.find_file_by_name(workspace["workspace_id"], parent_id, rel.rsplit("/", 1)[-1]) is None:
+                return self._insert_browser_row(workspace, rel, parent_id, FileKind.FOLDER, 0, None)
+            return None
+        text = getattr(entry, "text", None) if not isinstance(entry, dict) else entry.get("text")
+        size = int((getattr(entry, "size_bytes", 0) if not isinstance(entry, dict) else entry.get("size_bytes")) or 0)
+        digest = (getattr(entry, "content_hash", None) if not isinstance(entry, dict) else entry.get("content_hash")) or None
+        payload = text.encode("utf-8") if isinstance(text, str) else b""
+        if not digest and payload:
+            digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+        if not size:
+            size = len(payload)
+        file_id = self._insert_browser_row(workspace, rel, parent_id, FileKind.FILE, size, digest)
+        if payload:
+            self.store.put_capture(workspace["workspace_id"], file_id, 1, payload.decode("utf-8", errors="replace"), self.clock())
+        return file_id
+
+    def _insert_browser_row(
+        self,
+        workspace: Dict[str, Any],
+        rel: str,
+        parent_id: Optional[str],
+        kind: FileKind,
+        size: int,
+        digest: Optional[str],
+    ) -> str:
+        stamp = self.clock()
+        file_id = _new_id("wf")
+        name = rel.rsplit("/", 1)[-1]
+        self.store.insert_file(
+            {
+                "file_id": file_id,
+                "workspace_id": workspace["workspace_id"],
+                "parent_id": parent_id,
+                "kind": kind.value,
+                "name": name,
+                "mime_type": mimetypes.guess_type(name)[0] if kind is FileKind.FILE else None,
+                "size_bytes": size,
+                "content_hash": digest,
+                "revision": 1,
+                "index_status": IndexState.PENDING.value if kind is FileKind.FILE and digest else None,
+                "index_error": None,
+                "index_updated_at": stamp,
+                "created_at": stamp,
+                "updated_at": stamp,
+                "deleted_at": None,
+                "origin": "external",
+                "rel_path": rel,
+                "ext_mtime": None,
+                "synced_at": stamp,
+            }
+        )
+        if kind is FileKind.FILE and digest:
+            self.store.add_revision(
+                {
+                    "file_id": file_id,
+                    "workspace_id": workspace["workspace_id"],
+                    "revision": 1,
+                    "content_hash": digest,
+                    "size_bytes": size,
+                    "blob_key": "browser",
+                    "parser_version": None,
+                    "created_at": stamp,
+                }
+            )
+        self._emit(workspace["workspace_id"], file_id, "file.created", 1, {"provider": "local_browser", "path": rel})
+        if kind is FileKind.FILE:
+            self._notify_file(workspace["workspace_id"], file_id)
+        return file_id
+
+    def _ensure_folder_rows(self, workspace_id: str, rel_dir: str) -> Optional[str]:
+        """Create folder rows for `rel_dir` and return the deepest folder id (external layout)."""
+
+        if not rel_dir:
+            return None
+        parent_id: Optional[str] = None
+        prefix = ""
+        for part in rel_dir.split("/"):
+            prefix = f"{prefix}/{part}" if prefix else part
+            row = self.store.get_file_by_rel_path(workspace_id, prefix)
+            if row is not None and row["kind"] == FileKind.FOLDER.value:
+                parent_id = row["file_id"]
+                continue
+            existing = self.store.find_file_by_name(workspace_id, parent_id, part)
+            if existing is not None and existing["kind"] == FileKind.FOLDER.value:
+                parent_id = existing["file_id"]
+                continue
+            stamp = self.clock()
+            file_id = _new_id("wf")
+            self.store.insert_file(
+                {
+                    "file_id": file_id,
+                    "workspace_id": workspace_id,
+                    "parent_id": parent_id,
+                    "kind": FileKind.FOLDER.value,
+                    "name": part,
+                    "mime_type": None,
+                    "size_bytes": 0,
+                    "content_hash": None,
+                    "revision": 1,
+                    "index_status": None,
+                    "index_error": None,
+                    "index_updated_at": None,
+                    "created_at": stamp,
+                    "updated_at": stamp,
+                    "deleted_at": None,
+                    "origin": "external",
+                    "rel_path": prefix,
+                    "ext_mtime": None,
+                    "synced_at": stamp,
+                }
+            )
+            parent_id = file_id
+        return parent_id
+
+    def _initial_sync(self, record: Dict[str, Any]) -> None:
+        """First scan after open/new. A failure closes the workspace instead of leaving it half-open."""
+
+        try:
+            result = self.sync_service.sync(record, full=True)
+        except Exception as exc:  # folder unreadable or race
+            stamp = self.clock()
+            self.store.update_workspace(
+                record["workspace_id"],
+                {
+                    "lifecycle_state": WorkspaceLifecycleState.CLOSED.value,
+                    "closed_at": stamp,
+                    "updated_at": stamp,
+                    "revision": int(record["revision"]) + 1,
+                },
+            )
+            self.store.upsert_watch_state(
+                record["workspace_id"],
+                {"last_scan_at": stamp, "last_error": str(exc)[:300], "watching": 0, "updated_at": stamp},
+            )
+            self._emit(record["workspace_id"], None, "workspace.open_failed", 1, {"error": str(exc)[:300]})
+            raise self._folder_failure(exc) from exc
+        self._record_sync(record["workspace_id"], result)
+
+    def _record_sync(self, workspace_id: str, result: WorkspaceSyncResult, *, error: Optional[str] = None) -> None:
+        current = self.store.get_watch_state(workspace_id) or {}
+        delta = result.created + result.modified + result.moved + result.deleted
+        stamp = self.clock()
+        self.store.upsert_watch_state(
+            workspace_id,
+            {
+                "last_scan_at": result.finished_at or stamp,
+                "last_change_at": stamp if delta else current.get("last_change_at"),
+                "changes_total": int(current.get("changes_total") or 0) + delta,
+                "last_error": error,
+                "watching": 1,
+                "updated_at": stamp,
+            },
+        )
+
+    # -- close / reopen / disconnect ------------------------------------------------
+    def close_workspace(self, workspace_id: str, scope: ScopeView, reason: str = "") -> WorkspaceIdentity:
         record = self._workspace_record(workspace_id, scope)
+        if record.get("lifecycle_state") == WorkspaceLifecycleState.CLOSED.value:
+            return self.workspace_identity(record)
         stamp = self.clock()
         for file_row in self.store.list_files(workspace_id, recursive=True, include_deleted=False):
-            self.store.cancel_jobs_for_file(file_row["file_id"], stamp, reason="workspace_deleted")
+            self.store.cancel_jobs_for_file(file_row["file_id"], stamp, reason="workspace_closed")
+        self.store.update_workspace(
+            workspace_id,
+            {
+                "lifecycle_state": WorkspaceLifecycleState.CLOSED.value,
+                "closed_at": stamp,
+                "updated_at": stamp,
+                "revision": int(record["revision"]) + 1,
+            },
+        )
+        self.store.upsert_watch_state(workspace_id, {"watching": 0, "updated_at": stamp})
+        self._emit(workspace_id, None, "workspace.closed", int(record["revision"]) + 1, {"reason": (reason or "")[:200]})
+        return self.get_workspace(workspace_id, scope)
+
+    def reopen_workspace(self, workspace_id: str, scope: ScopeView) -> WorkspaceIdentity:
+        record = self._workspace_record(workspace_id, scope)
+        tenant, owner, _service = self._scope_ids(scope)
+        provider = WorkspaceStorageProvider(record.get("storage_provider") or "server_managed")
+        if provider is not WorkspaceStorageProvider.LOCAL_BROWSER:
+            root_path = record.get("root_path") or ""
+            if not root_path:
+                # a v1 blob workspace has nothing to re-attach
+                raise WorkspaceFailure(WorkspaceErrorCode.PROVIDER_MISMATCH, workspace_id=workspace_id)
+            try:
+                self.allowed_root_policy.resolve(
+                    tenant, owner, root_path, root_id=record.get("root_id"), must_exist=True
+                )
+            except RootPolicyError as exc:
+                raise self._root_failure(exc) from exc
+        stamp = self.clock()
+        self.store.update_workspace(
+            workspace_id,
+            {
+                "lifecycle_state": WorkspaceLifecycleState.OPEN.value,
+                "closed_at": None,
+                "opened_at": stamp,
+                "updated_at": stamp,
+                "revision": int(record["revision"]) + 1,
+            },
+        )
+        self._emit(workspace_id, None, "workspace.reopened", int(record["revision"]) + 1)
+        refreshed = self.store.get_workspace(workspace_id) or record
+        if self._is_folder_backed(refreshed):
+            self.sync_workspace_record(refreshed, full=False)
+        return self.get_workspace(workspace_id, scope)
+
+    def disconnect_workspace(
+        self,
+        workspace_id: str,
+        scope: ScopeView,
+        *,
+        delete_source_files: bool = False,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Release the workspace. The real folder is never touched unless explicitly allowed."""
+
+        record = self._workspace_record(workspace_id, scope)
+        source_files_deleted = 0
+        if delete_source_files:
+            if not self.settings.allow_source_delete or not confirm:
+                raise WorkspaceFailure(
+                    WorkspaceErrorCode.SOURCE_DELETE_NOT_PERMITTED,
+                    "source file deletion is disabled; disconnect only",
+                    workspace_id=workspace_id,
+                )
+            if self._is_folder_backed(record):
+                source_files_deleted = self._delete_source_tree(record)
+        stamp = self.clock()
+        for file_row in self.store.list_files(workspace_id, recursive=True, include_deleted=False):
+            self.store.cancel_jobs_for_file(file_row["file_id"], stamp, reason="workspace_disconnected")
         purged = self.store.purge_workspace_files(workspace_id)
         self.store.mark_workspace_deleted(workspace_id, stamp)
+        self.store.update_workspace(
+            workspace_id,
+            {
+                "lifecycle_state": WorkspaceLifecycleState.DELETED.value,
+                "updated_at": stamp,
+            },
+        )
+        self.store.upsert_watch_state(workspace_id, {"watching": 0, "updated_at": stamp})
         removed_blobs = self.storage.delete_workspace(record["tenant_id"], workspace_id)
-        self._emit(workspace_id, None, "workspace.deleted", int(record["revision"]))
+        self._emit(
+            workspace_id,
+            None,
+            "workspace.disconnected",
+            int(record["revision"]),
+            {"source_files_deleted": source_files_deleted},
+        )
         return {
             "workspace_id": workspace_id,
             "status": "deleted",
+            "lifecycle_state": WorkspaceLifecycleState.DELETED.value,
             "purged_files": purged,
             "removed_blobs": removed_blobs,
+            "source_files_deleted": source_files_deleted,
         }
+
+    def _delete_source_tree(self, record: Dict[str, Any]) -> int:
+        """Delete only the files this workspace tracks, then empty folders (never a blind rmtree)."""
+
+        root = Path(record.get("root_path") or "")
+        removed = 0
+        rows = sorted(
+            self.store.list_files(record["workspace_id"], recursive=True, include_deleted=False),
+            key=lambda row: str(row.get("rel_path") or "").count("/"),
+            reverse=True,
+        )
+        for row in rows:
+            rel = row.get("rel_path")
+            if not rel:
+                continue
+            try:
+                if row["kind"] == FileKind.FILE.value:
+                    removed += folderfs.remove_relative(root, rel)
+                else:
+                    folderfs.try_remove_empty_directory(root, rel)
+            except Exception:
+                continue
+        return removed
+
+    # -- watcher-facing sync --------------------------------------------------------
+    def sync_workspace(self, workspace_id: str, scope: ScopeView, full: bool = False) -> WorkspaceSyncResult:
+        record = self._workspace_record(workspace_id, scope)
+        self._require_open(record)
+        return self.sync_workspace_record(record, full=full)
+
+    def sync_workspace_record(self, record: Dict[str, Any], *, full: bool = False) -> WorkspaceSyncResult:
+        workspace_id = record["workspace_id"]
+        if not self._is_folder_backed(record):
+            raise WorkspaceFailure(WorkspaceErrorCode.PROVIDER_MISMATCH, workspace_id=workspace_id)
+        try:
+            result = self.sync_service.sync(record, full=full)
+        except folderfs.FolderError as exc:
+            self.store.upsert_watch_state(
+                workspace_id, {"last_scan_at": self.clock(), "last_error": str(exc)[:300], "updated_at": self.clock()}
+            )
+            raise self._folder_failure(exc) from exc
+        self._record_sync(workspace_id, result, error=("; ".join(item.get("code", "") for item in result.errors[:3]) or None))
+        return result
+
+    def watch_status(self, workspace_id: str, scope: ScopeView) -> WorkspaceWatchStatus:
+        record = self._workspace_record(workspace_id, scope)
+        state = self.store.get_watch_state(workspace_id) or {}
+        provider = WorkspaceStorageProvider(record.get("storage_provider") or "server_managed")
+        watching = (
+            record.get("lifecycle_state") == WorkspaceLifecycleState.OPEN.value
+            and not int(record.get("read_only") or 0)
+            and provider is not WorkspaceStorageProvider.LOCAL_BROWSER
+            and bool(self.settings.watch_enabled)
+        )
+        return WorkspaceWatchStatus(
+            workspace_id=workspace_id,
+            watching=watching,
+            storage_provider=provider,
+            interval_seconds=float(self.settings.watch_interval_seconds) if watching else 0.0,
+            last_scan_at=state.get("last_scan_at"),
+            last_change_at=state.get("last_change_at"),
+            changes_total=int(state.get("changes_total") or 0),
+            last_error=state.get("last_error"),
+        )
+
+    def workspace_root_info(self, workspace_id: str, scope: ScopeView) -> Dict[str, Any]:
+        record = self._workspace_record(workspace_id, scope)
+        root = self._root_info(record)
+        index_info = IndexStorageInfo()
+        db_path = Path(self.settings.resolved_db_path()).expanduser()
+        if record.get("root_path"):
+            root_path = Path(record["root_path"]).resolve()
+            try:
+                inside = str(db_path.resolve()).startswith(str(root_path) + os.sep) or db_path.resolve() == root_path
+            except OSError:  # pragma: no cover
+                inside = False
+            index_info = IndexStorageInfo(separate_from_workspace_root=not inside, inside_workspace_root=inside)
+        return {"workspace_id": workspace_id, "root": root.model_dump(mode="json"), "index_storage": index_info.model_dump(mode="json")}
 
     # ------------------------------------------------------------------ files
     def _file_record(self, workspace_id: str, file_id: str, scope: ScopeView, include_deleted: bool = False) -> Dict[str, Any]:
@@ -274,6 +962,19 @@ class WorkspaceManager:
         if folder is None or folder["kind"] != FileKind.FOLDER.value:
             raise WorkspaceFailure(WorkspaceErrorCode.FILE_NOT_FOUND, folder_id=folder_id)
 
+    def _rel_dir(self, workspace_id: str, parent_id: Optional[str]) -> str:
+        parts: List[str] = []
+        cursor = parent_id
+        guard = 0
+        while cursor and guard < 64:
+            row = self.store.get_file(workspace_id, cursor, include_deleted=True)
+            if row is None:
+                break
+            parts.append(row["name"])
+            cursor = row.get("parent_id")
+            guard += 1
+        return "/".join(reversed(parts))
+
     def list_files(
         self,
         workspace_id: str,
@@ -282,17 +983,23 @@ class WorkspaceManager:
         recursive: bool = False,
         include_deleted: bool = False,
     ) -> List[FileIdentity]:
-        self._workspace_record(workspace_id, scope)
+        record = self._workspace_record(workspace_id, scope)
+        provider = WorkspaceStorageProvider(record.get("storage_provider") or "server_managed")
         rows = self.store.list_files(workspace_id, parent_id, recursive, include_deleted)
-        return [self.file_identity(row) for row in rows]
+        return [self.file_identity(row, provider) for row in rows]
 
     list_workspace_files = list_files
 
     def get_file_metadata(self, workspace_id: str, file_id: str, scope: ScopeView) -> FileIdentity:
-        return self.file_identity(self._file_record(workspace_id, file_id, scope))
+        record = self._file_record(workspace_id, file_id, scope)
+        workspace = self.store.get_workspace(workspace_id) or {}
+        return self.file_identity(
+            record, WorkspaceStorageProvider(workspace.get("storage_provider") or "server_managed")
+        )
 
     def create_folder(self, workspace_id: str, scope: ScopeView, name: str, parent_id: Optional[str] = None) -> FileIdentity:
-        self._workspace_record(workspace_id, scope)
+        workspace = self._workspace_record(workspace_id, scope)
+        self._require_writable(workspace)
         clean = validate_name(name, field="folder name")
         self._folder_exists(workspace_id, parent_id)
         if self.store.find_file_by_name(workspace_id, parent_id, clean) is not None:
@@ -337,7 +1044,8 @@ class WorkspaceManager:
         expected_revision: Optional[int] = None,
         mime_type: Optional[str] = None,
     ) -> FileIdentity:
-        self._workspace_record(workspace_id, scope)
+        workspace = self._workspace_record(workspace_id, scope)
+        self._require_writable(workspace)
         clean = validate_name(filename, field="file name")
         if self._extension_blocked(clean):
             raise WorkspaceFailure(WorkspaceErrorCode.UNSUPPORTED_MEDIA_TYPE, name=clean)
@@ -358,7 +1066,17 @@ class WorkspaceManager:
             if self.store.count_files(workspace_id, kind=FileKind.FILE.value) >= self.settings.max_files_per_workspace:
                 raise WorkspaceFailure(WorkspaceErrorCode.QUOTA_EXCEEDED, "file limit reached")
 
-        tenant = self._workspace_record(workspace_id, scope)["tenant_id"]
+        if self._is_folder_backed(workspace):
+            # Upload into a folder workspace writes the real file (zero-copy), never a blob.
+            rel_dir = self._rel_dir(workspace_id, parent_id)
+            rel = f"{rel_dir}/{clean}" if rel_dir else clean
+            data = _collect(chunks, self.settings.max_file_bytes)
+            row = self._write_external_bytes(workspace, rel, data, mime_type=mime_type)
+            return self.file_identity(
+                row, WorkspaceStorageProvider(workspace.get("storage_provider") or "server_managed")
+            )
+
+        tenant = workspace["tenant_id"]
         usage = self.storage.workspace_usage(tenant, workspace_id)
         reclaim = int(existing["size_bytes"]) if existing is not None else 0
         allowance = self.settings.max_workspace_bytes - (usage - reclaim)
@@ -450,11 +1168,18 @@ class WorkspaceManager:
         self._notify_file(workspace_id, file_id)
         return self.get_file_metadata(workspace_id, file_id, scope)
 
-    def _prune_revisions(self, tenant_id: str, workspace_id: str, file_id: str) -> None:
-        keep = max(1, int(self.settings.revision_keep))
+    def _prune_revisions(
+        self, tenant_id: str, workspace_id: str, file_id: str, *, origin: str = "blob"
+    ) -> None:
+        if origin == ContentOrigin.EXTERNAL.value:
+            # External content is not retained per revision: the file is the single source.
+            keep = 1
+        else:
+            keep = max(1, int(self.settings.revision_keep))
         revisions = self.store.list_revisions(file_id)
         for row in revisions[keep:]:
-            self.storage.delete_blob(tenant_id, workspace_id, file_id, int(row["revision"]))
+            if origin != ContentOrigin.EXTERNAL.value:
+                self.storage.delete_blob(tenant_id, workspace_id, file_id, int(row["revision"]))
             self.store.delete_revision(file_id, int(row["revision"]))
 
     # Alias used by the provider interface.
@@ -490,6 +1215,8 @@ class WorkspaceManager:
         record = self._file_record(workspace_id, file_id, scope)
         if record["kind"] != FileKind.FILE.value:
             raise WorkspaceFailure(WorkspaceErrorCode.INVALID_REQUEST, "folder has no content")
+        workspace = self._workspace_record(workspace_id, scope)
+        self._require_open(workspace)
         current_revision = int(record["revision"])
         target = current_revision if revision is None else int(revision)
         if target < 1:
@@ -497,20 +1224,16 @@ class WorkspaceManager:
         row = self.store.get_revision(file_id, target)
         if row is None:
             raise WorkspaceFailure(WorkspaceErrorCode.FILE_NOT_FOUND, file_id=file_id, revision=target)
-        tenant = self._workspace_record(workspace_id, scope)["tenant_id"]
-        try:
-            data = self.storage.read_bytes(tenant, workspace_id, file_id, target)
-        except StorageError as exc:
-            raise WorkspaceFailure(WorkspaceErrorCode.FILE_NOT_FOUND, file_id=file_id, revision=target) from exc
-        if len(data) > max_bytes:
-            raise WorkspaceFailure(WorkspaceErrorCode.FILE_TOO_LARGE, limit_bytes=max_bytes)
+        data = self._read_content(workspace, record, target, max_bytes=max_bytes)
         try:
             text: Optional[str] = data.decode("utf-8")
         except UnicodeDecodeError:
             text = None
         status = RevisionStatus.CURRENT if target == current_revision else RevisionStatus.SUPERSEDED
         return FileContent(
-            metadata=self.file_identity(record),
+            metadata=self.file_identity(
+                record, WorkspaceStorageProvider(workspace.get("storage_provider") or "server_managed")
+            ),
             revision=target,
             revision_status=status,
             content_hash=row["content_hash"],
@@ -518,17 +1241,82 @@ class WorkspaceManager:
             text=text,
         )
 
+    def _read_content(
+        self, workspace: Dict[str, Any], record: Dict[str, Any], revision: int, *, max_bytes: int = 0
+    ) -> bytes:
+        """Bytes of one revision: blob copy, real file in the root, or browser capture."""
+
+        if (record.get("origin") or ContentOrigin.BLOB.value) == ContentOrigin.EXTERNAL.value:
+            if self._is_local_browser(workspace):
+                captured = self.store.get_capture(record["file_id"], revision) or self.store.get_capture_latest(
+                    record["file_id"]
+                )
+                if captured is None:
+                    raise WorkspaceFailure(
+                        WorkspaceErrorCode.FILE_NOT_FOUND, file_id=record["file_id"], revision=revision
+                    )
+                return captured.encode("utf-8")
+            root = self._root_path(workspace)
+            rel = record.get("rel_path")
+            if not rel:
+                raise WorkspaceFailure(WorkspaceErrorCode.FILE_NOT_FOUND, file_id=record["file_id"])
+            try:
+                data, _digest = folderfs.read_relative(root, rel, max_bytes=max_bytes)
+            except folderfs.FolderError as exc:
+                raise self._folder_failure(exc) from exc
+            return data
+        tenant = workspace["tenant_id"]
+        try:
+            data = self.storage.read_bytes(tenant, workspace["workspace_id"], record["file_id"], revision)
+        except StorageError as exc:
+            raise WorkspaceFailure(
+                WorkspaceErrorCode.FILE_NOT_FOUND, file_id=record["file_id"], revision=revision
+            ) from exc
+        if max_bytes and len(data) > max_bytes:
+            raise WorkspaceFailure(WorkspaceErrorCode.FILE_TOO_LARGE, limit_bytes=max_bytes)
+        return data
+
+    def read_revision_bytes(
+        self, workspace: Dict[str, Any], record: Dict[str, Any], revision: int
+    ) -> Tuple[bytes, str]:
+        """Content and its actual hash for the indexer; the hash guards against a stale read."""
+
+        origin = record.get("origin") or ContentOrigin.BLOB.value
+        if origin == ContentOrigin.EXTERNAL.value and not self._is_local_browser(workspace):
+            rel = record.get("rel_path")
+            if not rel:
+                raise WorkspaceFailure(WorkspaceErrorCode.FILE_NOT_FOUND, file_id=record["file_id"])
+            try:
+                return folderfs.read_relative(self._root_path(workspace), rel, max_bytes=self.settings.max_file_bytes)
+            except folderfs.FolderError as exc:
+                raise self._folder_failure(exc) from exc
+        data = self._read_content(workspace, record, revision)
+        digest = hashlib.sha256(data).hexdigest()
+        return data, "sha256:" + digest
+
     def iter_file(self, workspace_id: str, file_id: str, scope: ScopeView, revision: Optional[int] = None):
         record = self._file_record(workspace_id, file_id, scope)
         if record["kind"] != FileKind.FILE.value:
             raise WorkspaceFailure(WorkspaceErrorCode.INVALID_REQUEST, "folder has no content")
+        workspace = self._workspace_record(workspace_id, scope)
+        self._require_open(workspace)
         target = int(record["revision"]) if revision is None else int(revision)
         if self.store.get_revision(file_id, target) is None:
             raise WorkspaceFailure(WorkspaceErrorCode.FILE_NOT_FOUND, file_id=file_id, revision=target)
-        tenant = self._workspace_record(workspace_id, scope)["tenant_id"]
+        if (record.get("origin") or ContentOrigin.BLOB.value) == ContentOrigin.EXTERNAL.value:
+            if self._is_local_browser(workspace):
+                return iter([self._read_content(workspace, record, target)])
+            rel = record.get("rel_path") or ""
+            try:
+                return folderfs.iter_relative(self._root_path(workspace), rel)
+            except folderfs.FolderError as exc:
+                raise self._folder_failure(exc) from exc
+        tenant = workspace["tenant_id"]
         return self.storage.iter_content(tenant, workspace_id, file_id, target)
 
     def rename_file(self, workspace_id: str, file_id: str, scope: ScopeView, new_name: str, expected_revision: Optional[int] = None) -> FileIdentity:
+        workspace = self._workspace_record(workspace_id, scope)
+        self._require_writable(workspace)
         record = self._file_record(workspace_id, file_id, scope)
         if expected_revision is not None and int(record["revision"]) != int(expected_revision):
             raise WorkspaceFailure(
@@ -546,10 +1334,14 @@ class WorkspaceManager:
         if record["kind"] == FileKind.FILE.value:
             fields["mime_type"] = mimetypes.guess_type(clean)[0] or record.get("mime_type")
         self.store.update_file(workspace_id, file_id, fields)
+        if self._is_folder_backed(workspace):
+            self._rename_on_disk(workspace, record, clean)
         self._emit(workspace_id, file_id, "file.renamed", int(record["revision"]), {"name": clean})
         return self.get_file_metadata(workspace_id, file_id, scope)
 
     def move_file(self, workspace_id: str, file_id: str, scope: ScopeView, parent_id: Optional[str], expected_revision: Optional[int] = None) -> FileIdentity:
+        workspace = self._workspace_record(workspace_id, scope)
+        self._require_writable(workspace)
         record = self._file_record(workspace_id, file_id, scope)
         if expected_revision is not None and int(record["revision"]) != int(expected_revision):
             raise WorkspaceFailure(
@@ -569,8 +1361,43 @@ class WorkspaceManager:
         self.store.update_file(
             workspace_id, file_id, {"parent_id": parent_id, "updated_at": self.clock()}
         )
+        if self._is_folder_backed(workspace):
+            rel_dir = self._rel_dir(workspace_id, parent_id)
+            rel = f"{rel_dir}/{record['name']}" if rel_dir else record["name"]
+            self.store.update_file(workspace_id, file_id, {"rel_path": rel, "synced_at": self.clock()})
+            self._move_on_disk(workspace, record, rel)
         self._emit(workspace_id, file_id, "file.moved", int(record["revision"]), {"parent_id": parent_id})
         return self.get_file_metadata(workspace_id, file_id, scope)
+
+    def _rename_on_disk(self, workspace: Dict[str, Any], record: Dict[str, Any], new_name: str) -> None:
+        """Keep the real file aligned with a metadata rename (external content only)."""
+
+        old_rel = record.get("rel_path") if record else None
+        if not old_rel:
+            return
+        rel_dir = old_rel.rsplit("/", 1)[0] if "/" in old_rel else ""
+        new_rel = f"{rel_dir}/{new_name}" if rel_dir else new_name
+        self._move_on_disk(workspace, record, new_rel)
+
+    def _move_on_disk(self, workspace: Dict[str, Any], record: Dict[str, Any], new_rel: str) -> None:
+        old_rel = record.get("rel_path")
+        if not old_rel or old_rel == new_rel:
+            return
+        root = self._root_path(workspace)
+        try:
+            source, _clean = folderfs._secure_join(root, old_rel)
+            target, clean = folderfs._secure_join(root, new_rel)
+            if not source.exists():
+                return
+            if clean.count("/"):
+                folderfs.ensure_directory(root, clean.rsplit("/", 1)[0])
+            source.replace(target)
+        except Exception:
+            # The watcher reconciles the difference on its next pass.
+            return
+        self.store.update_file(
+            workspace["workspace_id"], record["file_id"], {"rel_path": new_rel, "synced_at": self.clock()}
+        )
 
     def update_file(
         self,
@@ -593,8 +1420,10 @@ class WorkspaceManager:
         return updated
 
     def delete_file(self, workspace_id: str, file_id: str, scope: ScopeView) -> Dict[str, Any]:
+        workspace = self._workspace_record(workspace_id, scope)
+        self._require_writable(workspace)
         record = self._file_record(workspace_id, file_id, scope)
-        tenant = self._workspace_record(workspace_id, scope)["tenant_id"]
+        tenant = workspace["tenant_id"]
         targets = [record]
         if record["kind"] == FileKind.FOLDER.value:
             for descendant_id in self.store.list_file_ids_under(workspace_id, file_id):
@@ -603,14 +1432,221 @@ class WorkspaceManager:
                     targets.append(row)
         stamp = self.clock()
         removed_blobs = 0
+        removed_source = 0
         for target in targets:
             self.store.cancel_jobs_for_file(target["file_id"], stamp, reason="file_deleted")
             self.store.delete_chunks(target["file_id"])
             self.store.delete_revisions(target["file_id"])
-            removed_blobs += self.storage.delete_file(tenant, workspace_id, target["file_id"])
+            if (target.get("origin") or "blob") == ContentOrigin.EXTERNAL.value:
+                # A file the user deletes in the explorer is a real file in the root; a folder is
+                # only removed when it is empty (untracked content is never destroyed).
+                rel = target.get("rel_path")
+                if rel:
+                    try:
+                        if target["kind"] == FileKind.FILE.value:
+                            removed_source += folderfs.remove_relative(self._root_path(workspace), rel)
+                        else:
+                            folderfs.try_remove_empty_directory(self._root_path(workspace), rel)
+                    except Exception:
+                        pass
+            else:
+                removed_blobs += self.storage.delete_file(tenant, workspace_id, target["file_id"])
             self.store.soft_delete_file(workspace_id, target["file_id"], stamp)
             self._emit(workspace_id, target["file_id"], "file.deleted", int(target["revision"]))
-        return {"file_id": file_id, "deleted": True, "removed_files": len(targets), "removed_blobs": removed_blobs}
+        return {
+            "file_id": file_id,
+            "deleted": True,
+            "removed_files": len(targets),
+            "removed_blobs": removed_blobs,
+            "removed_source_files": removed_source,
+        }
+
+    # ------------------------------------------------------------------ write contract
+    def write_file(
+        self, workspace_id: str, scope: ScopeView, request: WorkspaceWriteRequest
+    ) -> WorkspaceWriteResult:
+        """Canvas / Coding Agent common write: one call, every provider (§A1.5).""" 
+
+        workspace = self._workspace_record(workspace_id, scope)
+        self._require_writable(workspace)
+        try:
+            rel = validate_relative_path(request.path)
+        except InvalidRelativePath as exc:
+            raise WorkspaceFailure(WorkspaceErrorCode.INVALID_PATH, str(exc)) from exc
+        provider = WorkspaceStorageProvider(workspace.get("storage_provider") or "server_managed")
+
+        if provider is WorkspaceStorageProvider.LOCAL_BROWSER:
+            return WorkspaceWriteResult(
+                workspace_id=workspace_id,
+                path=rel,
+                storage_provider=provider,
+                content_origin=ContentOrigin.EXTERNAL,
+                client_write=ClientWriteDirective(
+                    client_handle_id=workspace.get("client_handle_id"),
+                    relative_path=rel,
+                ),
+            )
+
+        data = _write_payload(request)
+        if self._extension_blocked(rel.rsplit("/", 1)[-1]):
+            raise WorkspaceFailure(WorkspaceErrorCode.UNSUPPORTED_MEDIA_TYPE, name=rel)
+        existing = self.store.get_file_by_rel_path(workspace_id, rel) if self._is_folder_backed(workspace) else None
+        if request.expected_content_hash is not None:
+            current_hash = existing.get("content_hash") if existing else None
+            if current_hash != request.expected_content_hash:
+                raise WorkspaceFailure(
+                    WorkspaceErrorCode.CONTENT_CONFLICT,
+                    expected_content_hash=request.expected_content_hash,
+                    current_content_hash=current_hash,
+                )
+        if existing is not None and not request.overwrite:
+            raise WorkspaceFailure(WorkspaceErrorCode.FILE_EXISTS, name=rel, file_id=existing["file_id"])
+
+        if self._is_folder_backed(workspace):
+            row = self._write_external_bytes(
+                workspace,
+                rel,
+                data,
+                mime_type=request.mime_type,
+                create_parents=request.create_parents,
+                overwrite=request.overwrite,
+            )
+            identity = self.file_identity(row, provider)
+        else:
+            rel_dir = rel.rsplit("/", 1)[0] if "/" in rel else ""
+            parent_id = self._ensure_folder_rows(workspace_id, rel_dir) if rel_dir else None
+            identity = self.create_file(
+                workspace_id,
+                scope,
+                rel.rsplit("/", 1)[-1],
+                data,
+                parent_id=parent_id,
+                overwrite=request.overwrite,
+            )
+        origin = ContentOrigin.EXTERNAL if self._is_folder_backed(workspace) else ContentOrigin.BLOB
+        return WorkspaceWriteResult(
+            workspace_id=workspace_id,
+            path=rel,
+            file=identity,
+            revision=identity.revision,
+            content_hash=identity.content_hash,
+            written_bytes=identity.size_bytes,
+            storage_provider=provider,
+            content_origin=origin,
+        )
+
+    def _write_external_bytes(
+        self,
+        workspace: Dict[str, Any],
+        rel: str,
+        data: bytes,
+        *,
+        mime_type: Optional[str] = None,
+        create_parents: bool = True,
+        overwrite: bool = True,
+    ) -> Dict[str, Any]:
+        workspace_id = workspace["workspace_id"]
+        root = self._root_path(workspace)
+        existing = self.store.get_file_by_rel_path(workspace_id, rel)
+        if existing is not None and existing["kind"] != FileKind.FILE.value:
+            raise WorkspaceFailure(WorkspaceErrorCode.INVALID_PATH, "target is a folder")
+        if existing is None and (
+            self.store.count_files(workspace_id, kind=FileKind.FILE.value) >= self.settings.max_files_per_workspace
+        ):
+            raise WorkspaceFailure(WorkspaceErrorCode.QUOTA_EXCEEDED, "file limit reached")
+        try:
+            size, digest = folderfs.write_relative(
+                root,
+                rel,
+                data,
+                create_parents=create_parents,
+                overwrite=overwrite,
+                max_bytes=self.settings.max_file_bytes,
+            )
+        except folderfs.FolderError as exc:
+            raise self._folder_failure(exc) from exc
+        stamp = self.clock()
+        parent_id = self._ensure_folder_rows(workspace_id, rel.rsplit("/", 1)[0] if "/" in rel else "")
+        name = rel.rsplit("/", 1)[-1]
+        resolved_mime = mime_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
+        if existing is None:
+            file_id = _new_id("wf")
+            self.store.insert_file(
+                {
+                    "file_id": file_id,
+                    "workspace_id": workspace_id,
+                    "parent_id": parent_id,
+                    "kind": FileKind.FILE.value,
+                    "name": name,
+                    "mime_type": resolved_mime,
+                    "size_bytes": size,
+                    "content_hash": digest,
+                    "revision": 1,
+                    "index_status": IndexState.PENDING.value,
+                    "index_error": None,
+                    "index_updated_at": stamp,
+                    "created_at": stamp,
+                    "updated_at": stamp,
+                    "deleted_at": None,
+                    "origin": ContentOrigin.EXTERNAL.value,
+                    "rel_path": rel,
+                    "ext_mtime": None,
+                    "synced_at": stamp,
+                }
+            )
+            self.store.add_revision(
+                {
+                    "file_id": file_id,
+                    "workspace_id": workspace_id,
+                    "revision": 1,
+                    "content_hash": digest,
+                    "size_bytes": size,
+                    "blob_key": "external",
+                    "parser_version": None,
+                    "created_at": stamp,
+                }
+            )
+            self._emit(workspace_id, file_id, "file.created", 1, {"path": rel, "writer": "workspace_write_contract"})
+        else:
+            file_id = existing["file_id"]
+            revision = int(existing["revision"]) + 1
+            self.store.add_revision(
+                {
+                    "file_id": file_id,
+                    "workspace_id": workspace_id,
+                    "revision": revision,
+                    "content_hash": digest,
+                    "size_bytes": size,
+                    "blob_key": "external",
+                    "parser_version": None,
+                    "created_at": stamp,
+                }
+            )
+            self.store.cancel_jobs_for_file(file_id, stamp, reason="file_changed")
+            self.store.delete_chunks(file_id)
+            self.store.update_file(
+                workspace_id,
+                file_id,
+                {
+                    "parent_id": parent_id,
+                    "name": name,
+                    "rel_path": rel,
+                    "mime_type": resolved_mime,
+                    "size_bytes": size,
+                    "content_hash": digest,
+                    "revision": revision,
+                    "index_status": IndexState.PENDING.value,
+                    "index_error": None,
+                    "index_updated_at": stamp,
+                    "ext_mtime": None,
+                    "synced_at": stamp,
+                    "updated_at": stamp,
+                },
+            )
+            self._prune_revisions(workspace["tenant_id"], workspace_id, file_id, origin="external")
+            self._emit(workspace_id, file_id, "file.updated", revision, {"path": rel, "writer": "workspace_write_contract"})
+        self._notify_file(workspace_id, file_id)
+        return self.store.get_file(workspace_id, file_id) or existing or {}
 
     # ------------------------------------------------------------------ references
     def register_artifact_reference(
@@ -715,13 +1751,38 @@ class WorkspaceManager:
 
     # ------------------------------------------------------------------ recovery
     def recover(self) -> Dict[str, int]:
-        """Restart recovery: requeue interrupted jobs, sweep temp files, drop orphan blobs."""
+        """Restart recovery: requeue interrupted jobs, sweep temp files, drop orphan blobs.
+
+        Folder-backed workspaces are re-validated: a root that vanished while the server was down
+        closes its workspace instead of leaving a watcher pointed at nothing.
+        """
 
         requeued = self.store.stale_indexing_jobs(self.clock())
         temp_removed = self.storage.sweep_temp(older_than_seconds=0)
+        closed = 0
+        for workspace in self.store.list_all_workspaces():
+            if workspace.get("status") == "deleted" or workspace.get("lifecycle_state") != "open":
+                continue
+            if not self._is_folder_backed(workspace):
+                continue
+            root = Path(workspace.get("root_path") or "")
+            if root.exists() and root.is_dir():
+                continue
+            stamp = self.clock()
+            self.store.update_workspace(
+                workspace["workspace_id"],
+                {"lifecycle_state": WorkspaceLifecycleState.CLOSED.value, "closed_at": stamp, "updated_at": stamp},
+            )
+            self.store.upsert_watch_state(
+                workspace["workspace_id"], {"watching": 0, "last_error": "root_unavailable", "updated_at": stamp}
+            )
+            self._emit(workspace["workspace_id"], None, "workspace.closed", 0, {"reason": "root_unavailable"})
+            closed += 1
         known: List[Path] = []
         for workspace in self.store.list_all_workspaces():
             for row in self.store.list_files(workspace["workspace_id"], recursive=True, include_deleted=True):
+                if (row.get("origin") or "blob") == ContentOrigin.EXTERNAL.value:
+                    continue
                 for revision in self.store.list_revisions(row["file_id"]):
                     try:
                         known.append(
@@ -736,13 +1797,31 @@ class WorkspaceManager:
                 orphans += 1
             except OSError:
                 continue
-        return {"requeued_jobs": requeued, "temp_removed": temp_removed, "orphan_blobs_removed": orphans}
+        return {
+            "requeued_jobs": requeued,
+            "temp_removed": temp_removed,
+            "orphan_blobs_removed": orphans,
+            "workspaces_closed": closed,
+        }
 
-    def workspace_usage(self, workspace_id: str, scope: ScopeView) -> Dict[str, int]:
+    def workspace_usage(self, workspace_id: str, scope: ScopeView) -> Dict[str, Any]:
         record = self._workspace_record(workspace_id, scope)
+        provider = WorkspaceStorageProvider(record.get("storage_provider") or "server_managed")
+        if self._is_folder_backed(record) or provider is WorkspaceStorageProvider.LOCAL_BROWSER:
+            # Zero-copy: the workspace holds metadata, not file bodies.
+            return {
+                "usage_bytes": 0,
+                "limit_bytes": 0,
+                "files": self.store.count_files(workspace_id, kind=FileKind.FILE.value),
+                "file_limit": self.settings.max_files_per_workspace,
+                "zero_copy": True,
+                "storage_provider": provider.value,
+            }
         return {
             "usage_bytes": self.storage.workspace_usage(record["tenant_id"], workspace_id),
             "limit_bytes": self.settings.max_workspace_bytes,
             "files": self.store.count_files(workspace_id, kind=FileKind.FILE.value),
             "file_limit": self.settings.max_files_per_workspace,
+            "zero_copy": False,
+            "storage_provider": provider.value,
         }

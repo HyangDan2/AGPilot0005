@@ -19,10 +19,16 @@ from app.workspace.contracts import (
     FileIdentity,
     FileUpdateRequest,
     FolderCreateRequest,
+    FolderOpenRequest,
+    LocalBrowserWorkspaceRequest,
+    NewWorkspaceRequest,
     SearchMode,
+    WorkspaceCloseRequest,
     WorkspaceCreateRequest,
+    WorkspaceDisconnectRequest,
     WorkspaceErrorCode,
     WorkspaceUpdateRequest,
+    WorkspaceWriteRequest,
 )
 from app.workspace.manager import WorkspaceFailure
 from app.workspace.runtime import WorkspaceRuntime, get_runtime
@@ -101,6 +107,63 @@ def create_workspace(
     return runtime.manager.create_workspace(scope, body.name, body.description).model_dump(mode="json")
 
 
+# ----------------------------------------------------------------- Amendment 01 (§A1.2)
+@router.get("/allowed-roots")
+@guarded
+def allowed_roots(
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    items = [item.model_dump(mode="json") for item in runtime.manager.allowed_roots(scope)]
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/open-folder", status_code=201)
+@guarded
+def open_folder(
+    body: FolderOpenRequest,
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    return runtime.manager.open_folder(
+        scope, body.path, name=body.name, read_only=body.read_only, root_id=body.root_id
+    ).model_dump(mode="json")
+
+
+@router.post("/new", status_code=201)
+@guarded
+def new_workspace(
+    body: NewWorkspaceRequest,
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    return runtime.manager.new_workspace(
+        scope,
+        body.name,
+        description=body.description,
+        parent_path=body.parent_path,
+        root_id=body.root_id,
+    ).model_dump(mode="json")
+
+
+@router.post("/local-browser", status_code=201)
+@guarded
+def local_browser_workspace(
+    body: LocalBrowserWorkspaceRequest,
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    return runtime.manager.create_local_browser_workspace(
+        scope,
+        body.name,
+        client_handle_id=body.client_handle_id,
+        entries=body.entries,
+        display_path=body.display_path,
+        description=body.description,
+        read_only=body.read_only,
+    ).model_dump(mode="json")
+
+
 @router.get("/{workspace_id}")
 @guarded
 def get_workspace(
@@ -135,7 +198,92 @@ def delete_workspace(
     scope: ExecutionScope = Depends(get_scope),
     runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
 ) -> Dict[str, Any]:
-    return runtime.manager.delete_workspace(workspace_id, scope)
+    """Disconnect: metadata only. Real files are never removed by this endpoint."""
+
+    return runtime.manager.disconnect_workspace(workspace_id, scope, delete_source_files=False)
+
+
+@router.post("/{workspace_id}/close")
+@guarded
+def close_workspace(
+    workspace_id: str,
+    body: Optional[WorkspaceCloseRequest] = Body(default=None),
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    reason = (body.reason if body else "") or ""
+    return runtime.manager.close_workspace(workspace_id, scope, reason).model_dump(mode="json")
+
+
+@router.post("/{workspace_id}/reopen")
+@guarded
+def reopen_workspace(
+    workspace_id: str,
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    return runtime.manager.reopen_workspace(workspace_id, scope).model_dump(mode="json")
+
+
+@router.post("/{workspace_id}/disconnect")
+@guarded
+def disconnect_workspace(
+    workspace_id: str,
+    body: Optional[WorkspaceDisconnectRequest] = Body(default=None),
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    return runtime.manager.disconnect_workspace(
+        workspace_id,
+        scope,
+        delete_source_files=bool(body.delete_source_files) if body else False,
+        confirm=bool(body.confirm) if body else False,
+    )
+
+
+@router.post("/{workspace_id}/sync")
+@guarded
+def sync_workspace(
+    workspace_id: str,
+    body: Optional[Dict[str, Any]] = Body(default=None),
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    full = bool((body or {}).get("full") or False)
+    return runtime.manager.sync_workspace(workspace_id, scope, full=full).model_dump(mode="json")
+
+
+@router.get("/{workspace_id}/watch")
+@guarded
+def watch_status(
+    workspace_id: str,
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    return runtime.manager.watch_status(workspace_id, scope).model_dump(mode="json")
+
+
+@router.get("/{workspace_id}/root")
+@guarded
+def workspace_root(
+    workspace_id: str,
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    return runtime.manager.workspace_root_info(workspace_id, scope)
+
+
+@router.put("/{workspace_id}/file")
+@guarded
+def write_file(
+    workspace_id: str,
+    body: WorkspaceWriteRequest,
+    scope: ExecutionScope = Depends(get_scope),
+    runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
+) -> Dict[str, Any]:
+    """Canvas / Coding Agent common write contract (§A1.5)."""
+
+    return runtime.manager.write_file(workspace_id, scope, body).model_dump(mode="json")
 
 
 @router.get("/{workspace_id}/access")

@@ -201,10 +201,24 @@ class WorkspaceIndexer:
         try:
             workspace = self.store.get_workspace(workspace_id)
             tenant_id = workspace["tenant_id"] if workspace else ""
+            if not workspace:
+                raise ExtractionError("storage_unavailable", "workspace row missing")
+            # Zero-copy files are read from the workspace root; the returned hash is the actual
+            # content hash, so a file changed under us cancels this job instead of indexing stale bytes.
             try:
-                data = self.storage.read_bytes(tenant_id, workspace_id, file_id, revision)
-            except Exception as exc:  # blob missing/unreadable
+                data, actual_hash = self.manager.read_revision_bytes(workspace, file_record, revision)
+            except WorkspaceFailure as exc:
+                raise ExtractionError("storage_unavailable", exc.error.message or exc.error.code.value) from exc
+            except Exception as exc:  # unreadable root/file
                 raise ExtractionError("storage_unavailable", str(exc)) from exc
+            expected_hash = None
+            revision_row = self.store.get_revision(file_id, revision)
+            if revision_row is not None:
+                expected_hash = revision_row.get("content_hash")
+            if expected_hash and actual_hash and expected_hash != actual_hash:
+                self.store.finish_job(job["job_id"], IndexState.CANCELLED.value, at=self.clock(), error_code="stale_revision")
+                self.store.mark_index_status(workspace_id, file_id, IndexState.STALE.value, error="stale_revision", at=self.clock())
+                return
 
             ingestor = self.ingestor.for_scope(tenant_id, file_record.get("owner_id") or "")
             result = ingestor.extract(file_record["name"], file_record.get("mime_type"), data)

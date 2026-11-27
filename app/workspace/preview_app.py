@@ -52,4 +52,11 @@ app.include_router(build_mock_router())
 
 @app.get("/health", include_in_schema=False)
 def health() -> dict:
-    return {"status": "ok", "component": "agcore-r2-workspace-preview", "contract": "r2-w/v1"}
+    from app.workspace.contracts import WORKSPACE_CONTRACT_AMENDMENT, WORKSPACE_CONTRACT_REVISION
+
+    return {
+        "status": "ok",
+        "component": "agcore-r2-workspace-preview",
+        "contract": WORKSPACE_CONTRACT_REVISION,
+        "amendment": WORKSPACE_CONTRACT_AMENDMENT,
+    }
