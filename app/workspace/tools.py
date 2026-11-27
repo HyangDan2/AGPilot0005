@@ -1066,6 +1066,41 @@ def install_workspace_tools(tool_registry: Any) -> List[str]:
                 run_approvals = current_run_approvals.get()
                 safe_args = dict(kwargs)
 
+                # Beta safety guard: temporarily disable delete & destructive overwrite tools when AGCORE_WORKSPACE_ALLOW_DESTRUCTIVE_TOOLS=false
+                import os as _os
+                _allow_destructive_raw = _os.environ.get("AGCORE_WORKSPACE_ALLOW_DESTRUCTIVE_TOOLS")
+                _allow_destructive = (
+                    True
+                    if _allow_destructive_raw is None
+                    else _allow_destructive_raw.strip().lower() in ("1", "true", "yes")
+                )
+
+                if not _allow_destructive:
+                    if tname == "workspace_delete_file":
+                        return {
+                            "error": True,
+                            "status": "error",
+                            "tool": tname,
+                            "code": "destructive_tool_disabled",
+                            "message": "workspace_delete_file is temporarily disabled in Beta deployment.",
+                        }
+                    if tname == "workspace_create_file" and (safe_args.get("overwrite") or safe_args.get("confirm_overwrite")):
+                        return {
+                            "error": True,
+                            "status": "error",
+                            "tool": tname,
+                            "code": "destructive_tool_disabled",
+                            "message": "File overwrite via workspace_create_file is temporarily disabled in Beta deployment.",
+                        }
+                    if tname == "workspace_move_file" and safe_args.get("confirm_overwrite"):
+                        return {
+                            "error": True,
+                            "status": "error",
+                            "tool": tname,
+                            "code": "destructive_tool_disabled",
+                            "message": "Overwrite via workspace_move_file is temporarily disabled in Beta deployment.",
+                        }
+
                 # R2-INT-FIX-03-BE: Never trust LLM-supplied confirm / confirm_overwrite booleans!
                 # Strip them first and grant ONLY when verified in server-side AgentRunRequest.approvals.
                 if tname == "workspace_delete_file":

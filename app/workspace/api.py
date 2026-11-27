@@ -737,6 +737,17 @@ def agent_turn(
 ) -> Dict[str, Any]:
     """Agentic Execution Preview Adapter: one turn with real workspace tools."""
 
+    from app.config import settings as _app_settings
+
+    if str(getattr(_app_settings, "ENVIRONMENT", "")).strip().lower() == "production":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "preview_disabled_in_production",
+                "message": "Workspace preview agent/turn is disabled in production.",
+            },
+        )
+
     from app.workspace.agent import AgentTurnRequest
     from app.workspace.chat import WorkspaceChatSelection, build_workspace_chat_context
 
