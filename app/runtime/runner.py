@@ -1,8 +1,7 @@
 """Agent Runner with Lifecycle, SSE Event Streaming, and Cancellation."""
 import asyncio
-import json
 from app.tools.registry import registry
-from app.tools.adapters import ContextAdapter, PostCallAdapter, EscalationGate
+from app.tools.adapters import ContextAdapter
 from app.gateway.client import GatewayStreamError
 import time
 import uuid
@@ -313,195 +312,67 @@ class AgentRunner:
         start_time = time.time()
 
         try:
-            if settings.RUNTIME_ENGINE == "langgraph_r1":
-                from app.runtime.langgraph_r1 import LangGraphR1Runtime
-                from app.runtime.policy.constraints import ConstraintSpec
-                from app.tracing.store import get_trajectory_logger
+            from app.runtime.langgraph_r1 import LangGraphR1Runtime
+            from app.runtime.policy.constraints import ConstraintSpec
+            from app.tracing.store import get_trajectory_logger
 
-                allowed_tool_set = {t.name for t in registry.list_tools(service=state.service_id)}
-                constraints = ConstraintSpec.from_runtime(
-                    service_id=state.service_id,
-                    owner_id=state.owner_id,
-                    authenticated=bool(state.authenticated),
-                    allowed_tools=allowed_tool_set,
-                    max_steps=state.max_steps,
-                    max_tool_calls=state.max_tool_calls,
-                    time_budget_seconds=run_deadline.remaining_seconds(),
-                    context_budget_tokens=settings.CONTEXT_BUDGET_TOKENS,
-                    default_reasoning_effort=state.reasoning_effort or "default",
-                )
-                traj_logger = get_trajectory_logger() if settings.TRAJECTORY_ENABLED else None
-                r1_runtime = LangGraphR1Runtime(trajectory_logger=traj_logger)
-                async with asyncio.timeout(run_deadline.remaining_seconds()):
-                    r1_res = await r1_runtime.execute(
-                        state,
-                        constraints,
-                        emit=session.emit,
-                        deadline=run_deadline,
-                        fence=session.fence,
-                    )
-                session.finished_at = time.time()
-                if state.status == "completed":
-                    session.fence.try_finalize("completed")
-                    await session.emit("run.completed", {
-                        "citations": state.citations,
-                        "answer_kind": "answer",
-                        "answer": state.final_answer or "",
-                        "model_label": state.model_label,
-                        "total_steps": state.step_count,
-                        "total_tool_calls": state.tool_call_count,
-                        "duration_seconds": round(session.finished_at - start_time, 2),
-                        "terminal_status": r1_res.get("terminal_status") or "completed",
-                        "fallback_applied": bool(r1_res.get("fallback_applied_any", False)),
-                        "reason_code": r1_res.get("last_fallback_reason"),
-                        "runtime_engine": "langgraph_r1",
-                    })
-                else:
-                    session.fence.try_finalize("failed")
-                    err_info = state.error or {}
-                    state.error = {
-                        "code": err_info.get("code") or "terminated",
-                        "message": err_info.get("message") or "에이전트 실행이 중단되었습니다.",
-                    }
-                    await session.emit("run.failed", {
-                        **state.error,
-                        "terminal_status": r1_res.get("terminal_status") or "failed",
-                        "fallback_applied": bool(r1_res.get("fallback_applied_any", False)),
-                        "reason_code": r1_res.get("last_fallback_reason"),
-                        "runtime_engine": "langgraph_r1",
-                    })
-                return
-
+            allowed_tool_set = {t.name for t in registry.list_tools(service=state.service_id)}
+            constraints = ConstraintSpec.from_runtime(
+                service_id=state.service_id,
+                owner_id=state.owner_id,
+                authenticated=bool(state.authenticated),
+                allowed_tools=allowed_tool_set,
+                max_steps=state.max_steps,
+                max_tool_calls=state.max_tool_calls,
+                time_budget_seconds=run_deadline.remaining_seconds(),
+                context_budget_tokens=settings.CONTEXT_BUDGET_TOKENS,
+                default_reasoning_effort=state.reasoning_effort or "default",
+            )
+            traj_logger = get_trajectory_logger() if settings.TRAJECTORY_ENABLED else None
+            r1_runtime = LangGraphR1Runtime(trajectory_logger=traj_logger)
             async with asyncio.timeout(run_deadline.remaining_seconds()):
-                # We execute the graph step-by-step to emit fine-grained SSE events
-                last_tool_meta = None
-                attempted_tool_sigs = set()
-                escalations_used = 0
-                allowed_tool_set = {t.name for t in registry.list_tools(service=state.service_id)}
-                while state.step_count < state.max_steps and state.status == "running" and not session.fence.is_terminal:
-                    await session.emit("step.started", {"step": state.step_count + 1})
-                    await session.emit("model.started", {"step": state.step_count + 1, 'reasoning_effort': state.reasoning_effort or 'default'})
-                    
-                    # 1. Delta callback for streaming user answer tokens
-                    answer_parts = []
-                    has_streamed_delta = False
-                    is_pseudo_tool = False
-                    async def on_delta(token: str):
-                        nonlocal has_streamed_delta, is_pseudo_tool
-                        if session.fence.is_terminal:
-                            session.fence.record_late_result()
-                            return
-                        answer_parts.append(token)
-                        if "<tool_call" in token or "<function" in token or re.search(r"<\s*(?:tool_call|function\b)", "".join(answer_parts), re.I):
-                            is_pseudo_tool = True
-                        if not is_pseudo_tool and not state.pending_tool_calls:
-                            has_streamed_delta = True
-                            await session.emit("answer.delta", {"delta": token})
-
-                    async def on_reasoning(token: str):
-                        if session.fence.is_terminal:
-                            session.fence.record_late_result()
-                            return
-                        await session.emit('reasoning.delta', {'delta': token})
-
-                    # 2. Invoke Model Node
-                    from app.runtime.graph import model_node, tool_node
-                    model_res = await model_node(state, on_delta=on_delta, on_reasoning_delta=on_reasoning)
-                    # FIX-212: Legacy Terminal State Fence — block late model_node mutation after cancel/timeout!
-                    if session.fence.is_terminal:
-                        session.fence.record_late_result()
-                        return
-                    for k, v in model_res.items():
-                        setattr(state, k, v)
-                    await session.emit('model.completed', {'step': state.step_count, 'reasoning_effort': state.reasoning_effort or 'default'})
-
-                    if state.pending_tool_calls and state.tool_call_count + len(state.pending_tool_calls) > state.max_tool_calls:
-                        raise DocumentReferenceError("tool_call_budget_exceeded")
-                    if not state.pending_tool_calls:
-                        should_esc, esc_prompt = EscalationGate.evaluate(
-                            last_tool_meta, attempted_tool_sigs, allowed_tool_set, escalations_used, budget=1
-                        )
-                        if should_esc and esc_prompt and state.step_count + 1 < state.max_steps:
-                            escalations_used += 1
-                            last_tool_meta = None
-                            state.messages.append(GatewayMessage(role="user", content=esc_prompt))
-                            await session.emit("tool.started", {"step": state.step_count, "tool_name": "quality.escalate", "tool_call_id": f"esc-{escalations_used}"})
-                            await session.emit("tool.completed", {"step": state.step_count, "tool_name": "quality.escalate", "tool_call_id": f"esc-{escalations_used}", "is_error": False, "duration_ms": 1})
-                            continue
-                        answer = state.final_answer or "".join(answer_parts)
-                        if state.citations:
-                            from app.runtime.tasks.presentation import legacy_citations
-                            answer, _ = legacy_citations({'answer':answer, 'document_titles':state.document_titles,
-                                'entries':[{'doc_id':c['doc_id'],'chunk_id':c['chunk_id'],'source':{'page':c.get('page')}} for c in state.citations]})
-                            state.final_answer = answer
-                        if re.search(r"<\s*(?:tool_call|function\b)", answer, re.I):
-                            raise DocumentReferenceError("model_tool_syntax_in_answer")
-                        if answer:
-                            if not has_streamed_delta:
-                                await session.emit("answer.delta", {"delta": answer})
-                            else:
-                                citation_tail = answer[len("".join(answer_parts)):]
-                                if citation_tail:
-                                    await session.emit("answer.delta", {"delta": citation_tail})
-
-                    # 3. If model requested tools, invoke Tool Node
-                    if state.pending_tool_calls and state.tool_call_count < state.max_tool_calls:
-                        async def on_tool_event(event_type: str, item: Any, step: int):
-                            if event_type == "started":
-                                await session.emit("tool.started", {
-                                    "step": step,
-                                    "tool_name": item.function.name,
-                                    "tool_call_id": item.id,
-                                    "arguments": item.function.arguments,
-                                })
-                            elif event_type == "completed":
-                                await session.emit("tool.completed", {
-                                    "step": step,
-                                    "tool_name": item.name,
-                                    "tool_call_id": item.tool_call_id,
-                                    "duration_ms": item.trace.duration_ms,
-                                    "result_size_bytes": item.trace.result_size_bytes,
-                                    "is_error": item.is_error,
-                                    "status": "failed" if item.is_error else "completed",
-                                })
-
-                        tool_res = await tool_node(state, on_tool_event=on_tool_event)
-                        # FIX-212: Legacy Terminal State Fence — block late tool_node mutation after cancel/timeout!
-                        if session.fence.is_terminal:
-                            session.fence.record_late_result()
-                            return
-                        for k, v in tool_res.items():
-                            setattr(state, k, v)
-                        for m in state.messages[-max(1, len(tool_res.get("traces", []))):]:
-                            if getattr(m, "role", None) == "tool":
-                                last_tool_meta = PostCallAdapter.inspect(getattr(m, "name", ""), getattr(m, "content", ""), False)
-                        for tr in tool_res.get("traces", []):
-                            sig = f"{tr.tool_name}:{json.dumps(tr.arguments or {}, sort_keys=True, ensure_ascii=False)}"
-                            attempted_tool_sigs.add(sig)
-                            
-                        await session.emit("step.completed", {
-                            "step": state.step_count,
-                            "tool_calls_executed": len(tool_res.get("traces", [])),
-                        })
-                    else:
-                        # No tools needed or reached limit; model produced final response
-                        await session.emit("step.completed", {"step": state.step_count})
-                        break
-
-            if state.pending_tool_calls or not (state.final_answer or "").strip():
-                raise DocumentReferenceError("agent_answer_incomplete")
-            # Completed successfully
-            if session.fence.try_finalize("completed"):
-                state.status = "completed"
-                session.finished_at = time.time()
+                r1_res = await r1_runtime.execute(
+                    state,
+                    constraints,
+                    emit=session.emit,
+                    deadline=run_deadline,
+                    fence=session.fence,
+                )
+            if state.status == "cancelled" or session.fence.terminal_state == "cancelled":
+                if session.finished_at is None:
+                    session.finished_at = time.time()
+                return
+            session.finished_at = time.time()
+            if state.status == "completed":
+                session.fence.try_finalize("completed")
                 await session.emit("run.completed", {
-                    'citations': state.citations, 'answer_kind': 'answer',
+                    "citations": state.citations,
+                    "answer_kind": "answer",
                     "answer": state.final_answer or "",
                     "model_label": state.model_label,
                     "total_steps": state.step_count,
                     "total_tool_calls": state.tool_call_count,
                     "duration_seconds": round(session.finished_at - start_time, 2),
+                    "terminal_status": r1_res.get("terminal_status") or "completed",
+                    "fallback_applied": bool(r1_res.get("fallback_applied_any", False)),
+                    "reason_code": r1_res.get("last_fallback_reason"),
+                    "runtime_engine": "langgraph_r1",
                 })
+            else:
+                session.fence.try_finalize("failed")
+                err_info = state.error or {}
+                state.error = {
+                    "code": err_info.get("code") or "terminated",
+                    "message": err_info.get("message") or "에이전트 실행이 중단되었습니다.",
+                }
+                await session.emit("run.failed", {
+                    **state.error,
+                    "terminal_status": r1_res.get("terminal_status") or "failed",
+                    "fallback_applied": bool(r1_res.get("fallback_applied_any", False)),
+                    "reason_code": r1_res.get("last_fallback_reason"),
+                    "runtime_engine": "langgraph_r1",
+                })
+            return
 
         except asyncio.CancelledError:
             if session.fence.try_finalize("cancelled"):

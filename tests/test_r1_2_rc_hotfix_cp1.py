@@ -108,10 +108,10 @@ async def test_cr_01_http_provider_sync_registration_and_execution(tmp_path, mon
 
 
 # ---------------------------------------------------------------------------
-# CR-02 & CR-03: Full E2E FastAPI -> Auth -> Immutable ExecutionScope -> Runner (Legacy & LangGraph) -> HTTP Tool
+# CR-02 & CR-03: Full E2E FastAPI -> Auth -> Immutable ExecutionScope -> Runner (LangGraph Single Runtime) -> HTTP Tool
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-@pytest.mark.parametrize("engine", ["legacy", "langgraph_r1"])
+@pytest.mark.parametrize("engine", ["langgraph_r1"])
 async def test_cr_02_and_03_e2e_scope_propagation_both_runtimes(tmp_path, monkeypatch, engine):
     monkeypatch.setattr(settings, "ENVIRONMENT", "production")
     monkeypatch.setattr(settings, "RUNTIME_ENGINE", engine)

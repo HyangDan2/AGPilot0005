@@ -9,6 +9,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "AGCore",
-        "version": "1.0.0-mvp",
+        "version": "1.3.0",
+        "runtime_engine": "langgraph_r1",
         "gateway_connected": not gateway_client.mock_mode,
     }
