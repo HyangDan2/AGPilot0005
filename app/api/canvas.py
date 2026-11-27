@@ -13,6 +13,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.canvas.approval import build_user_approval, current_user_approval
+from app.canvas.config import load_canvas_settings
 from app.canvas.errors import CanvasError
 from app.canvas.events import GenerationRequest
 from app.canvas.models import PatchOperation, PatchRequest
@@ -21,7 +23,34 @@ from app.canvas.service import CanvasService, get_canvas_service
 from app.canvas.tools import manifest as tools_manifest
 from app.core.auth import ExecutionScope, require_authenticated_caller
 
-router = APIRouter(prefix="/canvas", tags=["Canvas Artifacts"], dependencies=[Depends(require_authenticated_caller)])
+def require_canvas_enabled() -> None:
+    """WO-C17 / C-FIX-05: the feature stays off until an operator enables it explicitly.
+
+    Merging this branch into an operating service therefore exposes no working Canvas endpoint:
+    ``AGCORE_CANVAS_ENABLED`` defaults to false and every route answers ``503 canvas_disabled``.
+    """
+    settings = load_canvas_settings()
+    if not settings.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "canvas_disabled",
+                "message": "canvas engine is disabled (set AGCORE_CANVAS_ENABLED=true to activate it)",
+                "retryable": False,
+                "context": {
+                    "feature_flag": "AGCORE_CANVAS_ENABLED",
+                    "feature_flag_default": False,
+                    "dev_preview_flag": "AGCORE_CANVAS_DEV_PREVIEW",
+                },
+            },
+        )
+
+
+router = APIRouter(
+    prefix="/canvas",
+    tags=["Canvas Artifacts"],
+    dependencies=[Depends(require_authenticated_caller), Depends(require_canvas_enabled)],
+)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -102,6 +131,9 @@ class ApplyProposalBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     change_reason: Optional[str] = Field(default=None, max_length=500)
+    # WO-C17 / C-FIX-06: the user's approval of this proposal, carried by the interactive UI.
+    user_approved: bool = False
+    approval_reference: Optional[str] = Field(default=None, max_length=120)
 
 
 class RejectProposalBody(BaseModel):
@@ -439,12 +471,23 @@ async def apply_edit_proposal(
 ) -> Dict[str, Any]:
     scope = _scope(request)
     try:
-        return _service(request).proposals.apply(
+        approval = build_user_approval(
             scope,
-            proposal_id,
-            change_reason=(body.change_reason if body else None),
-            actor_id=scope.owner_id,
+            proposal_id=proposal_id,
+            user_approved=bool(body.user_approved) if body else False,
+            approval_reference=(body.approval_reference if body else None),
         )
+        token = current_user_approval.set(approval)
+        try:
+            return _service(request).proposals.apply(
+                scope,
+                proposal_id,
+                change_reason=(body.change_reason if body else None),
+                actor_id=scope.owner_id,
+                approval=approval,
+            )
+        finally:
+            current_user_approval.reset(token)
     except CanvasError as exc:
         raise _http(exc) from exc
 
@@ -474,6 +517,7 @@ async def generate_artifact(
     scope = _scope(request)
     service = _service(request)
     try:
+        service.generation.ensure_dev_preview()
         if stream:
             return StreamingResponse(
                 service.generation.stream(scope, body),

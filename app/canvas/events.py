@@ -32,7 +32,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.canvas.errors import CanvasError, CanvasErrorCode
-from app.canvas.manager import ArtifactManager, scope_ids
+from app.canvas.manager import ArtifactManager, assert_workspace_level, scope_ids
 from app.canvas.models import Artifact, Revision
 from app.canvas.schemas import ARTIFACT_EVENT_TYPES  # noqa: F401  (re-exported contract constant)
 from app.schemas.events import SSEEvent
@@ -125,6 +125,12 @@ class ArtifactStreamSession:
         if self.status != "idle":
             # A repeated start on the same session is a duplicate delivery, not a new artifact.
             return self.events[0]
+        if workspace_id is not None:
+            # WO-C17 / C-FIX-01: fail fast when the caller may not write into the workspace.
+            assert_workspace_level(
+                self.manager.workspace, workspace_id, self.scope,
+                required="write", operation="generation.start",
+            )
         self.status = "started"
         self._request = {
             "title": title,
@@ -269,10 +275,22 @@ class ArtifactStreamSession:
 class GenerationService:
     """Drives explicit generation requests and exposes the event stream (no LLM call)."""
 
-    def __init__(self, manager: ArtifactManager) -> None:
+    def __init__(self, manager: ArtifactManager, *, dev_preview: bool = True) -> None:
         self.manager = manager
+        self.dev_preview = bool(dev_preview)
         self._sessions: Dict[Tuple[str, str], ArtifactStreamSession] = {}
         self.last_sessions: Dict[str, ArtifactStreamSession] = {}
+
+    def ensure_dev_preview(self) -> None:
+        """WO-C17 / C-FIX-05: the simulated stream is a development surface, not a feature."""
+        if not self.dev_preview:
+            raise CanvasError(
+                CanvasErrorCode.AI_ADAPTER_UNAVAILABLE,
+                "artifact generation is a development preview surface; no production generation "
+                "adapter is integrated (set AGCORE_CANVAS_DEV_PREVIEW=true for the dev contract)",
+                retryable=True,
+                context={"dev_preview": False, "ai_integration_verified": False, "persisted": False},
+            )
 
     def _session(self, scope: Any, key: str) -> ArtifactStreamSession:
         lookup = (scope_key_of(scope), key)
@@ -284,6 +302,7 @@ class GenerationService:
         return session
 
     def generate(self, scope: Any, request: GenerationRequest) -> Dict[str, Any]:
+        self.ensure_dev_preview()
         # Fail fast on an unusable type/language before any frame is emitted.
         self.manager.types.get(request.artifact_type)
         self.manager.types.normalize_language(request.artifact_type, request.language)
@@ -360,6 +379,7 @@ class GenerationService:
         """SSE rendering of the same events (contract verification without an LLM)."""
         import json
 
+        self.ensure_dev_preview()
         result = self.generate(scope, request)
         for frame in result["events"]:
             payload = {
