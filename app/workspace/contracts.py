@@ -354,6 +354,7 @@ class ContextResponse(BaseModel):
     sources: List[Citation] = Field(default_factory=list)
     retrieved: List[SearchResult] = Field(default_factory=list)
     degraded: bool = False
+    injection_suspected: int = 0
 
 
 class CitationResolveResponse(BaseModel):
@@ -361,6 +362,7 @@ class CitationResolveResponse(BaseModel):
     citation: Optional[Citation] = None
     revision_status: RevisionStatus = RevisionStatus.CURRENT
     download_url: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class CitationValidationRequest(BaseModel):

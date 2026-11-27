@@ -126,6 +126,7 @@ CREATE INDEX IF NOT EXISTS idx_job_file ON workspace_index_job(file_id, state);
 
 CREATE TABLE IF NOT EXISTS workspace_chunk (
     chunk_id TEXT PRIMARY KEY,
+    citation_id TEXT,
     workspace_id TEXT NOT NULL,
     file_id TEXT NOT NULL,
     file_revision INTEGER NOT NULL,
@@ -142,6 +143,7 @@ CREATE TABLE IF NOT EXISTS workspace_chunk (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chunk_workspace ON workspace_chunk(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_citation ON workspace_chunk(workspace_id, citation_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_file ON workspace_chunk(file_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS workspace_chunk_fts USING fts5(
@@ -151,6 +153,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS workspace_chunk_fts USING fts5(
     body,
     tokenize = 'unicode61 remove_diacritics 2'
 );
+
+CREATE TABLE IF NOT EXISTS workspace_citation (
+    citation_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    file_revision INTEGER NOT NULL,
+    chunk_id TEXT NOT NULL,
+    file_name TEXT,
+    page_number INTEGER,
+    section TEXT,
+    source_excerpt TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_citation_workspace ON workspace_citation(workspace_id);
 
 CREATE TABLE IF NOT EXISTS workspace_chunk_vector (
     chunk_id TEXT NOT NULL,
@@ -712,10 +728,10 @@ class WorkspaceStore:
             conn.execute("DELETE FROM workspace_chunk WHERE file_id=?", (file_id,))
             for chunk in chunks:
                 conn.execute(
-                    """INSERT INTO workspace_chunk(chunk_id, workspace_id, file_id, file_revision, chunk_index, content,
+                    """INSERT INTO workspace_chunk(chunk_id, citation_id, workspace_id, file_id, file_revision, chunk_index, content,
                             content_hash, token_count, page_number, section, offset_start, offset_end, parser_version,
                             chunking_version, created_at)
-                       VALUES(:chunk_id, :workspace_id, :file_id, :file_revision, :chunk_index, :content,
+                       VALUES(:chunk_id, :citation_id, :workspace_id, :file_id, :file_revision, :chunk_index, :content,
                             :content_hash, :token_count, :page_number, :section, :offset_start, :offset_end,
                             :parser_version, :chunking_version, :created_at)""",
                     chunk,
@@ -755,10 +771,10 @@ class WorkspaceStore:
             conn.execute("DELETE FROM workspace_chunk WHERE file_id=?", (file_id,))
             for chunk in chunks:
                 conn.execute(
-                    """INSERT INTO workspace_chunk(chunk_id, workspace_id, file_id, file_revision, chunk_index, content,
+                    """INSERT INTO workspace_chunk(chunk_id, citation_id, workspace_id, file_id, file_revision, chunk_index, content,
                             content_hash, token_count, page_number, section, offset_start, offset_end, parser_version,
                             chunking_version, created_at)
-                       VALUES(:chunk_id, :workspace_id, :file_id, :file_revision, :chunk_index, :content,
+                       VALUES(:chunk_id, :citation_id, :workspace_id, :file_id, :file_revision, :chunk_index, :content,
                             :content_hash, :token_count, :page_number, :section, :offset_start, :offset_end,
                             :parser_version, :chunking_version, :created_at)""",
                     chunk,
@@ -828,6 +844,41 @@ class WorkspaceStore:
             params.append(revision)
         with self.read() as conn:
             return int(conn.execute(sql, params).fetchone()["c"])
+
+    def upsert_citation(self, record: Dict[str, Any]) -> None:
+        with self.write() as conn:
+            conn.execute(
+                """INSERT INTO workspace_citation(citation_id, workspace_id, file_id, file_revision, chunk_id,
+                        file_name, page_number, section, source_excerpt, created_at)
+                   VALUES(:citation_id, :workspace_id, :file_id, :file_revision, :chunk_id, :file_name,
+                        :page_number, :section, :source_excerpt, :created_at)
+                   ON CONFLICT(citation_id) DO UPDATE SET
+                        file_name=excluded.file_name, page_number=excluded.page_number,
+                        section=excluded.section, source_excerpt=excluded.source_excerpt""",
+                record,
+            )
+
+    def get_citation(self, workspace_id: str, citation_id: str) -> Optional[Dict[str, Any]]:
+        with self.read() as conn:
+            return _row(
+                conn.execute(
+                    "SELECT * FROM workspace_citation WHERE workspace_id=? AND citation_id=?",
+                    (workspace_id, citation_id),
+                ).fetchone()
+            )
+
+    def purge_citations(self, workspace_id: str) -> int:
+        with self.write() as conn:
+            return conn.execute("DELETE FROM workspace_citation WHERE workspace_id=?", (workspace_id,)).rowcount
+
+    def get_chunk_by_citation(self, workspace_id: str, citation_id: str) -> Optional[Dict[str, Any]]:
+        with self.read() as conn:
+            return _row(
+                conn.execute(
+                    "SELECT * FROM workspace_chunk WHERE workspace_id=? AND citation_id=?",
+                    (workspace_id, citation_id),
+                ).fetchone()
+            )
 
     def get_chunk(self, chunk_id: str) -> Optional[Dict[str, Any]]:
         with self.read() as conn:
@@ -955,6 +1006,7 @@ class WorkspaceStore:
             conn.execute("DELETE FROM workspace_index_job WHERE workspace_id=?", (workspace_id,))
             conn.execute("DELETE FROM workspace_file_revision WHERE workspace_id=?", (workspace_id,))
             conn.execute("DELETE FROM workspace_artifact_ref WHERE workspace_id=?", (workspace_id,))
+            conn.execute("DELETE FROM workspace_citation WHERE workspace_id=?", (workspace_id,))
             conn.execute("DELETE FROM workspace_conversation_ref WHERE workspace_id=?", (workspace_id,))
             cursor = conn.execute("DELETE FROM workspace_file WHERE workspace_id=?", (workspace_id,))
             return cursor.rowcount

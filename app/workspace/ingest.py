@@ -5,12 +5,10 @@ Document API; text-like files are decoded locally and chunked by `chunking.py`.
 """
 from __future__ import annotations
 
-import io
-import mimetypes
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Optional, Protocol
 
 import httpx
 

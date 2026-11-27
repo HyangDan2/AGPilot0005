@@ -33,6 +33,11 @@ def _chunk_id(file_id: str, revision: int, index: int, content_hash: str) -> str
     return f"wc_{digest[:12]}"
 
 
+def _citation_id(workspace_id: str, file_id: str, revision: int, chunk_id: str) -> str:
+    digest = hashlib.sha256(f"{workspace_id}|{file_id}|{revision}|{chunk_id}".encode("utf-8")).hexdigest()
+    return f"cit_{digest[:12]}"
+
+
 class WorkspaceIndexer:
     def __init__(
         self,
@@ -252,9 +257,11 @@ class WorkspaceIndexer:
         for index, chunk in enumerate(limited):
             content = chunk.content
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            chunk_id = _chunk_id(file_id, revision, index, digest)
             rows.append(
                 {
-                    "chunk_id": _chunk_id(file_id, revision, index, digest),
+                    "chunk_id": chunk_id,
+                    "citation_id": _citation_id(workspace_id, file_id, revision, chunk_id),
                     "workspace_id": workspace_id,
                     "file_id": file_id,
                     "file_revision": revision,
