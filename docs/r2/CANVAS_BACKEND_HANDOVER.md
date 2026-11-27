@@ -1,7 +1,11 @@
-# AGCore R2 — Canvas Backend Handover (CP-06 / WO-C15 · WO-C16)
+# AGCore R2 — Canvas Backend Handover (CP-06 / WO-C15 · WO-C16 · WO-C17)
 
 Recorded 2026-11-27 (KST) by the Canvas Engineer (피클 / 향단이), branch `feat/r2-canvas`.
 Status: **backend complete and locally verified, not merged, not deployed, no production change.**
+WO-C17 (Canvas Backend Correction, `C-FIX-01` … `C-FIX-07`) is applied on top: the feature is now
+off by default, workspace write/read authority is separated and re-checked on every path, proposal
+apply is one transaction, the revision cap prunes instead of blocking, and applying a proposal
+requires a verified user approval (§16).
 `main` was not touched, no pull request was opened, and no operating AGCore store, `Server-HQ`
 configuration or gateway was modified.
 
@@ -31,6 +35,10 @@ Companion documents:
 | `af4d4fd` | CP-03 / WO-C06·C07·C08 | Generation stream contract, partial editing proposals, eight Canvas tools, opt-in tool registration (`AGCORE_CANVAS_TOOLS_ENABLED`) |
 | `0b95c33` | CP-05 / WO-C13·C14 | Export provider closure, HTML/preview sanitizer hardening, security & resource-control test suite |
 | CP-06 | WO-C15·C16 | This handover document (and the tool-manifest wording that matches the opt-in flag) — `git log -1 -- docs/r2/CANVAS_BACKEND_HANDOVER.md` for the exact SHA |
+| `c615874` | WO-C17 / C-FIX-05 | Feature isolation behind `AGCORE_CANVAS_ENABLED` (default **false**), separate `AGCORE_CANVAS_DEV_PREVIEW`, `/capabilities` isolation/retention/approval report, `app/canvas/approval.py` |
+| `136ac0f` | WO-C17 / C-FIX-01·02 | Workspace write-vs-read authority, live access re-check on every artifact path, list filtering for revoked artifacts |
+| `db551a3` | WO-C17 / C-FIX-03·04·06 | Atomic proposal apply (one `BEGIN IMMEDIATE`), revision retention by pruning, user-approval gate for apply |
+| `f383aff` | WO-C17 tests | `tests/test_r2_canvas_correction.py` (18) plus the corrected existing Canvas expectations |
 
 Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover: `git ls-remote origin feat/r2-canvas`). The first push attempt returned HTTP 403 from the GitHub App write path and the immediate retry succeeded; if the connection stops accepting writes, the operator must transfer the branch — never force-push or merge `main`. No pull request was opened and `main` remains at `0d2047f`.
 
@@ -43,36 +51,38 @@ Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover:
 | Module | Responsibility | ≈LOC |
 | --- | --- | --- |
 | `__init__.py` | Public exports of the package | 21 |
-| `config.py` | `AGCORE_CANVAS_*` settings resolved at call time; production downgrade of dev adapters | 132 |
-| `errors.py` | `CanvasError` + `CanvasErrorCode` → HTTP status map; R2-W-compatible envelope | 78 |
+| `config.py` | `AGCORE_CANVAS_*` settings resolved at call time; feature flag + separate dev-preview gate; production downgrade of dev adapters; retention window | 178 |
+| `approval.py` | User-approval contract for `apply` (`UserApproval`, role rules, `require_user_approval`, policy report) | 129 |
+| `errors.py` | `CanvasError` + `CanvasErrorCode` → HTTP status map; R2-W-compatible envelope | 88 |
 | `types.py` | Extensible artifact type registry (5 enabled, 4 reserved), language → extension map | 227 |
-| `models.py` | Pydantic domain models: `Artifact`, `Revision`, `PatchRequest`, `PatchOutcome`, `EditProposal`, pages | 143 |
+| `models.py` | Pydantic domain models: `Artifact`, `Revision`, `PatchRequest`, `PatchOutcome`, `EditProposal`, pages (page reports workspace exclusions) | 148 |
 | `offsets.py` | UTF-16 ↔ code-point offset contract, surrogate-split rejection, content metrics | 137 |
-| `storage.py` | `CanvasStorage` protocol + SQLite implementation with content-addressed blob store | 874 |
-| `manager.py` | Artifact CRUD, list/get, rename, soft delete/purge, workspace & conversation links, export/preview entry points | 359 |
-| `revisions.py` | Revision history, revision diff, non-destructive restore, `PatchEngine` | 202 |
+| `storage.py` | `CanvasStorage` protocol + SQLite implementation, blob store, atomic `apply_proposal`, retention pruning + prune audit | 1156 |
+| `manager.py` | Artifact CRUD, list/get, rename, soft delete/purge, workspace & conversation links, export/preview entry points, workspace level enforcement + list filtering | 575 |
+| `revisions.py` | Revision history, revision diff, non-destructive restore, `PatchEngine` (workspace-aware) | 222 |
 | `patching.py` | Pure patch computation for six operations (conflict / expected-text checks) | 201 |
 | `diffing.py` | Line-based diff with a bounded line budget | 211 |
-| `editing.py` | AI edit adapter port, dev adapter, edit proposal lifecycle, bounded context envelope | 552 |
-| `events.py` | SSE event contract, streaming generation session, idempotent replay | 397 |
+| `editing.py` | AI edit adapter port, dev adapter, edit proposal lifecycle (approval-gated apply), bounded context envelope | 576 |
+| `events.py` | SSE event contract, streaming generation session (dev-preview gated), idempotent replay | 417 |
 | `export.py` | Export providers (md/txt/html/json/source), safe filename + RFC 5987 disposition, office contract | 243 |
 | `security.py` | Preview sanitizer & CSP policy, title/identifier hygiene, scope-override guard, token estimate | 293 |
-| `tools.py` | Eight-tool manifest, handlers, `install_canvas_tools()` (idempotent) | 467 |
-| `service.py` | `CanvasService` singleton wiring storage/types/workspace/exporter/adapter/managers | 125 |
+| `tools.py` | Eight-tool manifest, handlers, AI-exposed subset (withholds `apply_edit`), `install_canvas_tools()` | 506 |
+| `service.py` | `CanvasService` singleton wiring storage/types/workspace/exporter/adapter/managers; feature gate; isolation report | 155 |
 | `schemas.py` | Re-exported event-type constants | 16 |
-| `workspace.py` | `WorkspaceGateway` protocol, runtime/dev/unavailable providers, `WorkspaceAccess` | 259 |
+| `workspace.py` | `WorkspaceGateway` protocol, providers, `WorkspaceAccess` with read/write levels, dev `set_level` | 316 |
 
 ### 2.2 API and tests
 
 | File | Content |
 | --- | --- |
-| `app/api/canvas.py` | `/api/v1/canvas` router (24 endpoints), request models with `extra="forbid"`, structured errors (496 LOC) |
+| `app/api/canvas.py` | `/api/v1/canvas` router (24 endpoints), feature-flag gate, approval body on apply, request models with `extra="forbid"`, structured errors (540 LOC) |
 | `tests/conftest.py` | `canvas` / `configured` fixtures (throw-away data dir + service reset) — new file, 36 LOC |
-| `tests/r2_canvas_support.py` | Scope/header/client helpers, `configure()` (54 LOC) |
+| `tests/r2_canvas_support.py` | Scope/header/client helpers, `configure()` (feature flag + dev preview on) (77 LOC) |
 | `tests/test_r2_canvas_foundation.py` | CP-01: types, manager, persistence, restart recovery, limits (11 tests) |
 | `tests/test_r2_canvas_revision_patch.py` | CP-02: revisions, restore, diff, patch conflicts, offsets (7 tests) |
 | `tests/test_r2_canvas_ai.py` | CP-03: generation stream, edit proposals, tools, opt-in registration (17 tests) |
 | `tests/test_r2_canvas_export_security.py` | CP-05: export formats, filename/header hardening, sanitizer, isolation, limits (10 tests) |
+| `tests/test_r2_canvas_correction.py` | WO-C17: C-FIX-01…06 verification (18 tests) |
 
 ### 2.3 Shared files touched (merge targets, see §14)
 
@@ -239,7 +249,7 @@ frozen R2 contract referenced by `CANVAS_BASELINE.md` §4.
 | POST | `/artifacts/{artifact_id}/edit-proposals` | AI edit proposal (dev adapter) (201) |
 | GET | `/artifacts/{artifact_id}/edit-proposals` | list proposals (`status`, paging) |
 | GET | `/edit-proposals/{proposal_id}` | one proposal (+ `is_stale`) |
-| POST | `/edit-proposals/{proposal_id}/apply` | apply an approved proposal |
+| POST | `/edit-proposals/{proposal_id}/apply` | apply a proposal — requires `user_approved: true` and an interactive user scope |
 | POST | `/edit-proposals/{proposal_id}/reject` | reject a proposal |
 | POST | `/generations` | explicit artifact generation (dev SSE contract; `?stream=true`) |
 
@@ -269,7 +279,11 @@ frozen R2 contract referenced by `CANVAS_BASELINE.md` §4.
 | `ai_adapter_unavailable` | 503 | no verified AI edit adapter |
 | `storage_failure` | 500 | persistence failed; nothing committed |
 | `unauthenticated` | 401 | no verified scope |
-| `forbidden` | 403 | scope override fields, disabled engine |
+| `forbidden` | 403 | scope override fields |
+| `proposal_already_applied` | 409 | a second apply of an applied proposal (WO-C17) |
+| `proposal_rejected` | 409 | apply of a rejected proposal (WO-C17) |
+| `user_approval_required` | 403 | apply without a verified user approval (WO-C17 / C-FIX-06) |
+| `canvas_disabled` | 503 | `AGCORE_CANVAS_ENABLED` is off, so the whole router is gated (WO-C17 / C-FIX-05) |
 
 ### 5.2 Request rules
 
@@ -279,6 +293,11 @@ frozen R2 contract referenced by `CANVAS_BASELINE.md` §4.
   `expected_original_text`; the write is compare-and-commit inside one transaction.
 * `artifact create` accepts `creation_source` (`user|ai|import|tool`) and an optional
   `idempotency_key`; a duplicate key returns the original artifact (`duplicate: true`).
+* `POST /edit-proposals/{id}/apply` requires `user_approved: true` **and** an interactive principal
+  (`user`/`owner`/`admin`/`admiral`). Without it the answer is `403 user_approval_required`; a
+  second apply is `409 proposal_already_applied`, a rejected one `409 proposal_rejected`.
+* Every route is behind `AGCORE_CANVAS_ENABLED`; with the flag off the answer is
+  `503 canvas_disabled` (authentication is still evaluated first).
 
 ### 5.3 Offset contract (backend ↔ frontend)
 
@@ -391,7 +410,7 @@ Eight tools, registered in the existing Dynamic Tool Registry (`app/tools/regist
 | `canvas.read_artifact` | yes | `artifact_id` (optional `revision`) | none |
 | `canvas.list_artifacts` | yes | — (filters, paging) | none |
 | `canvas.propose_edit` | no | `artifact_id`, `instruction` | stores a proposal; revision unchanged |
-| `canvas.apply_edit` | no | `proposal_id` | creates a revision from the proposal |
+| `canvas.apply_edit` | no | `proposal_id` | **withheld from the AI-exposed set**; a tool call is refused with `403 user_approval_required` (a revision is only written from the user-facing apply endpoint) |
 | `canvas.list_revisions` | yes | `artifact_id` | none |
 | `canvas.restore_revision` | no | `artifact_id`, `revision` | appends a restore revision |
 | `canvas.export_artifact` | yes | `artifact_id` (optional `revision`, `format`) | none |
@@ -409,7 +428,9 @@ Invariants:
 Enablement (two independent steps):
 
 1. **Registration** — `AGCORE_CANVAS_TOOLS_ENABLED=1` (also `true`/`yes`/`on`) at process start.
-   Without it the registry contains exactly the eight R1.3 builtin tools.
+   Without it the registry contains exactly the eight R1.3 builtin tools. Registration adds the
+   **seven AI-exposed tools**; `canvas.apply_edit` is withheld until R1.3 defines its approval
+   channel (`install_canvas_tools(registry, ai_exposed_only=False)` is the admin-only variant).
 2. **Exposure** — add the tool names to the operator's tool profile (`app/tools/policy.py`
    profiles / `tool_policy.json`). No shipped profile lists a `canvas.*` tool.
 
@@ -428,10 +449,10 @@ The wire layer translates `canvas.create_artifact` to the provider-safe
 | Pragmas | `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5000ms` |
 | Transactions | `BEGIN IMMEDIATE`; metadata + revision + head pointer commit together |
 | Blob write | temp file → `fsync` → `os.replace` (atomic), immutable once named by its hash |
-| Schema version | `1` in `canvas_meta`; created idempotently with `CREATE TABLE IF NOT EXISTS` |
+| Schema version | `2` in `canvas_meta`; created idempotently with `CREATE TABLE IF NOT EXISTS` (v2 adds `canvas_revision_prunes`) |
 | Soft delete | `deleted_at` set; hidden from reads/lists; data retained |
-| Purge | deletes artifact/revision/proposal/event rows; content-addressed blobs stay (shared, no GC in R2) |
-| Limits | content ≤ 512 KiB, revisions ≤ 100, list ≤ 100/page, diff ≤ 2000 lines, context ≤ 3000 tokens (all `AGCORE_CANVAS_*` overridable) |
+| Purge | deletes artifact/revision/proposal/event/prune rows; content-addressed blobs stay (shared, no GC in R2) |
+| Limits | content ≤ 512 KiB, revisions ≤ 100 (pruned at the cap), list ≤ 100/page, diff ≤ 2000 lines, context ≤ 3000 tokens (all `AGCORE_CANVAS_*` overridable) |
 | Restart | nothing cached in memory; a new process on the same DB + blob root returns identical data (covered by a test) |
 
 Environment variables:
@@ -439,15 +460,18 @@ Environment variables:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AGCORE_ENV` | `development` | `production` disables dev adapters and forces the runtime/unavailable providers |
-| `AGCORE_CANVAS_ENABLED` | `true` | engine on/off (off → 403 `forbidden`) |
+| `AGCORE_CANVAS_ENABLED` | **`false`** | engine on/off; off ⇒ `503 canvas_disabled` on every route and the tool layer refuses |
+| `AGCORE_CANVAS_DEV_PREVIEW` | `false` | separate switch for the dev-only surface (dev workspace provider, dev edit adapter, simulated generation stream); forced off in production |
 | `AGCORE_CANVAS_DATA_DIR` | `<repo>/data/canvas` | DB + blob root |
 | `AGCORE_CANVAS_DB_PATH` | `<data_dir>/canvas.db` | explicit DB file |
-| `AGCORE_CANVAS_TOOLS_ENABLED` | unset (off) | register the eight Canvas tools in the tool registry |
+| `AGCORE_CANVAS_TOOLS_ENABLED` | unset (off) | register the Canvas tools in the tool registry (seven AI-exposed; `canvas.apply_edit` withheld) |
 | `AGCORE_CANVAS_WORKSPACE_PROVIDER` | `dev` | `dev` \| `workspace` \| `unavailable` |
 | `AGCORE_CANVAS_AI_ADAPTER` | `dev` | `dev` \| `runtime` |
-| `AGCORE_CANVAS_DEV_ADAPTERS` | `true` | ignored/forced off in production |
+| `AGCORE_CANVAS_DEV_ADAPTERS` | `true` | second gate on the dev adapters; can only shrink the surface, forced off in production |
 | `AGCORE_CANVAS_MAX_CONTENT_BYTES` | `524288` | per-artifact content limit |
-| `AGCORE_CANVAS_MAX_REVISIONS` | `100` | revision retention per artifact |
+| `AGCORE_CANVAS_MAX_REVISIONS` | `100` | revision cap per artifact (enforced by pruning, never by blocking edits) |
+| `AGCORE_CANVAS_RETENTION_MIN_REVISIONS` | `20` | newest revisions always kept (clamped to `max_revisions - 1`) |
+| `AGCORE_CANVAS_MAX_LIST_SCAN` | `1000` | rows scanned when list must filter revoked workspace artifacts |
 | `AGCORE_CANVAS_MAX_TITLE_CHARS` | `200` | title limit |
 | `AGCORE_CANVAS_MAX_LIST_LIMIT` | `100` | page size ceiling |
 | `AGCORE_CANVAS_DEFAULT_PAGE_LIMIT` | `25` | default page size |
@@ -482,6 +506,8 @@ export AGCORE_TOOL_POLICY_FILE=/tmp/canvas-preview/tool_policy.json
 export AGCORE_RUNTIME_CONFIG_PATH=/tmp/canvas-preview/runtime_config.json
 export AGCORE_TRAJECTORY_DB_PATH=/tmp/canvas-preview/trajectory.db
 export AGCORE_AGTOOLS_ENABLED=false          # no AGTools token in this environment
+export AGCORE_CANVAS_ENABLED=true            # WO-C17: the feature is off by default
+export AGCORE_CANVAS_DEV_PREVIEW=true        # dev provider / dev edit adapter / fake stream
 # export AGCORE_CANVAS_TOOLS_ENABLED=1       # only when testing tool registration
 
 /workspace/.venv-r2canvas/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8213
@@ -507,9 +533,11 @@ curl -s "${H[@]}" -H 'Content-Type: application/json' -X POST \
 ```
 
 Verified on 2026-11-27: `/api/v1/health` → 200, `/canvas/capabilities` returned
-`environment=development`, five enabled types and eight tools, artifact creation returned
+`environment=development`, five enabled types and eight manifest tools, artifact creation returned
 `art_…` with `current_revision: 1`. With `AGCORE_CANVAS_TOOLS_ENABLED=1`, `/api/v1/agent/agents`
-listed all eight `canvas.*` tools; with the flag unset it listed none. Stop the server with
+listed all eight `canvas.*` tools; with the flag unset it listed none. (WO-C17 changes the exposed
+count to seven — `canvas.apply_edit` is withheld — and requires `AGCORE_CANVAS_ENABLED=true`
+before any Canvas route answers; see §11.1 for the WO-C17 smoke run.) Stop the server with
 `Ctrl+C`; delete `/tmp/canvas-preview*` afterwards.
 
 Interactive docs: `/docs` (the custom Swagger UI) lists all `/api/v1/canvas` endpoints.
@@ -550,6 +578,33 @@ Test-isolation notes:
 
 ---
 
+### 11.1 WO-C17 verification run
+
+```bash
+cd /workspace/repos/AGPilot0005
+/workspace/.venv-r2canvas/bin/pytest \
+  tests/test_r2_canvas_foundation.py tests/test_r2_canvas_revision_patch.py \
+  tests/test_r2_canvas_ai.py tests/test_r2_canvas_export_security.py \
+  tests/test_r2_canvas_correction.py -q
+```
+
+Result: **63 passed** (45 pre-existing Canvas tests + 18 new WO-C17 tests), Python 3.12.16,
+2026-11-27. The 219-test baseline was not re-run (its PASS evidence is accepted per WO-C17); the
+R1.3 modules that share the tool registry (`tests/test_tools.py`, `tests/test_beta_baseline.py`,
+`tests/test_runtime_and_api.py`, 23 tests) were re-run because `install_canvas_tools()` changed and
+all pass.
+
+Smoke run over HTTP (2026-11-27, `uvicorn` on 127.0.0.1):
+
+| Check | Result |
+| --- | --- |
+| flag off (default): `GET /canvas/capabilities` | `503 canvas_disabled`, `/api/v1/health` still `200` |
+| flag + dev preview on: `GET /canvas/capabilities` | `enabled: true`, `dev_preview: true`, retention and approval policy reported |
+| create → propose → apply without `user_approved` | `403 user_approval_required` |
+| apply with `user_approved: true` | `200`, revision 2, `approval.source = "user_action"` |
+| second apply | `409 proposal_already_applied` |
+| `/agent/agents` with `AGCORE_CANVAS_TOOLS_ENABLED=1` | 7 `canvas.*` tools, `canvas.apply_edit` absent |
+
 ## 12. Not implemented / not verified
 
 | Item | State |
@@ -559,7 +614,8 @@ Test-isolation notes:
 | Canvas frontend (CP-04) | Out of this task. `AGPilot0011` was not accessible to the GitHub App (404 on installation scope); no UI file was touched. |
 | Office export (DOCX/PDF/XLSX/PPTX) | Contract declared in `OFFICE_EXPORT_CONTRACT`, refused with `export_format_unsupported`. No conversion engine. |
 | Export into a workspace file | Out of scope; needs the Workspace owner's approval of a file-write API. |
-| Live Workspace provider | `RuntimeWorkspaceProvider` is implemented but never exercised against a merged `feat/r2-workspace-rag`; only the dev provider is tested. |
+| Live Workspace provider | `RuntimeWorkspaceProvider` is implemented but never exercised against a merged `feat/r2-workspace-rag`; only the dev provider is tested. The WO-C17 revocation tests use the dev provider's `set_level()`, so the *live* revocation path (real provider answering `none`) is still unverified. |
+| Generation session expiry / storage quota | P2 backlog — see §16.8 (C-FIX-07). |
 | Tool exposure to a live model | Tools dispatch through `ToolDispatcher` in tests, but no real LLM tool-calling run was made; no shipped profile lists `canvas.*`. |
 | Production deployment / migration | Not attempted. No server, systemd unit, reverse-proxy rule or production DB change. |
 | Load/performance and multi-process concurrency | Only SQLite `BEGIN IMMEDIATE` + busy timeout is exercised; no load test, no multi-worker run. |
@@ -603,8 +659,8 @@ Test-isolation notes:
    The Canvas router is not gated by the tool flag: the HTTP API can be present while the model
    cannot see the tools. To hide the API too, condition this include on the same flag.
 
-3. **Tool exposure to the model** — after registration, add the eight names to the service's tool
-   profile (`app/tools/policy.py` `DEFAULT_POLICY["profiles"][…]["tools"]` or the runtime
+3. **Tool exposure to the model** — after registration, add the seven AI-exposed names to the
+   service's tool profile (`app/tools/policy.py` `DEFAULT_POLICY["profiles"][…]["tools"]` or the runtime
    `tool_policy.json`). Only then do `get_definitions(service)` / the agent runner offer them.
    No `app/runtime/` file needs a change: the runner already asks the registry for definitions and
    the dispatcher resolves `canvas.*` handlers from the same registry.
@@ -662,3 +718,134 @@ was not performed.
    environment.
 6. Plan production storage (dedicated DB + blob volume, backup pair, blob GC) before the first
    real deployment.
+
+---
+
+## 16. WO-C17 — Canvas Backend Correction
+
+Scope of this work order: `C-FIX-01` … `C-FIX-06` implemented and verified, `C-FIX-07` registered as
+backlog. The 219-test evidence from CP-06 is taken as-is; no architecture was redesigned, no R1.3
+runtime file, no Workspace/RAG-owned file, no `main` merge and no deployment is part of it.
+
+### 16.1 What changed
+
+| Item | Defect | Correction | Evidence |
+| --- | --- | --- | --- |
+| **C-FIX-01** workspace write permission | A `read` grant was enough to create an artifact *into* a workspace and to link one | `WorkspaceAccess` splits `read` (`read\|write\|admin`) from `write` (`write\|admin`); create-into-workspace, link, rename, delete, patch, restore and proposal writes require `write` | `test_cfix01_*` (403 with `required_level: "write"`, no artifact / no link written) |
+| **C-FIX-02** access revocation | A workspace grant checked once at link time was never re-checked; revoked users kept reading/editing | `assert_workspace_level()` is called on every path that touches a workspace-linked artifact, with the *current* level; `list` drops revoked artifacts and reports the exclusions | `test_cfix02_*` (14 paths → 403, list exclusion, 503 when the provider is down, detach still allowed) |
+| **C-FIX-03** proposal transaction | Revision insert and proposal status were two transactions, so a duplicate/concurrent apply could double-write or the proposal could stay `proposed` after a revision landed | `SqliteCanvasStorage.apply_proposal()` does status check → patch → status flip in one `BEGIN IMMEDIATE`; 409 for already-applied / rejected; stale committed then raised | `test_cfix03_*` (concurrent apply → one revision, rollback on storage failure, stale status persisted) |
+| **C-FIX-04** revision retention | At `max_revisions` every edit failed with `409 revision_limit_reached` — an autosave history bricked the artifact | At the cap, the oldest unprotected revision is pruned inside the same transaction and recorded in `canvas_revision_prunes`; current + newest window + proposal-referenced revisions are kept, baseline dropped last | `test_cfix04_*` (12 autosaves on a cap of 4, proposal-referenced row survives) |
+| **C-FIX-05** feature isolation | Canvas merged into an operating service with the API live and dev adapters on by default | `AGCORE_CANVAS_ENABLED` defaults **false** (503 `canvas_disabled`), `AGCORE_CANVAS_DEV_PREVIEW` is a separate off-by-default switch, production forces dev adapters off | `test_cfix05_*`, smoke run |
+| **C-FIX-06** user approval boundary | `canvas.apply_edit` (a model tool call) applied a proposal directly | Apply needs a `UserApproval` built from an interactive scope **and** an explicit `user_approved: true`; `canvas.apply_edit` is withheld from the AI-exposed set and refuses with `403 user_approval_required` | `test_cfix06_*` |
+| **C-FIX-07** generation session expiry / storage quota | Not implemented (see 16.8) | Registered as P2 backlog | this section |
+
+### 16.2 Workspace permission contract (Canvas side)
+
+| Operation | Required workspace level |
+| --- | --- |
+| `list`, `get`, content/revision read, `diff`, `preview`, `export`, proposal get/list | `read` (read · write · admin) |
+| create with `workspace_id`, link to a workspace, rename, delete, patch, patch preview, restore, proposal create/apply/reject | `write` (write · admin) |
+| `DELETE /links/workspace` (detach) | none — owner scope only, the documented way out of a revoked workspace |
+| Access provider error | `503 workspace_unavailable` (never a stale allow) |
+
+A revoked level makes the artifact invisible and immutable immediately; it is **not** deleted, and
+the owner can detach it to regain local access. Artifact ids from another scope still answer `404`,
+so the 403 only ever describes an artifact the caller already owns.
+
+### 16.3 Proposal apply — state and concurrency
+
+```
+proposed --apply(user approval)--> applied   (one transaction: revision + status)
+proposed --rejected-------------> rejected  (409 on any later apply)
+proposed --base revision moved--> stale     (committed; 409 proposal_stale)
+applied  --apply----------------> 409 proposal_already_applied
+```
+
+The apply request carries `user_approved: true`; the response echoes the recorded approval
+(`approval_id`, `approved_by`, `source: "user_action"`) and the `artifact.edit.applied` event data
+carries the same object, so the audit trail shows *who* approved, not just that a revision appeared.
+
+### 16.4 Revision retention
+
+* Policy: `prune_oldest_unprotected`, evaluated inside the write transaction.
+* Always kept: the current revision, the newest `min_retained_revisions` (default 20, clamped to
+  `max_revisions - 1`), revisions referenced by a proposal (`applied_revision`, or `base_revision`
+  while the proposal is `proposed`/`stale`).
+* Dropped first: oldest rows outside that window — the baseline (revision 1) is only dropped when it
+  is the last candidate.
+* Each removal is recorded in `canvas_revision_prunes` (revision, content hash, timestamp, reason
+  `retention_cap` / `retention_cap_forced`) and surfaced as
+  `limits.revision_retention.pruned_total` with `editing_blocked_at_limit: false`.
+* `409 revision_limit_reached` now exists only for the pathological case where every stored revision
+  is protected; normal editing and autosave never hit it.
+* Blob garbage collection is still out of scope — pruned blob files remain (16.8).
+
+### 16.5 Feature isolation and Dev Preview settings
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `AGCORE_CANVAS_ENABLED` | `false` | Whole router + service + tools answer `503 canvas_disabled` / refuse. Merging the branch activates nothing. |
+| `AGCORE_CANVAS_DEV_PREVIEW` | `false` | Dev workspace provider, deterministic dev edit adapter, simulated `POST /generations`. Forced `false` under `AGCORE_ENV=production`. |
+| `AGCORE_CANVAS_DEV_ADAPTERS` | (implied true) | Second gate on the dev adapters; can only shrink the surface. |
+| `AGCORE_CANVAS_TOOLS_ENABLED` | unset (off) | Tool registration, independent of the API flag. |
+| `AGCORE_CANVAS_WORKSPACE_PROVIDER` | `dev` | `dev` \| `workspace` \| `unavailable`; production rewrites `dev` → `workspace`. |
+| `AGCORE_CANVAS_AI_ADAPTER` | `dev` | `dev` \| `runtime`; production rewrites `dev` → `runtime`. |
+
+Activation sequence for a preview: `AGCORE_CANVAS_ENABLED=true` **and**
+`AGCORE_CANVAS_DEV_PREVIEW=true` (plus `AGCORE_CANVAS_TOOLS_ENABLED=1` only if the model should see
+the tools). `/capabilities.feature_isolation` reports all of this, including
+`auto_activation: false`, so a deployment can be audited without guessing.
+
+### 16.6 User approval boundary
+
+* Approvable roles: `user`, `owner`, `admin`, `admiral` (a human principal) **with**
+  `user_approved: true` in the request body.
+* Refused: `service`, `tool`, `ai`, `assistant`, `automation`, `system`, `guest` — even when they
+  hold the owner scope, and even with the flag set.
+* `canvas.apply_edit` never receives an approval object: the tool dispatcher has no approval channel,
+  so the call returns `403 user_approval_required` and no revision is written. The tool is also left
+  out of `AI_EXPOSED_TOOL_NAMES`, so with `AGCORE_CANVAS_TOOLS_ENABLED=1` the model sees seven tools,
+  not eight. `manifest().approval_boundary` states this for the frontend and the tool admin UI.
+* Until R1.3 defines its own approval channel, the model can propose (`canvas.propose_edit`) but the
+  user applies from the UI — which is the intended product behaviour, now enforced by the backend.
+
+### 16.7 New / changed error codes
+
+| Code | HTTP | Raised when |
+| --- | --- | --- |
+| `canvas_disabled` | 503 | `AGCORE_CANVAS_ENABLED` is off |
+| `user_approval_required` | 403 | apply without a verified user approval (or a machine role) |
+| `proposal_already_applied` | 409 | second apply of an applied proposal |
+| `proposal_rejected` | 409 | apply of a rejected proposal |
+| `workspace_access_denied` | 403 | current level is below the required level (`context.required_level`, `context.level`) |
+| `workspace_unavailable` | 503 | the workspace provider is down or unconfigured |
+
+### 16.8 C-FIX-07 — Backlog (P2, deliberately not implemented)
+
+| Item | Priority | Detail | Why deferred |
+| --- | --- | --- | --- |
+| Generation session expiry | P2 | `GenerationService._sessions` keeps every completed/aborted session in process memory for idempotent replay; there is no TTL, so a long-lived process accumulates session frames (each holds the accumulated chunks). Need: idle TTL + max sessions + eviction that keeps the idempotency key result readable from storage instead of memory. | Requires a decision on replay semantics after eviction (replay from `canvas_events` vs 409 `session_expired`), which belongs to the R1.3 generation integration. |
+| Generation storage quota | P2 | No per-scope/per-artifact generation quota or total-bytes accounting; only `max_content_bytes` per artifact and `max_revisions` per artifact exist. Need: scope-level byte/piece quota, a rejection code, and an operator-visible usage report. | Quota limits are a product/ops decision (who is limited, what happens at the cap) and would otherwise bake a guess into the store. |
+| Blob garbage collection | P2 | Pruned revisions and purged artifacts leave content-addressed blobs on disk (`data/canvas/blobs`) because blobs are shared. Need: reference scan + GC job. | Safe GC needs a full-store pass and a scheduling owner; deleting blobs from a request path would risk another artifact's content. |
+| List scan ceiling | P3 | A scope with many workspace-linked artifacts and revoked access scans up to `AGCORE_CANVAS_MAX_LIST_SCAN` rows per page and reports `total_exact: false` beyond that. | Acceptable at current scale; a proper fix is a per-scope workspace visibility index owned by the Workspace side. |
+
+### 16.9 Changed files (WO-C17)
+
+| File | Change |
+| --- | --- |
+| `app/canvas/approval.py` | new — approval contract + policy |
+| `app/canvas/config.py` | feature flag default off, dev preview, retention window, activation report |
+| `app/canvas/workspace.py` | read/write levels, `set_level` for the dev provider, write-gated reference registration |
+| `app/canvas/manager.py` | `owned_artifact`, workspace-aware `visible_artifact`, write-gated create/link/rename/delete/patch, list filtering, retention report |
+| `app/canvas/revisions.py` | workspace gateway in revision/patch managers, read/write requirements |
+| `app/canvas/editing.py` | workspace-aware proposal lifecycle, approval-gated atomic apply |
+| `app/canvas/storage.py` | schema v2 (`canvas_revision_prunes`), `_apply_patch_conn`, `apply_proposal`, retention pruning, `count_artifacts` |
+| `app/canvas/events.py` | dev-preview gate for generation, fail-fast workspace write check at stream start |
+| `app/canvas/service.py` | feature gate, wiring, capabilities (`feature_isolation`, `revision_retention`, `approval`) |
+| `app/canvas/tools.py` | approval gate on `canvas.apply_edit`, AI-exposed subset, manifest boundary |
+| `app/canvas/errors.py`, `models.py` | new codes, page exclusion fields |
+| `app/api/canvas.py` | `require_canvas_enabled` dependency, approval body on apply |
+| `tests/r2_canvas_support.py`, `tests/test_r2_canvas_{ai,foundation}.py`, `tests/test_r2_canvas_correction.py` | flag-aware fixtures, corrected expectations, 18 new tests |
+
+No file under `app/runtime/`, `app/runtime/policy/`, `app/gateway/`, `app/adapters/`,
+`app/workspace/` or `app/tools/{registry,policy}.py` is modified by WO-C17.
