@@ -297,15 +297,18 @@ async def create_artifact(
     change_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
+        from app.core.auth import current_run_conversation_id
+
         scope = _scope_or_error()
         service = _service()
+        resolved_conv_id = conversation_id or current_run_conversation_id.get()
         artifact, revision, duplicate, meta = service.manager.create(
             scope,
             title=title,
             artifact_type=artifact_type,
             content=content,
             language=language,
-            conversation_id=conversation_id,
+            conversation_id=resolved_conv_id,
             workspace_id=workspace_id,
             creation_source="tool",
             change_reason=change_reason or "created by canvas.create_artifact",
@@ -339,10 +342,13 @@ async def list_artifacts(
     offset: int = 0,
 ) -> Dict[str, Any]:
     try:
+        from app.core.auth import current_run_conversation_id
+
         scope = _scope_or_error()
+        resolved_conv_id = conversation_id or current_run_conversation_id.get()
         page = _service().manager.list(
             scope,
-            conversation_id=conversation_id,
+            conversation_id=resolved_conv_id,
             workspace_id=workspace_id,
             artifact_type=artifact_type,
             limit=limit,
@@ -516,7 +522,10 @@ async def load_from_workspace(
 ) -> Dict[str, Any]:
     """Open an existing workspace file as a Canvas editing session (external reference)."""
     try:
+        from app.core.auth import current_run_conversation_id
+
         scope = _scope_or_error()
+        resolved_conv_id = conversation_id or current_run_conversation_id.get()
         return _service().manager.load_from_workspace(
             scope,
             workspace_id=workspace_id,
@@ -525,7 +534,7 @@ async def load_from_workspace(
             title=title,
             artifact_type=artifact_type,
             language=language,
-            conversation_id=conversation_id,
+            conversation_id=resolved_conv_id,
             force=force,
         )
     except CanvasError as exc:

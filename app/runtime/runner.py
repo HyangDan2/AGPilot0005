@@ -295,6 +295,7 @@ class AgentRunner:
             initial_state = AgentState(
                 run_id=run_id,
                 session_id=req.session_id,
+                conversation_id=(req.conversation_id or "").strip() or None,
                 service_id=service_id,
                 owner_id=owner_id,
                 tenant_id=tenant_id,

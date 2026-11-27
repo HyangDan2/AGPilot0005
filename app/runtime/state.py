@@ -7,6 +7,7 @@ from app.schemas.gateway import GatewayMessage, ToolCall
 class AgentState(BaseModel):
     run_id: str
     session_id: Optional[str] = None
+    conversation_id: Optional[str] = None
     service_id: Optional[str] = None
     owner_id: str = "default_user"
     tenant_id: str = "default_tenant"

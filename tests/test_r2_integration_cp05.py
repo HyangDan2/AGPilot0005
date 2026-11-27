@@ -1002,3 +1002,59 @@ async def test_r2_int_fix_03_mock_and_preview_blocked_in_production(monkeypatch)
         r_mock = await client.get("/_mock/workspaces")
         assert r_mock.status_code == 403
         assert r_mock.json()["detail"]["code"] == "preview_disabled_in_production"
+
+
+# ---------------------------------------------------------------------------
+# R2-BETA-HOTFIX-02-BE: AgentRunRequest.conversation_id -> Canvas Tool Auto-Bind
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_r2_beta_hotfix_02_conversation_id_propagates_to_canvas_artifact(monkeypatch, tmp_path):
+    gw = ScriptedGateway(
+        [
+            {
+                "content": None,
+                "tool_calls": [
+                    ToolCall(
+                        id="tc_conv_art",
+                        function=FunctionCall(
+                            name="canvas.create_artifact",
+                            arguments=json.dumps(
+                                {
+                                    "title": "Conversation Bound Artifact",
+                                    "artifact_type": "markdown",
+                                    "content": "# Auto-bound\nLinked to conversation_id.\n",
+                                }
+                            ),
+                        ),
+                    )
+                ],
+            },
+            {"content": "대화에 연결된 아티팩트를 생성했습니다."},
+        ]
+    )
+    _setup_r2_env(monkeypatch, tmp_path, gw)
+    hdr = _proxy_headers()
+    conv_id = "conv-beta-hf02-001"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        rs = await client.post(
+            "/api/v1/agent/runs",
+            json={
+                "message": "아티팩트 만들어줘",
+                "conversation_id": conv_id,
+                "stream": True,
+            },
+            headers=hdr,
+        )
+        assert rs.status_code == 200
+        events = _parse_sse(rs.text)
+        art_ev = next(e for e in events if e["event"] == "artifact.created")
+        created_id = art_ev["data"]["artifact_id"]
+
+        # Verify GET /api/v1/canvas/artifacts?conversation_id=<conv_id> returns the created artifact
+        rl = await client.get(f"/api/v1/canvas/artifacts?conversation_id={conv_id}", headers=hdr)
+        assert rl.status_code == 200, rl.text
+        items = rl.json()["items"]
+        assert len(items) == 1
+        assert items[0]["artifact_id"] == created_id
+        assert items[0]["conversation_id"] == conv_id

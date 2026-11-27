@@ -35,6 +35,7 @@ def validate_scope_identifier(value: str, field_name: str) -> str:
 
 current_execution_scope: ContextVar[Optional["ExecutionScope"]] = ContextVar("current_execution_scope", default=None)
 current_run_approvals: ContextVar[FrozenSet[str]] = ContextVar("current_run_approvals", default=frozenset())
+current_run_conversation_id: ContextVar[Optional[str]] = ContextVar("current_run_conversation_id", default=None)
 
 
 def has_user_approval(

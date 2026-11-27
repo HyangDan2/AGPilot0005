@@ -258,13 +258,14 @@ async def tool_node(
     )
     if per_tool_budget is not None:
         per_tool_budget = min(int(per_tool_budget), remaining_input_tokens // max(1, len(calls)))
-    from app.core.auth import current_execution_scope, current_run_approvals
+    from app.core.auth import current_execution_scope, current_run_approvals, current_run_conversation_id
 
     owner_token = document_owner_id.set(state.owner_id)
     budget_token = tool_token_budget.set(per_tool_budget)
-    # CR-02 & R2-INT-FIX-03-BE: Propagate verified ExecutionScope & server-side user approvals
+    # CR-02, R2-INT-FIX-03-BE & R2-BETA-HOTFIX-02-BE: Propagate verified scope, approvals & conversation_id
     scope_token = current_execution_scope.set(state.execution_scope) if state.execution_scope is not None else None
     approvals_token = current_run_approvals.set(frozenset(state.approvals or ()))
+    conv_token = current_run_conversation_id.set(state.conversation_id)
     try:
         results = await dispatcher.execute_batch(
             calls=calls,
@@ -277,6 +278,7 @@ async def tool_node(
             constraints=constraints,
         )
     finally:
+        current_run_conversation_id.reset(conv_token)
         current_run_approvals.reset(approvals_token)
         if scope_token is not None:
             current_execution_scope.reset(scope_token)

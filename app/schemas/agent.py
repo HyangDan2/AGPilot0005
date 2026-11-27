@@ -13,6 +13,7 @@ class AgentRunRequest(BaseModel):
     agent_id: str = "general-agent"
     message: str
     session_id: Optional[str] = None
+    conversation_id: Optional[str] = Field(default=None, max_length=128)
     context_refs: List[str] = Field(default_factory=list)
     stream: bool = False
     options: Optional[AgentRunOptions] = None
