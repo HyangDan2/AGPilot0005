@@ -1,16 +1,25 @@
 /**
- * AGCore R2-W — Workspace Shared Contract (client types, contract r2-w/v1)
+ * AGCore R2-W — Workspace Shared Contract (client types, contract r2-w/v1+a01)
  *
  * Mirror of `docs/r2/WORKSPACE_CONTRACT.md` and `app/workspace/contracts.py`.
  * Canonical copy lives in AGPilot0005 `clients/workspace-contract.ts`; the frontend copy is
  * AGPilot0011 `hd2ai-shared/workspace-contract.ts` (byte-identical).
  *
+ * Amendment 01 (folder-based workspace) is additive: every v1 field/operation keeps its
+ * meaning, and every Amendment 01 member is optional for a v1 consumer.
+ *
  * Canvas Engineer: build against `WorkspaceProvider` + `createMockWorkspaceProvider()`.
  */
 
 export const WORKSPACE_CONTRACT_VERSION = 'r2-w/v1';
+export const WORKSPACE_CONTRACT_AMENDMENT = 'A01';
+export const WORKSPACE_CONTRACT_REVISION = 'r2-w/v1+a01';
 
 export type WorkspaceStatus = 'active' | 'archived' | 'deleted';
+export type WorkspaceLifecycleState = 'open' | 'closed' | 'deleted';
+export type WorkspaceStorageProvider = 'server_managed' | 'server_mounted_folder' | 'local_browser';
+export type ContentOrigin = 'blob' | 'external';
+export type RootStatus = 'available' | 'missing' | 'not_allowed' | 'metadata_overlap';
 export type AccessLevel = 'read' | 'write' | 'admin' | 'none';
 export type FileKind = 'file' | 'folder';
 export type IndexState = 'PENDING' | 'INDEXING' | 'READY' | 'FAILED' | 'STALE' | 'CANCELLED';
@@ -20,6 +29,16 @@ export type ContextStatus = 'ok' | 'insufficient_documents' | 'empty_workspace';
 
 export type WorkspaceErrorCode =
   | 'workspace_not_found'
+  | 'workspace_closed'
+  | 'read_only_workspace'
+  | 'path_outside_allowed_root'
+  | 'symlink_escape'
+  | 'root_unavailable'
+  | 'provider_mismatch'
+  | 'content_conflict'
+  | 'source_delete_not_permitted'
+  | 'metadata_overlap'
+  | 'watch_unavailable'
   | 'file_not_found'
   | 'file_exists'
   | 'revision_conflict'
@@ -39,6 +58,38 @@ export interface WorkspaceError {
   context?: Record<string, unknown>;
 }
 
+export interface WorkspaceRootInfo {
+  storage_provider: WorkspaceStorageProvider;
+  root_id: string | null;
+  display_path: string;
+  allowed_root_id: string | null;
+  read_only: boolean;
+  zero_copy: boolean;
+  /** False for `local_browser`: the server never receives a server-side path. */
+  server_side_path_access: boolean;
+  client_handle_id: string | null;
+  opened_at: string | null;
+  status: RootStatus;
+}
+
+export interface AllowedRootInfo {
+  root_id: string;
+  display_path: string;
+  storage_provider: WorkspaceStorageProvider;
+  writable: boolean;
+  scope: string;
+  is_default: boolean;
+}
+
+export interface IndexStorageInfo {
+  separate_from_workspace_root: boolean;
+  metadata_store: string;
+  metadata_location_ref: string;
+  chunk_index_location_ref: string;
+  vector_index_location_ref: string;
+  inside_workspace_root: boolean;
+}
+
 export interface WorkspaceIdentity {
   workspace_id: string;
   tenant_id: string;
@@ -50,6 +101,10 @@ export interface WorkspaceIdentity {
   revision: number;
   created_at: string;
   updated_at: string;
+  /** Amendment 01 */
+  lifecycle_state?: WorkspaceLifecycleState;
+  root?: WorkspaceRootInfo;
+  closed_at?: string | null;
 }
 
 export interface FileIdentity {
@@ -66,6 +121,11 @@ export interface FileIdentity {
   index_status: IndexState | null;
   created_at: string;
   updated_at: string;
+  /** Amendment 01 */
+  storage_provider?: WorkspaceStorageProvider;
+  content_origin?: ContentOrigin;
+  relative_path?: string | null;
+  synced_at?: string | null;
 }
 
 export interface AccessResult {
@@ -212,6 +272,128 @@ export interface ArtifactReferenceInput {
   metadata?: Record<string, unknown>;
 }
 
+// ---------------------------------------------------------------------------------------
+// Amendment 01 — folder-based workspace lifecycle, root, write and sync
+// ---------------------------------------------------------------------------------------
+
+export interface FolderOpenRequest {
+  path: string;
+  name?: string;
+  read_only?: boolean;
+  root_id?: string;
+}
+
+export interface NewWorkspaceRequest {
+  name: string;
+  description?: string;
+  parent_path?: string;
+  root_id?: string;
+}
+
+export interface LocalBrowserEntry {
+  path: string;
+  kind?: FileKind;
+  size_bytes?: number;
+  content_hash?: string | null;
+  text?: string | null;
+  mime_type?: string | null;
+}
+
+export interface LocalBrowserWorkspaceRequest {
+  name: string;
+  description?: string;
+  client_handle_id: string;
+  display_path?: string;
+  read_only?: boolean;
+  entries?: LocalBrowserEntry[];
+}
+
+export interface WorkspaceCloseRequest {
+  reason?: string;
+}
+
+export interface WorkspaceDisconnectRequest {
+  /** Default false: disconnecting never deletes the real folder. */
+  delete_source_files?: boolean;
+  confirm?: boolean;
+}
+
+export interface WorkspaceWriteRequest {
+  path: string;
+  content?: string;
+  content_base64?: string;
+  mime_type?: string;
+  expected_content_hash?: string;
+  create_parents?: boolean;
+  overwrite?: boolean;
+}
+
+export interface ClientWriteDirective {
+  required: boolean;
+  client_handle_id: string | null;
+  relative_path: string;
+  reason: string;
+}
+
+export interface WorkspaceWriteResult {
+  workspace_id: string;
+  path: string;
+  file: FileIdentity | null;
+  revision: number;
+  content_hash: string | null;
+  written_bytes: number;
+  storage_provider: WorkspaceStorageProvider;
+  content_origin: ContentOrigin;
+  /** Set for `local_browser`: the browser must perform the write through its handle. */
+  client_write: ClientWriteDirective | null;
+}
+
+export interface WorkspaceSyncResult {
+  workspace_id: string;
+  full: boolean;
+  scanned: number;
+  created: number;
+  modified: number;
+  moved: number;
+  deleted: number;
+  unchanged: number;
+  errors: Array<Record<string, unknown>>;
+  started_at: string;
+  finished_at: string;
+}
+
+export interface WorkspaceWatchStatus {
+  workspace_id: string;
+  watching: boolean;
+  storage_provider: WorkspaceStorageProvider;
+  interval_seconds: number;
+  last_scan_at: string | null;
+  last_change_at: string | null;
+  changes_total: number;
+  last_error: string | null;
+}
+
+/**
+ * Validate and normalize a workspace-relative path (the same gate the server applies).
+ * Rejects absolute paths, drive letters, backslashes, control characters and `.`/`..`.
+ */
+export function validateRelativePath(path: string): string {
+  if (typeof path !== 'string') throw { code: 'invalid_path', message: 'path must be a string' };
+  const raw = path;
+  if (!raw.trim()) throw { code: 'invalid_path', message: 'empty path' };
+  if (/[\u0000-\u001f\u007f]/.test(raw)) throw { code: 'invalid_path', message: 'control characters rejected' };
+  if (raw.includes('\\')) throw { code: 'invalid_path', message: 'backslash rejected' };
+  if (raw.startsWith('/') || raw.startsWith('~')) throw { code: 'invalid_path', message: 'absolute path rejected' };
+  if (raw.length > 1024) throw { code: 'invalid_path', message: 'path too long' };
+  if (/^[A-Za-z]:/.test(raw)) throw { code: 'invalid_path', message: 'drive letter rejected' };
+  const parts = raw.split('/');
+  for (const part of parts) {
+    if (!part || part === '.' || part === '..') throw { code: 'invalid_path', message: `invalid segment: ${part}` };
+    if (part.length > 255) throw { code: 'invalid_path', message: 'path segment too long' };
+  }
+  return parts.join('/');
+}
+
 /** Structural view of the verified server-side scope; clients never send tenant/owner. */
 export interface ScopeView {
   tenant_id: string;
@@ -235,6 +417,14 @@ export interface WorkspaceProvider {
   ): Promise<FileIdentity>;
   registerArtifactReference(workspaceId: string, ref: ArtifactReferenceInput): Promise<ArtifactReference>;
   listArtifactReferences(workspaceId: string, kind?: string): Promise<ArtifactReference[]>;
+  // Amendment 01 (optional for v1 consumers)
+  openFolder?(request: FolderOpenRequest): Promise<WorkspaceIdentity>;
+  newWorkspace?(request: NewWorkspaceRequest): Promise<WorkspaceIdentity>;
+  closeWorkspace?(workspaceId: string, reason?: string): Promise<WorkspaceIdentity>;
+  reopenWorkspace?(workspaceId: string): Promise<WorkspaceIdentity>;
+  disconnectWorkspace?(workspaceId: string, deleteSourceFiles?: boolean): Promise<Record<string, unknown>>;
+  writeFile?(workspaceId: string, request: WorkspaceWriteRequest): Promise<WorkspaceWriteResult>;
+  syncWorkspace?(workspaceId: string, full?: boolean): Promise<WorkspaceSyncResult>;
 }
 
 /** REST paths for the shared API contract (§3). `{…}` are path parameters. */
@@ -242,8 +432,19 @@ export const WORKSPACE_API = {
   base: '/api/v1/workspaces',
   list: '/api/v1/workspaces',
   create: '/api/v1/workspaces',
+  openFolder: '/api/v1/workspaces/open-folder',
+  newWorkspace: '/api/v1/workspaces/new',
+  localBrowser: '/api/v1/workspaces/local-browser',
+  allowedRoots: '/api/v1/workspaces/allowed-roots',
   detail: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}`,
   access: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/access`,
+  root: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/root`,
+  close: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/close`,
+  reopen: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/reopen`,
+  disconnect: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/disconnect`,
+  sync: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/sync`,
+  watch: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/watch`,
+  writeFile: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/file`,
   files: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/files`,
   folders: (workspaceId: string) => `/api/v1/workspaces/${workspaceId}/folders`,
   file: (workspaceId: string, fileId: string) => `/api/v1/workspaces/${workspaceId}/files/${fileId}`,
@@ -277,6 +478,16 @@ export function isWorkspaceError(value: unknown): value is WorkspaceError {
 
 export const ERROR_HTTP_STATUS: Record<WorkspaceErrorCode, number> = {
   workspace_not_found: 404,
+  workspace_closed: 409,
+  read_only_workspace: 403,
+  path_outside_allowed_root: 403,
+  symlink_escape: 400,
+  root_unavailable: 409,
+  provider_mismatch: 400,
+  content_conflict: 409,
+  source_delete_not_permitted: 403,
+  metadata_overlap: 400,
+  watch_unavailable: 409,
   file_not_found: 404,
   file_exists: 409,
   revision_conflict: 409,
@@ -296,9 +507,43 @@ export const ERROR_HTTP_STATUS: Record<WorkspaceErrorCode, number> = {
  */
 export interface MockWorkspaceProvider extends WorkspaceProvider {
   /** Seed a workspace owned by the mock scope (not part of the provider contract). */
-  seedWorkspace(name?: string): WorkspaceIdentity;
+  seedWorkspace(
+    name?: string,
+    storageProvider?: WorkspaceStorageProvider,
+    displayPath?: string,
+    readOnly?: boolean,
+  ): WorkspaceIdentity;
   /** Seed a text file inside a mock workspace (not part of the provider contract). */
   seedFile(workspaceId: string, name: string, content: string, parentId?: string | null): FileIdentity;
+  // Amendment 01 is required on the mock so Canvas can build the full folder lifecycle.
+  openFolder(request: FolderOpenRequest): Promise<WorkspaceIdentity>;
+  newWorkspace(request: NewWorkspaceRequest): Promise<WorkspaceIdentity>;
+  closeWorkspace(workspaceId: string, reason?: string): Promise<WorkspaceIdentity>;
+  reopenWorkspace(workspaceId: string): Promise<WorkspaceIdentity>;
+  disconnectWorkspace(workspaceId: string, deleteSourceFiles?: boolean): Promise<Record<string, unknown>>;
+  writeFile(workspaceId: string, request: WorkspaceWriteRequest): Promise<WorkspaceWriteResult>;
+  syncWorkspace(workspaceId: string, full?: boolean): Promise<WorkspaceSyncResult>;
+}
+
+function mockRoot(
+  provider: WorkspaceStorageProvider,
+  displayPath: string,
+  readOnly: boolean,
+  stamp: string,
+): WorkspaceRootInfo {
+  const zeroCopy = provider !== 'server_managed';
+  return {
+    storage_provider: provider,
+    root_id: null,
+    display_path: displayPath,
+    allowed_root_id: null,
+    read_only: readOnly,
+    zero_copy: zeroCopy,
+    server_side_path_access: provider !== 'local_browser',
+    client_handle_id: provider === 'local_browser' ? 'mock-handle' : null,
+    opened_at: stamp,
+    status: 'available',
+  };
 }
 
 export function createMockWorkspaceProvider(
@@ -319,7 +564,7 @@ export function createMockWorkspaceProvider(
   };
 
   const provider: MockWorkspaceProvider = {
-    seedWorkspace(name = 'Mock workspace') {
+    seedWorkspace(name = 'Mock workspace', storageProvider = 'server_managed', displayPath = '', readOnly = false) {
       const stamp = now();
       const ws: WorkspaceIdentity = {
         workspace_id: id('ws'),
@@ -332,9 +577,132 @@ export function createMockWorkspaceProvider(
         revision: 1,
         created_at: stamp,
         updated_at: stamp,
+        lifecycle_state: 'open',
+        root: mockRoot(storageProvider, displayPath, readOnly, stamp),
+        closed_at: null,
       };
       workspaces.set(ws.workspace_id, ws);
       return { ...ws };
+    },
+    async openFolder(request) {
+      if (!request.path) throw { code: 'invalid_path', message: 'path required' } satisfies WorkspaceError;
+      return this.seedWorkspace(
+        request.name || 'Mock folder workspace',
+        'server_mounted_folder',
+        request.path,
+        Boolean(request.read_only),
+      );
+    },
+    async newWorkspace(request) {
+      const ws = this.seedWorkspace(
+        request.name,
+        'server_managed',
+        `${request.parent_path || '/mock/workspaces'}/${request.name}`,
+      );
+      const withRoot: WorkspaceIdentity = {
+        ...ws,
+        description: request.description ?? '',
+        root: ws.root ? { ...ws.root, zero_copy: true, root_id: request.root_id ?? null } : ws.root,
+      };
+      workspaces.set(ws.workspace_id, withRoot);
+      return { ...withRoot };
+    },
+    async closeWorkspace(workspaceId, reason = '') {
+      const ws = ensure(workspaceId);
+      const stamp = now();
+      const updated: WorkspaceIdentity = {
+        ...ws,
+        lifecycle_state: 'closed',
+        revision: ws.revision + 1,
+        updated_at: stamp,
+        closed_at: stamp,
+      };
+      workspaces.set(workspaceId, updated);
+      void reason;
+      return { ...updated };
+    },
+    async reopenWorkspace(workspaceId) {
+      const ws = workspaces.get(workspaceId);
+      if (!ws || ws.status === 'deleted') {
+        throw { code: 'workspace_not_found', message: 'workspace not found' } satisfies WorkspaceError;
+      }
+      const stamp = now();
+      const updated: WorkspaceIdentity = {
+        ...ws,
+        lifecycle_state: 'open',
+        revision: ws.revision + 1,
+        updated_at: stamp,
+        closed_at: null,
+      };
+      workspaces.set(workspaceId, updated);
+      return { ...updated };
+    },
+    async disconnectWorkspace(workspaceId, deleteSourceFiles = false) {
+      if (deleteSourceFiles) {
+        throw { code: 'source_delete_not_permitted', message: 'source deletion is not permitted' } satisfies WorkspaceError;
+      }
+      const ws = ensure(workspaceId);
+      const purgedFiles = [...files.values()].filter((f) => f.workspace_id === workspaceId).length;
+      for (const [fileId, file] of [...files.entries()]) {
+        if (file.workspace_id === workspaceId) files.delete(fileId);
+      }
+      workspaces.set(workspaceId, { ...ws, status: 'deleted', lifecycle_state: 'deleted', updated_at: now() });
+      return { workspace_id: workspaceId, lifecycle_state: 'deleted', purged_files: purgedFiles, source_files_deleted: false };
+    },
+    async writeFile(workspaceId, request) {
+      const ws = ensure(workspaceId);
+      if (ws.root?.read_only) {
+        throw { code: 'read_only_workspace', message: 'workspace is read-only' } satisfies WorkspaceError;
+      }
+      const relative = validateRelativePath(request.path);
+      if (ws.root?.storage_provider === 'local_browser') {
+        return {
+          workspace_id: workspaceId,
+          path: relative,
+          file: null,
+          revision: 0,
+          content_hash: null,
+          written_bytes: 0,
+          storage_provider: 'local_browser',
+          content_origin: 'external',
+          client_write: {
+            required: true,
+            client_handle_id: ws.root.client_handle_id ?? null,
+            relative_path: relative,
+            reason: 'local_browser_no_server_path_access',
+          },
+        };
+      }
+      const identity = await this.createFile(workspaceId, relative, request.content ?? '', null);
+      return {
+        workspace_id: workspaceId,
+        path: relative,
+        file: identity,
+        revision: identity.revision,
+        content_hash: identity.content_hash,
+        written_bytes: identity.size_bytes,
+        storage_provider: ws.root?.storage_provider ?? 'server_managed',
+        content_origin: ws.root?.zero_copy ? 'external' : 'blob',
+        client_write: null,
+      };
+    },
+    async syncWorkspace(workspaceId, full = false) {
+      ensure(workspaceId);
+      const stamp = now();
+      const total = [...files.values()].filter((f) => f.workspace_id === workspaceId && f.kind === 'file').length;
+      return {
+        workspace_id: workspaceId,
+        full,
+        scanned: total,
+        created: 0,
+        modified: 0,
+        moved: 0,
+        deleted: 0,
+        unchanged: total,
+        errors: [],
+        started_at: stamp,
+        finished_at: stamp,
+      };
     },
     seedFile(workspaceId, name, content, parentId = null) {
       ensure(workspaceId);
@@ -402,7 +770,10 @@ export function createMockWorkspaceProvider(
       };
     },
     async createFile(workspaceId, name, content, parentId = null, expectedRevision) {
-      ensure(workspaceId);
+      const ws = ensure(workspaceId);
+      if (ws.root?.read_only) {
+        throw { code: 'read_only_workspace', message: 'workspace is read-only' } satisfies WorkspaceError;
+      }
       const text = typeof content === 'string' ? content : '';
       const existing = [...files.values()].find(
         (f) => f.workspace_id === workspaceId && f.parent_id === parentId && f.name === name && f.kind === 'file',
@@ -436,6 +807,10 @@ export function createMockWorkspaceProvider(
         index_status: 'PENDING' as IndexState,
         created_at: stamp,
         updated_at: stamp,
+        storage_provider: ws.root?.storage_provider ?? 'server_managed',
+        content_origin: ws.root?.zero_copy ? ('external' as ContentOrigin) : ('blob' as ContentOrigin),
+        relative_path: parentId ? null : name,
+        synced_at: null,
         content: text,
       };
       files.set(file.file_id, file);

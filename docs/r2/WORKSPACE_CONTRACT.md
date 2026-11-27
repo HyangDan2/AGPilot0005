@@ -1,9 +1,15 @@
 # AGCore R2-W — Workspace Shared Contract
 
-Status: **FROZEN PREVIEW CONTRACT (R2-W, v1)**
+Status: **FROZEN PREVIEW CONTRACT (R2-W, v1) + Amendment 01 (folder-based workspace)**
+Contract revision: `r2-w/v1+a01` (`WORKSPACE_CONTRACT_REVISION`)
 Owner: Workspace/RAG Engineer (`feat/r2-workspace-rag`)
 Consumers: Canvas Engineer (`feat/r2-canvas`), HD2AI Frontend (`AGPilot0011`), Server-HQ Supervisor
 Baseline: AGCore **v1.2.0 (`0d2047f`)**, AGTools **`6d0f57f`**, HD2AI **`b4913d0`**
+
+Amendment 01 is **additive**. Every v1 type, operation, error code and field keeps its meaning;
+new members are optional for a v1 consumer. Sections §1–§9 are the frozen v1 contract, §A1 is
+Amendment 01 (folder-based workspace). The v1 operation name list (`provider_operations()`) stays
+frozen; Amendment 01 operations are listed by `provider_operations_a01()`.
 
 This document is the contract between the Workspace/RAG engine (AGPilot0005), the Canvas
 Artifact engine (parallel `feat/r2-canvas` branch) and the HD2AI frontend (AGPilot0011).
@@ -347,4 +353,181 @@ router inclusion in `app/main.py` (listed in the handover document), nothing els
 
 Breaking changes to this contract require a note to Server-HQ Supervisor and both engineers.
 Additive fields are allowed without a version bump. The contract revision is tracked in
-`WORKSPACE_CONTRACT_VERSION` (`app/workspace/contracts.py`).
+`WORKSPACE_CONTRACT_VERSION` (`app/workspace/contracts.py`); Amendment 01 is tracked separately in
+`WORKSPACE_CONTRACT_AMENDMENT` / `WORKSPACE_CONTRACT_REVISION`.
+
+---
+
+# Amendment 01 — Folder-Based Workspace
+
+A workspace is no longer only a logical upload space. It can be rooted in a **real folder**: an
+existing server folder mounted zero-copy, a folder the server creates and manages, or a folder the
+user picks in the browser. The work order's ten requirements map to §A1.1–§A1.10.
+
+## A1.1 Root and Storage Provider (§1, §7 of the work order)
+
+`WorkspaceIdentity.root` describes where the root lives:
+
+```json
+"root": {
+  "storage_provider": "server_mounted_folder",
+  "root_id": "lab-docs",
+  "display_path": "/srv/hd2lab/workspaces/lab-docs",
+  "allowed_root_id": "lab",
+  "read_only": false,
+  "zero_copy": true,
+  "server_side_path_access": true,
+  "client_handle_id": null,
+  "opened_at": "2026-11-27T02:41:09.004Z",
+  "status": "available"
+}
+```
+
+| `storage_provider` | Root | Content origin | Server path access |
+| --- | --- | --- | --- |
+| `server_managed` (no root folder) | v1 upload workspace | `blob` (content-addressed copy) | n/a |
+| `server_managed` (folder root) | folder the server created under an allowed root | `external` (zero-copy) | yes |
+| `server_mounted_folder` | existing server folder, mounted in place | `external` (zero-copy) | yes |
+| `local_browser` | folder picked in the browser (File System Access API) | `external` (browser-owned) | **no** |
+
+`FileIdentity` gains `storage_provider`, `content_origin` (`blob` \| `external`), `relative_path`
+(the real path inside the root, POSIX, no leading slash) and `synced_at`. `path` stays the display
+path of §1. For `content_origin: external` the bytes are read from the root in place; nothing is
+copied into the storage root.
+
+## A1.2 Lifecycle: Open / New / Close / Reopen
+
+`WorkspaceIdentity.lifecycle_state` ∈ `open` \| `closed` \| `deleted` (default `open`).
+
+| Operation | Effect |
+| --- | --- |
+| `Open Folder` | `POST /workspaces/open-folder` — mount an existing folder; scans it into the index |
+| `New Workspace` | `POST /workspaces/new` — create a real folder under an allowed root, then open it |
+| `Close` | `POST /workspaces/{id}/close` — watcher stops; reads, writes and indexing return `409 workspace_closed`; **all metadata, revisions and chunks are kept** |
+| `Reopen` | `POST /workspaces/{id}/reopen` — re-validates the root, rescans (catch-up) and returns to `open` |
+| `Disconnect` | `POST /workspaces/{id}/disconnect` (or `DELETE /workspaces/{id}`) — drops the binding and every metadata row; the real folder is untouched |
+
+`GET /workspaces/{id}/watch` returns `WorkspaceWatchStatus` (`watching`, `last_scan_at`,
+`last_change_at`, `changes_total`, `interval_seconds`). `POST /workspaces/{id}/sync` forces one
+watcher pass (`{full?:boolean}` → `WorkspaceSyncResult`).
+
+## A1.3 Zero-copy (§3)
+
+Opening an existing folder never copies file bodies. The engine stores only metadata, revisions
+(content hash + size per revision) and the RAG index. Quota limits for `external` content are file
+count / scanned byte limits, not storage bytes. Revisions of an `external` file keep their hash and
+size; older bodies are not retained because the file is the single source of truth.
+
+## A1.4 File watcher → incremental index (§4)
+
+The engine watches each open folder-backed workspace with a lightweight polling scanner
+(configurable interval, `AGCORE_WORKSPACE_WATCH_INTERVAL_SECONDS`, default 2s; no external watcher
+daemon is required). One pass detects create / modify / move / delete of files and folders and
+applies them through the existing revision and index lifecycle:
+
+* create → new `file.created`, `PENDING` index job
+* modify (content hash changed) → new `revision`, in-flight job `CANCELLED`, chunks dropped, `file.updated`, `PENDING`
+* move/rename (same hash, new path) → `file.moved`, index kept (no reindex)
+* delete → chunks/vectors removed, jobs cancelled, `file.deleted`
+* a folder move is expressed as the moves of its descendants
+
+Every applied change also appears in `GET /workspaces/{id}/events` as `filesystem.changed` with a
+payload `{change, path, file_id, revision}`. A scan that finds the revision's hash no longer matches
+the file cancels that index job (`stale_revision`) instead of indexing stale bytes.
+
+## A1.5 Canvas / Coding Agent common write contract (§5)
+
+`PUT /workspaces/{id}/file` with `WorkspaceWriteRequest` writes an output into the same workspace
+root, for every provider:
+
+```json
+{"path": "reports/summary.md", "content": "# …", "mime_type": "text/markdown",
+ "expected_content_hash": null, "create_parents": true, "overwrite": true}
+```
+
+Response `WorkspaceWriteResult`: `{workspace_id, path, file, revision, content_hash, written_bytes,
+storage_provider, content_origin, client_write}`.
+
+* Paths pass `validate_relative_path()` (absolute paths, `..`, `.`, drive letters, backslashes,
+  control characters and over-long segments rejected with `invalid_path`), then every component is
+  confined to the root (`path_outside_allowed_root`, `symlink_escape`).
+* Folder-backed providers write the real file (atomic temp + `os.replace`, `create_parents`),
+  record a new revision and enqueue indexing — the same call the Coding Agent uses.
+* `local_browser`: the server has no path access, so it returns `client_write` (a
+  `ClientWriteDirective` with `client_handle_id` and `relative_path`) and the browser performs the
+  write through its handle, then reports the result. Writes against a `read_only` root return
+  `403 read_only_workspace`.
+* `expected_content_hash` mismatch returns `409 content_conflict` and changes nothing, so two
+  agents writing the same file cannot silently overwrite each other.
+
+The shared helper also exists client-side: `validateRelativePath()` in the TS contract and
+`validate_relative_path()` in `contracts.py`.
+
+## A1.6 Disconnect vs. delete (§6)
+
+Disconnecting releases the workspace and keeps the user's files. Deleting real files is never part
+of disconnect and is **refused by default**: `POST /workspaces/{id}/disconnect` with
+`{delete_source_files: true}` returns `403 source_delete_not_permitted` unless the server operator
+enables `AGCORE_WORKSPACE_ALLOW_SOURCE_DELETE=true`, and even then the request must carry
+`confirm: true`. The UI shows disconnect and source deletion as two separate actions, and the
+default (and only enabled) action is disconnect.
+
+## A1.7 Allowed roots (§9)
+
+Server folder paths (`open_folder`, `new` with a `parent_path`) are only accepted inside a
+configured **allowed root** for that user scope:
+
+```
+AGCORE_WORKSPACE_ALLOWED_ROOTS="lab:/srv/hd2lab/workspaces:owner,shared:/srv/hd2lab/shared:tenant"
+```
+
+Format: `root_id:absolute_path:scope` (`owner` \| `tenant` \| `global`); a fourth `:ro` suffix makes
+the root read-only. `GET /workspaces/allowed-roots` lists roots visible to the caller. Validation
+performed on every open and on reopen:
+
+1. the path is absolute and normalizes inside a declared root (`path_outside_allowed_root`)
+2. no `..` / control characters, and no symlink component inside the root (`symlink_escape`)
+3. the resolved root is a directory (`root_unavailable`)
+4. the metadata store and the storage root are **not** inside the workspace root (`metadata_overlap`)
+
+## A1.8 Browser constraints (§8)
+
+`local_browser` workspaces are created by `POST /workspaces/local-browser`
+(`LocalBrowserWorkspaceRequest`: `client_handle_id`, `display_path`, `entries[]` with per-file
+`path`, `size_bytes`, optional `content_hash` and the `text` the browser captured for indexing).
+The server stores index metadata only for those entries, never a server-side path, and always
+answers `server_side_path_access: false`. Reads of a browser workspace are served from the captured
+text/index; writes are returned as `client_write` directives. No endpoint accepts a client-local
+absolute path as a server path.
+
+## A1.9 Metadata and index separation (§10)
+
+`GET /workspaces/{id}/root` also returns `IndexStorageInfo`: metadata, chunk index and vectors live
+in the state directory SQLite database (`state://workspace.db`), never inside the workspace root.
+Directory scans skip the engine's own bookkeeping and ignore these default excluded names when
+indexing: `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `dist`, `build` (configurable via
+`AGCORE_WORKSPACE_SCAN_EXCLUDES`). Opening a root that contains the database file is refused
+(`metadata_overlap`), which is the structural guarantee that the user's folder is never polluted.
+
+## A1.10 Errors added by Amendment 01
+
+| code | HTTP | Meaning |
+| --- | --- | --- |
+| `workspace_closed` | 409 | workspace is closed; reopen it first |
+| `read_only_workspace` | 403 | the root was opened read-only |
+| `path_outside_allowed_root` | 403 | path is not inside a declared allowed root |
+| `symlink_escape` | 400 | a symlink component would escape the root |
+| `root_unavailable` | 409 | the root folder is missing or unreadable (open/reopen/sync) |
+| `provider_mismatch` | 400 | operation not valid for this storage provider |
+| `content_conflict` | 409 | `expected_content_hash` no longer matches |
+| `source_delete_not_permitted` | 403 | disconnecting may not delete real files |
+| `metadata_overlap` | 400 | workspace root would contain the metadata store |
+| `watch_unavailable` | 409 | watcher cannot run for this provider/lifecycle |
+
+## A1.11 Mock provider (Canvas independence, unchanged guarantee)
+
+`MockWorkspaceProvider` (Python) and `createMockWorkspaceProvider()` (TS) implement the Amendment 01
+lifecycle in memory: `openFolder`, `newWorkspace`, `closeWorkspace`, `reopenWorkspace`,
+`disconnectWorkspace` (refuses source deletion), `writeFile` (returns `client_write` for
+`local_browser`) and `syncWorkspace`. The preview router exposes the same paths under
+`/api/v1/workspaces/_mock/*`. A v1 consumer that only calls §2 operations keeps working unchanged.

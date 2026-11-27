@@ -12,13 +12,65 @@ from pydantic import BaseModel, ConfigDict, Field
 
 WORKSPACE_CONTRACT_VERSION = "r2-w/v1"
 
+# Amendment 01 (folder-based workspace) is additive on top of the frozen v1 surface.
+# Existing v1 operations, fields and error codes keep their meaning; every Amendment 01 type
+# below is optional for a v1 consumer.
+WORKSPACE_CONTRACT_AMENDMENT = "A01"
+WORKSPACE_CONTRACT_REVISION = "r2-w/v1+a01"
+
 ID_PATTERN = r"^(ws|wf|wc|wj|wref)_[a-z0-9]{4,32}$"
+_ROOT_ID_PATTERN = r"^[a-z0-9][a-z0-9_-]{1,47}$"
 
 
 class WorkspaceStatus(str, Enum):
     ACTIVE = "active"
     ARCHIVED = "archived"
     DELETED = "deleted"
+
+
+class WorkspaceLifecycleState(str, Enum):
+    """Connection lifecycle of the workspace root (Amendment 01 §A1.2).
+
+    `closed` keeps every row (metadata, revisions, chunks) so `reopen` is lossless; a closed
+    workspace refuses reads, writes and indexing until it is reopened.
+    """
+
+    OPEN = "open"
+    CLOSED = "closed"
+    DELETED = "deleted"
+
+
+class WorkspaceStorageProvider(str, Enum):
+    """Where the workspace root physically lives (Amendment 01 §A1.1).
+
+    * `server_managed`        — a folder the server created and owns. Without a folder root this
+                                is the original v1 upload workspace (content-addressed blobs).
+    * `server_mounted_folder` — an existing user folder on the server, mounted zero-copy.
+    * `local_browser`         — a folder the user picked in the browser (File System Access API).
+                                The server never receives a server-side path for it.
+    """
+
+    SERVER_MANAGED = "server_managed"
+    SERVER_MOUNTED_FOLDER = "server_mounted_folder"
+    LOCAL_BROWSER = "local_browser"
+
+
+class ContentOrigin(str, Enum):
+    """How a file's bytes are reached.
+
+    `blob`     — a copy under the server storage root (v1 behavior).
+    `external` — zero-copy: the bytes live in the workspace root itself and are read in place.
+    """
+
+    BLOB = "blob"
+    EXTERNAL = "external"
+
+
+class RootStatus(str, Enum):
+    AVAILABLE = "available"
+    MISSING = "missing"
+    NOT_ALLOWED = "not_allowed"
+    METADATA_OVERLAP = "metadata_overlap"
 
 
 class AccessLevel(str, Enum):
@@ -62,6 +114,17 @@ class ContextStatus(str, Enum):
 
 class WorkspaceErrorCode(str, Enum):
     WORKSPACE_NOT_FOUND = "workspace_not_found"
+    # Amendment 01 additions (additive; v1 consumers can ignore them)
+    WORKSPACE_CLOSED = "workspace_closed"
+    READ_ONLY_WORKSPACE = "read_only_workspace"
+    PATH_OUTSIDE_ALLOWED_ROOT = "path_outside_allowed_root"
+    SYMLINK_ESCAPE = "symlink_escape"
+    ROOT_UNAVAILABLE = "root_unavailable"
+    PROVIDER_MISMATCH = "provider_mismatch"
+    CONTENT_CONFLICT = "content_conflict"
+    SOURCE_DELETE_NOT_PERMITTED = "source_delete_not_permitted"
+    METADATA_OVERLAP = "metadata_overlap"
+    WATCH_UNAVAILABLE = "watch_unavailable"
     FILE_NOT_FOUND = "file_not_found"
     FILE_EXISTS = "file_exists"
     REVISION_CONFLICT = "revision_conflict"
@@ -77,6 +140,16 @@ class WorkspaceErrorCode(str, Enum):
 
 ERROR_STATUS: Dict[WorkspaceErrorCode, int] = {
     WorkspaceErrorCode.WORKSPACE_NOT_FOUND: 404,
+    WorkspaceErrorCode.WORKSPACE_CLOSED: 409,
+    WorkspaceErrorCode.READ_ONLY_WORKSPACE: 403,
+    WorkspaceErrorCode.PATH_OUTSIDE_ALLOWED_ROOT: 403,
+    WorkspaceErrorCode.SYMLINK_ESCAPE: 400,
+    WorkspaceErrorCode.ROOT_UNAVAILABLE: 409,
+    WorkspaceErrorCode.PROVIDER_MISMATCH: 400,
+    WorkspaceErrorCode.CONTENT_CONFLICT: 409,
+    WorkspaceErrorCode.SOURCE_DELETE_NOT_PERMITTED: 403,
+    WorkspaceErrorCode.METADATA_OVERLAP: 400,
+    WorkspaceErrorCode.WATCH_UNAVAILABLE: 409,
     WorkspaceErrorCode.FILE_NOT_FOUND: 404,
     WorkspaceErrorCode.FILE_EXISTS: 409,
     WorkspaceErrorCode.REVISION_CONFLICT: 409,
@@ -111,6 +184,50 @@ class WorkspaceError(BaseModel):
 # --------------------------------------------------------------------------------------
 
 
+class WorkspaceRootInfo(BaseModel):
+    """Root binding of a workspace (Amendment 01 §A1.1 / §A1.7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    storage_provider: WorkspaceStorageProvider = WorkspaceStorageProvider.SERVER_MANAGED
+    root_id: Optional[str] = None
+    display_path: str = ""
+    allowed_root_id: Optional[str] = None
+    read_only: bool = False
+    zero_copy: bool = False
+    # False for `local_browser`: the server must never be assumed to reach the client path.
+    server_side_path_access: bool = True
+    client_handle_id: Optional[str] = None
+    opened_at: Optional[str] = None
+    status: RootStatus = RootStatus.AVAILABLE
+
+
+class AllowedRootInfo(BaseModel):
+    """One server-side root a user may open as a workspace (Amendment 01 §A1.9)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    root_id: str
+    display_path: str
+    storage_provider: WorkspaceStorageProvider = WorkspaceStorageProvider.SERVER_MOUNTED_FOLDER
+    writable: bool = True
+    scope: str = "owner"  # owner | tenant | global
+    is_default: bool = False
+
+
+class IndexStorageInfo(BaseModel):
+    """Proof that metadata/index storage is outside the workspace root (§A1.10)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    separate_from_workspace_root: bool = True
+    metadata_store: str = "sqlite"
+    metadata_location_ref: str = "state://workspace.db"
+    chunk_index_location_ref: str = "state://workspace.db#workspace_chunk"
+    vector_index_location_ref: str = "state://workspace.db#workspace_chunk_vector"
+    inside_workspace_root: bool = False
+
+
 class WorkspaceIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -124,6 +241,10 @@ class WorkspaceIdentity(BaseModel):
     revision: int = 0
     created_at: str
     updated_at: str
+    # Amendment 01 (additive)
+    lifecycle_state: WorkspaceLifecycleState = WorkspaceLifecycleState.OPEN
+    root: WorkspaceRootInfo = Field(default_factory=WorkspaceRootInfo)
+    closed_at: Optional[str] = None
 
 
 class FileIdentity(BaseModel):
@@ -142,6 +263,11 @@ class FileIdentity(BaseModel):
     index_status: Optional[IndexState] = None
     created_at: str
     updated_at: str
+    # Amendment 01 (additive): zero-copy files carry their real relative path in the root.
+    storage_provider: WorkspaceStorageProvider = WorkspaceStorageProvider.SERVER_MANAGED
+    content_origin: ContentOrigin = ContentOrigin.BLOB
+    relative_path: Optional[str] = None
+    synced_at: Optional[str] = None
 
 
 class AccessResult(BaseModel):
@@ -229,6 +355,148 @@ class WorkspaceFileList(BaseModel):
 class WorkspaceList(BaseModel):
     items: List[WorkspaceIdentity] = Field(default_factory=list)
     total: int = 0
+
+
+# --------------------------------------------------------------------------------------
+# Amendment 01 — folder-based workspace lifecycle / root / write contract
+# --------------------------------------------------------------------------------------
+
+
+class FolderOpenRequest(BaseModel):
+    """`Open Folder`: mount an existing server folder as a workspace root (zero-copy)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=4096)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    read_only: bool = False
+    root_id: Optional[str] = Field(default=None, pattern=_ROOT_ID_PATTERN)
+
+
+class NewWorkspaceRequest(BaseModel):
+    """`New Workspace`: create a real folder under an allowed root and use it as the root."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=2000)
+    parent_path: Optional[str] = Field(default=None, max_length=4096)
+    root_id: Optional[str] = Field(default=None, pattern=_ROOT_ID_PATTERN)
+
+
+class LocalBrowserEntry(BaseModel):
+    """One file the browser read from the picked directory (never a server-side path)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=1024)
+    kind: FileKind = FileKind.FILE
+    size_bytes: int = Field(default=0, ge=0)
+    content_hash: Optional[str] = None
+    text: Optional[str] = None
+    mime_type: Optional[str] = None
+
+
+class LocalBrowserWorkspaceRequest(BaseModel):
+    """Browser-picked folder (`local_browser` provider, File System Access API)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=2000)
+    client_handle_id: str = Field(min_length=1, max_length=128)
+    display_path: str = Field(default="", max_length=512)
+    read_only: bool = True
+    entries: List[LocalBrowserEntry] = Field(default_factory=list)
+
+
+class WorkspaceCloseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(default="", max_length=200)
+
+
+class WorkspaceDisconnectRequest(BaseModel):
+    """Connection release. Deleting the real folder is a separate, explicit option."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    delete_source_files: bool = False
+    confirm: bool = False
+
+
+class WorkspaceWriteRequest(BaseModel):
+    """Canvas / Coding Agent common write contract (Amendment 01 §A1.5).
+
+    One request per output file; the same request works against every provider. Paths are
+    validated (`validate_relative_path`) and confined to the workspace root.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=1024)
+    content: Optional[str] = None
+    content_base64: Optional[str] = None
+    mime_type: Optional[str] = Field(default=None, max_length=200)
+    expected_content_hash: Optional[str] = Field(default=None, max_length=80)
+    create_parents: bool = True
+    overwrite: bool = True
+
+
+class ClientWriteDirective(BaseModel):
+    """Returned when only the client can perform the write (`local_browser`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    required: bool = True
+    client_handle_id: Optional[str] = None
+    relative_path: str
+    reason: str = "local_browser_no_server_path_access"
+
+
+class WorkspaceWriteResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: str
+    path: str
+    file: Optional[FileIdentity] = None
+    revision: int = 0
+    content_hash: Optional[str] = None
+    written_bytes: int = 0
+    storage_provider: WorkspaceStorageProvider = WorkspaceStorageProvider.SERVER_MANAGED
+    content_origin: ContentOrigin = ContentOrigin.BLOB
+    client_write: Optional[ClientWriteDirective] = None
+
+
+class WorkspaceSyncResult(BaseModel):
+    """Result of one watcher pass / manual rescan (Amendment 01 §A1.4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: str
+    full: bool = False
+    scanned: int = 0
+    created: int = 0
+    modified: int = 0
+    moved: int = 0
+    deleted: int = 0
+    unchanged: int = 0
+    errors: List[Dict[str, Any]] = Field(default_factory=list)
+    started_at: str = ""
+    finished_at: str = ""
+
+
+class WorkspaceWatchStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: str
+    watching: bool = False
+    storage_provider: WorkspaceStorageProvider = WorkspaceStorageProvider.SERVER_MANAGED
+    interval_seconds: float = 0.0
+    last_scan_at: Optional[str] = None
+    last_change_at: Optional[str] = None
+    changes_total: int = 0
+    last_error: Optional[str] = None
 
 
 # --------------------------------------------------------------------------------------
@@ -449,3 +717,90 @@ def provider_operations() -> Tuple[str, ...]:
         "register_artifact_reference",
         "list_artifact_references",
     )
+
+
+@runtime_checkable
+class WorkspaceFolderProvider(Protocol):
+    """Amendment 01 folder lifecycle + common write/scan surface (§A1.2, §A1.4, §A1.5)."""
+
+    def open_folder(self, scope: ScopeView, path: str, **options: Any) -> WorkspaceIdentity: ...
+
+    def new_workspace(self, scope: ScopeView, name: str, **options: Any) -> WorkspaceIdentity: ...
+
+    def close_workspace(self, workspace_id: str, scope: ScopeView, reason: str = "") -> WorkspaceIdentity: ...
+
+    def reopen_workspace(self, workspace_id: str, scope: ScopeView) -> WorkspaceIdentity: ...
+
+    def disconnect_workspace(
+        self, workspace_id: str, scope: ScopeView, delete_source_files: bool = False
+    ) -> Dict[str, Any]: ...
+
+    def write_file(
+        self, workspace_id: str, scope: ScopeView, request: WorkspaceWriteRequest
+    ) -> WorkspaceWriteResult: ...
+
+    def sync_workspace(self, workspace_id: str, scope: ScopeView, full: bool = False) -> WorkspaceSyncResult: ...
+
+
+def provider_operations_a01() -> Tuple[str, ...]:
+    """Operations added by Amendment 01 (kept apart from the frozen v1 list)."""
+
+    return (
+        "open_folder",
+        "new_workspace",
+        "close_workspace",
+        "reopen_workspace",
+        "disconnect_workspace",
+        "write_file",
+        "sync_workspace",
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Relative path validation (shared by server, mock and clients)
+# --------------------------------------------------------------------------------------
+
+_PATH_MAX_SEGMENT = 255
+_PATH_MAX_TOTAL = 1024
+_FORBIDDEN_SEGMENTS = {"", ".", ".."}
+
+
+class InvalidRelativePath(ValueError):
+    """Raised by `validate_relative_path`; mapped to `invalid_path` by the API."""
+
+
+def validate_relative_path(path: str, *, allow_empty: bool = False) -> str:
+    """Normalize and validate a workspace-relative path.
+
+    Rejects absolute paths, Windows drive/UNC prefixes, backslashes, control characters, NUL,
+    `.`/`..` segments and over-long segments. Returns the normalized POSIX form without a
+    leading or trailing slash. This is the single path gate shared by Canvas, the Coding Agent
+    and the workspace API.
+    """
+
+    raw = path or ""
+    if not isinstance(raw, str):
+        raise InvalidRelativePath("path must be a string")
+    if raw.strip() == "":
+        if allow_empty:
+            return ""
+        raise InvalidRelativePath("empty path")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        raise InvalidRelativePath("control characters rejected")
+    if "\\" in raw:
+        raise InvalidRelativePath("backslash rejected")
+    if raw.startswith("/") or raw.startswith("~"):
+        raise InvalidRelativePath("absolute path rejected")
+    if len(raw) > _PATH_MAX_TOTAL:
+        raise InvalidRelativePath("path too long")
+    if len(raw) >= 2 and raw[1] == ":":
+        raise InvalidRelativePath("drive letter rejected")
+    parts = [part for part in raw.split("/")]
+    out: List[str] = []
+    for part in parts:
+        if part in _FORBIDDEN_SEGMENTS:
+            raise InvalidRelativePath(f"invalid path segment: {part!r}")
+        if len(part) > _PATH_MAX_SEGMENT:
+            raise InvalidRelativePath("path segment too long")
+        out.append(part)
+    return "/".join(out)
