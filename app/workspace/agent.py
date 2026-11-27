@@ -311,6 +311,22 @@ def _sentences(text: str) -> List[str]:
     return sentences
 
 
+_TOKEN_SPLIT = re.compile(r"[\s,.;:!?()\[\]{}<>/\\|`\"'“”‘’·…~#*_-]+")
+
+
+def _doc_terms(text: str, limit: int = 10) -> List[str]:
+    """Most repeated meaningful words of a document (for compare/keyword summaries)."""
+
+    cleaned = sanitize_document_text(text or "").lower()
+    counts: Dict[str, int] = {}
+    for token in _TOKEN_SPLIT.split(cleaned):
+        word = _strip_particle(token).strip()
+        if len(word) < 2 or word in _STOPWORDS or word.isdigit():
+            continue
+        counts[word] = counts.get(word, 0) + 1
+    return [word for word, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
 def _score_sentences(text: str, terms: Sequence[str], limit: int = 5) -> List[str]:
     sentences = _sentences(text)
     if not sentences:
@@ -870,7 +886,7 @@ class _TurnRun:
             return
         first, second = docs
         self._retrieve(" ".join(analysis.terms[:6]) or self.message, file_ids=[first["file_id"], second["file_id"]], top_k=6)
-        terms = analysis.terms or _terms(first["text"] + " " + second["text"])
+        terms = analysis.terms or _doc_terms(first["text"] + "\n" + second["text"], 12)
         first_keys = _keyword_set(first["text"], terms)
         second_keys = _keyword_set(second["text"], terms)
         lines = [f"`{first['path']}` ↔ `{second['path']}` 비교", ""]
