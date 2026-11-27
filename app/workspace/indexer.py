@@ -332,7 +332,7 @@ class WorkspaceIndexer:
     # ------------------------------------------------------------------ public API
     def reindex(self, workspace_id: str, scope: Any, file_id: Optional[str] = None) -> List[IndexJob]:
         manager = self.manager
-        manager.get_workspace(workspace_id, scope)
+        manager.ensure_open(workspace_id, scope)
         if file_id is not None:
             targets = [manager.get_file_metadata(workspace_id, file_id, scope)]
         else:
@@ -357,7 +357,7 @@ class WorkspaceIndexer:
         return jobs
 
     def cancel(self, workspace_id: str, scope: Any, file_id: str) -> Optional[IndexJob]:
-        self.manager.get_workspace(workspace_id, scope)
+        self.manager.ensure_open(workspace_id, scope)
         self.manager.get_file_metadata(workspace_id, file_id, scope)
         at = self.clock()
         self.store.cancel_jobs_for_file(file_id, at, reason="cancelled")

@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import mimetypes
 import secrets
+import sqlite3
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from app.workspace import folder
 from app.workspace.contracts import FileKind, IndexState, WorkspaceSyncResult
@@ -38,9 +41,31 @@ class FolderSyncService:
         self.store = manager.store
         self.settings = settings
         self.clock = manager.clock
+        self._locks: Dict[str, threading.RLock] = {}
+        self._locks_guard = threading.Lock()
+
+    @contextmanager
+    def workspace_lock(self, workspace_id: str) -> Iterator[None]:
+        """Serialise everything that mutates one workspace's file tree.
+
+        The watcher thread, an opening scan and a Canvas write can otherwise insert the same row
+        concurrently (unique file name) or double-apply a change.
+        """
+
+        with self._locks_guard:
+            lock = self._locks.get(workspace_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._locks[workspace_id] = lock
+        with lock:
+            yield
 
     # ------------------------------------------------------------------ public
     def sync(self, workspace: Dict[str, Any], *, full: bool = False) -> WorkspaceSyncResult:
+        with self.workspace_lock(workspace["workspace_id"]):
+            return self._sync_locked(workspace, full=full)
+
+    def _sync_locked(self, workspace: Dict[str, Any], *, full: bool = False) -> WorkspaceSyncResult:
         workspace_id = workspace["workspace_id"]
         root = Path(workspace["root_path"] or "")
         started = self.clock()
@@ -305,7 +330,14 @@ class FolderSyncService:
             "ext_mtime": mtime,
             "synced_at": stamp,
         }
-        self.store.insert_file(record)
+        try:
+            self.store.insert_file(record)
+        except sqlite3.IntegrityError:
+            # A concurrent writer already created this path; keep that row instead of failing.
+            existing = self.store.find_file_by_name(workspace_id, parent_id, name)
+            if existing is None:
+                raise
+            return existing["file_id"]
         if kind is FileKind.FILE and digest:
             self.store.add_revision(
                 {

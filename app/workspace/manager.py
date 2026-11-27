@@ -403,6 +403,13 @@ class WorkspaceManager:
         if record.get("lifecycle_state") == WorkspaceLifecycleState.CLOSED.value:
             raise WorkspaceFailure(WorkspaceErrorCode.WORKSPACE_CLOSED, workspace_id=record.get("workspace_id"))
 
+    def ensure_open(self, workspace_id: str, scope: ScopeView) -> WorkspaceIdentity:
+        """Access check plus lifecycle gate, for read surfaces outside the file API."""
+
+        record = self._workspace_record(workspace_id, scope)
+        self._require_open(record)
+        return self.workspace_identity(record)
+
     def _require_writable(self, record: Dict[str, Any]) -> None:
         self._require_open(record)
         if int(record.get("read_only") or 0):
@@ -1422,6 +1429,12 @@ class WorkspaceManager:
     def delete_file(self, workspace_id: str, file_id: str, scope: ScopeView) -> Dict[str, Any]:
         workspace = self._workspace_record(workspace_id, scope)
         self._require_writable(workspace)
+        with self.sync_service.workspace_lock(workspace_id):
+            return self._delete_file_locked(workspace, workspace_id, file_id, scope)
+
+    def _delete_file_locked(
+        self, workspace: Dict[str, Any], workspace_id: str, file_id: str, scope: ScopeView
+    ) -> Dict[str, Any]:
         record = self._file_record(workspace_id, file_id, scope)
         tenant = workspace["tenant_id"]
         targets = [record]
@@ -1536,6 +1549,28 @@ class WorkspaceManager:
         )
 
     def _write_external_bytes(
+        self,
+        workspace: Dict[str, Any],
+        rel: str,
+        data: bytes,
+        *,
+        mime_type: Optional[str] = None,
+        create_parents: bool = True,
+        overwrite: bool = True,
+    ) -> Dict[str, Any]:
+        # The watcher thread may be scanning the same root; the per-workspace lock keeps the
+        # disk write and its metadata row a single step.
+        with self.sync_service.workspace_lock(workspace["workspace_id"]):
+            return self._write_external_bytes_locked(
+                workspace,
+                rel,
+                data,
+                mime_type=mime_type,
+                create_parents=create_parents,
+                overwrite=overwrite,
+            )
+
+    def _write_external_bytes_locked(
         self,
         workspace: Dict[str, Any],
         rel: str,

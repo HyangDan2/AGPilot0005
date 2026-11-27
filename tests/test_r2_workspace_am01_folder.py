@@ -412,6 +412,36 @@ def test_new_workspace_creates_a_real_folder_under_the_allowed_root(env):
     assert duplicate.value.error.code in {WorkspaceErrorCode.FILE_EXISTS, WorkspaceErrorCode.QUOTA_EXCEEDED}
 
 
+# --------------------------------------------------------------------- concurrency
+
+
+def test_watcher_and_opening_scan_do_not_race(env):
+    """A regression for the unique-name clash when the watcher scanned a workspace mid-open."""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    files = {f"note-{index}.txt": f"body {index}" for index in range(12)}
+    folder = _make_folder(env["allowed"], "race", files)
+    watcher: WorkspaceWatcher = env["watcher"]
+    watcher.start(interval=0.01)
+    try:
+        workspace = _open(env, folder)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(
+                pool.map(
+                    lambda _index: env["manager"].sync_workspace(workspace.workspace_id, env["scope"]),
+                    range(8),
+                )
+            )
+        assert all(result.workspace_id == workspace.workspace_id for result in results)
+        rows = _files(env, workspace.workspace_id)
+        names = [row.name for row in rows]
+        assert len(names) == len(set(names)), names
+        assert len(_by_rel(env, workspace.workspace_id)) == len(files)
+    finally:
+        watcher.stop()
+
+
 # --------------------------------------------------------------------- write contract
 def test_write_contract_is_identical_on_both_folder_providers(env):
     mounted = _open(env, _make_folder(env["allowed"], "mounted", {"seed.txt": "seed"}))
@@ -580,6 +610,9 @@ def test_http_open_close_reopen_disconnect_and_write(api):
 
     closed = client.post(f"/api/v1/workspaces/{workspace_id}/close", json={"reason": "test"})
     assert closed.json()["lifecycle_state"] == "closed"
+    blocked = client.get(f"/api/v1/workspaces/{workspace_id}/search", params={"q": "hello"})
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "workspace_closed"
     reopened = client.post(f"/api/v1/workspaces/{workspace_id}/reopen")
     assert reopened.json()["lifecycle_state"] == "open"
 

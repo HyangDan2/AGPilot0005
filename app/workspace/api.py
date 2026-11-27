@@ -70,7 +70,8 @@ def guarded(func: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _runtime(runtime: WorkspaceRuntime, scope: ExecutionScope, workspace_id: str) -> None:
-    runtime.manager.get_workspace(workspace_id, scope)
+    # Access check + lifecycle: a closed workspace keeps its data but refuses reads.
+    runtime.manager.ensure_open(workspace_id, scope)
 
 
 def _ensure_index_ready(runtime: WorkspaceRuntime, workspace_id: str) -> None:
