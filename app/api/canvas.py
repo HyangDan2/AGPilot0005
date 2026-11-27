@@ -23,12 +23,10 @@ from app.canvas.service import CanvasService, get_canvas_service
 from app.canvas.tools import manifest as tools_manifest
 from app.core.auth import ExecutionScope, require_authenticated_caller
 
-def require_canvas_enabled() -> None:
-    """WO-C17 / C-FIX-05: the feature stays off until an operator enables it explicitly.
+def require_canvas_enabled(scope: ExecutionScope = Depends(require_authenticated_caller)) -> None:
+    """WO-C17 / C-FIX-05 & R2-INT-FIX-02: global feature gate + per-service allowlist isolation."""
+    from app.config import is_canvas_service_allowed
 
-    Merging this branch into an operating service therefore exposes no working Canvas endpoint:
-    ``AGCORE_CANVAS_ENABLED`` defaults to false and every route answers ``503 canvas_disabled``.
-    """
     settings = load_canvas_settings()
     if not settings.enabled:
         raise HTTPException(
@@ -41,6 +39,19 @@ def require_canvas_enabled() -> None:
                     "feature_flag": "AGCORE_CANVAS_ENABLED",
                     "feature_flag_default": False,
                     "dev_preview_flag": "AGCORE_CANVAS_DEV_PREVIEW",
+                },
+            },
+        )
+    if not is_canvas_service_allowed(scope.service_id):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "canvas_disabled_for_service",
+                "message": f"Canvas feature is not enabled for service '{scope.service_id}'.",
+                "retryable": False,
+                "context": {
+                    "service_id": scope.service_id,
+                    "feature_flag": "AGCORE_CANVAS_ALLOWED_SERVICES",
                 },
             },
         )

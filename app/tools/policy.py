@@ -249,20 +249,32 @@ class ToolPolicyStore:
         if tool_name in BUILTIN_TOOLS:
             if not providers.get("builtin", {}).get("enabled", True):
                 return False, "builtin_provider_disabled"
-            # CP-02 / CP-03: Feature-flag gating for R2 Workspace and Canvas tools on service-scoped runs
+            # CP-02 / CP-03 / R2-INT-FIX-02: Feature-flag & per-service allowlist gating for R2 tools
             if service_id:
                 if tool_name in WORKSPACE_TOOLS:
-                    from app.config import is_workspace_enabled
+                    from app.config import is_workspace_enabled, is_workspace_enabled_for_service
 
                     if not is_workspace_enabled():
                         return False, "workspace_disabled"
+                    if not is_workspace_enabled_for_service(service_id):
+                        return False, "workspace_disabled_for_service"
                 if tool_name.startswith("canvas."):
-                    from app.config import is_canvas_tools_enabled, is_workspace_enabled
+                    from app.config import (
+                        is_canvas_tools_enabled,
+                        is_canvas_tools_enabled_for_service,
+                        is_workspace_enabled,
+                        is_workspace_enabled_for_service,
+                    )
 
                     if not is_canvas_tools_enabled():
                         return False, "canvas_tools_disabled"
-                    if tool_name in CANVAS_WORKSPACE_TOOLS and not is_workspace_enabled():
-                        return False, "workspace_disabled"
+                    if not is_canvas_tools_enabled_for_service(service_id):
+                        return False, "canvas_tools_disabled_for_service"
+                    if tool_name in CANVAS_WORKSPACE_TOOLS:
+                        if not is_workspace_enabled():
+                            return False, "workspace_disabled"
+                        if not is_workspace_enabled_for_service(service_id):
+                            return False, "workspace_disabled_for_service"
             # NG-01: Respect global AGTOOLS_ENABLED switch across all document.* tools
             if tool_name.startswith("document.") and not settings.AGTOOLS_ENABLED:
                 return False, "agtools_disabled"
@@ -309,7 +321,7 @@ class ToolPolicyStore:
             # HF-01: Never fall back to public-safe for unregistered services
             return []
         profile = policy.get("profiles", {}).get(profile_id, {})
-        return list(profile.get("tools") or [])
+        return [t for t in (profile.get("tools") or []) if self.is_tool_allowed(t, service_id)[0]]
 
     async def sync_provider(self, provider_id: str, tool_registry: Any) -> Dict[str, Any]:
         policy = self.load()

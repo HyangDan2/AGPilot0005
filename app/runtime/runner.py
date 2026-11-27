@@ -241,10 +241,12 @@ class AgentRunner:
             messages = [GatewayMessage(role="system", content=ContextAdapter.build_system_message(active_tool_names))]
             workspace_id: Optional[str] = (req.workspace_id or "").strip() or None
             if workspace_id is not None:
-                from app.config import is_workspace_enabled
+                from app.config import is_workspace_enabled, is_workspace_enabled_for_service
 
                 if not is_workspace_enabled():
                     raise DocumentReferenceError("workspace_disabled")
+                if not is_workspace_enabled_for_service(service_id):
+                    raise DocumentReferenceError("workspace_disabled_for_service")
                 if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workspace_id):
                     raise DocumentReferenceError("invalid_workspace_id")
                 from app.workspace.manager import WorkspaceFailure

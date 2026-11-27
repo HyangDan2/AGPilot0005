@@ -89,12 +89,23 @@ class Settings(BaseModel):
     )
     TRAJECTORY_ENABLED: bool = os.environ.get("AGCORE_TRAJECTORY_ENABLED", "true").lower() in ("true", "1", "yes")
 
-    # Phase R2 (CP-02): Workspace & Canvas Feature Flags — default OFF (explicit opt-in required)
+    # Phase R2 (CP-02 & R2-INT-FIX-02): Workspace & Canvas Feature Flags + Service Allowlists
     WORKSPACE_ENABLED: bool = os.environ.get("AGCORE_WORKSPACE_ENABLED", "false").lower() in ("true", "1", "yes")
     CANVAS_ENABLED: bool = os.environ.get("AGCORE_CANVAS_ENABLED", "false").lower() in ("true", "1", "yes")
     CANVAS_TOOLS_ENABLED: bool = os.environ.get("AGCORE_CANVAS_TOOLS_ENABLED", "false").lower() in ("true", "1", "yes")
+    WORKSPACE_ALLOWED_SERVICES: str = os.environ.get("AGCORE_WORKSPACE_ALLOWED_SERVICES", "")
+    CANVAS_ALLOWED_SERVICES: str = os.environ.get("AGCORE_CANVAS_ALLOWED_SERVICES", "")
 
 settings = Settings()
+
+
+def _parse_allowed_services(env_name: str, fallback_raw: str) -> Optional[Set[str]]:
+    """Parse comma-separated service allowlist; returns None when unset/empty (no extra service restriction)."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        raw = fallback_raw
+    tokens = {item.strip() for item in (raw or "").split(",") if item.strip()}
+    return tokens or None
 
 
 def is_workspace_enabled() -> bool:
@@ -105,6 +116,19 @@ def is_workspace_enabled() -> bool:
     return bool(settings.WORKSPACE_ENABLED)
 
 
+def is_workspace_service_allowed(service_id: Optional[str]) -> bool:
+    """Check AGCORE_WORKSPACE_ALLOWED_SERVICES without checking the global enabled toggle."""
+    allowed = _parse_allowed_services("AGCORE_WORKSPACE_ALLOWED_SERVICES", settings.WORKSPACE_ALLOWED_SERVICES)
+    if allowed is None:
+        return True
+    return bool(service_id) and (service_id in allowed or "*" in allowed)
+
+
+def is_workspace_enabled_for_service(service_id: Optional[str]) -> bool:
+    """R2-INT-FIX-02: True iff Workspace is globally enabled AND allowed for service_id."""
+    return is_workspace_enabled() and is_workspace_service_allowed(service_id)
+
+
 def is_canvas_enabled() -> bool:
     """Resolve AGCORE_CANVAS_ENABLED dynamically (default False)."""
     raw = os.environ.get("AGCORE_CANVAS_ENABLED")
@@ -113,12 +137,30 @@ def is_canvas_enabled() -> bool:
     return bool(settings.CANVAS_ENABLED)
 
 
+def is_canvas_service_allowed(service_id: Optional[str]) -> bool:
+    """Check AGCORE_CANVAS_ALLOWED_SERVICES without checking the global enabled toggle."""
+    allowed = _parse_allowed_services("AGCORE_CANVAS_ALLOWED_SERVICES", settings.CANVAS_ALLOWED_SERVICES)
+    if allowed is None:
+        return True
+    return bool(service_id) and (service_id in allowed or "*" in allowed)
+
+
+def is_canvas_enabled_for_service(service_id: Optional[str]) -> bool:
+    """R2-INT-FIX-02: True iff Canvas is globally enabled AND allowed for service_id."""
+    return is_canvas_enabled() and is_canvas_service_allowed(service_id)
+
+
 def is_canvas_tools_enabled() -> bool:
     """Resolve AGCORE_CANVAS_TOOLS_ENABLED dynamically (default False)."""
     raw = os.environ.get("AGCORE_CANVAS_TOOLS_ENABLED")
     if raw is not None:
         return raw.strip().lower() in ("true", "1", "yes", "on")
     return bool(settings.CANVAS_TOOLS_ENABLED)
+
+
+def is_canvas_tools_enabled_for_service(service_id: Optional[str]) -> bool:
+    """R2-INT-FIX-02: True iff Canvas tools are globally enabled AND allowed for service_id."""
+    return is_canvas_tools_enabled() and is_canvas_service_allowed(service_id)
 
 
 def validate_runtime_engine_config(engine: Optional[str] = None) -> str:

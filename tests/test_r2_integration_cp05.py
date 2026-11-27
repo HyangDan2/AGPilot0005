@@ -690,3 +690,113 @@ async def test_cp05_10_local_browser_client_read_write_fail_explicitly(monkeypat
         assert rl.status_code == 400
         assert rl.json()["detail"]["code"] == "provider_mismatch"
         assert rl.json()["detail"]["context"].get("client_read_required") is True
+
+
+# ---------------------------------------------------------------------------
+# R2-INT-FIX-02: Admin / Beta / Public Service-Level R2 Feature Isolation
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_r2_int_fix_02_beta_only_service_isolation(monkeypatch, tmp_path):
+    ws_rt, _ = _setup_r2_env(
+        monkeypatch,
+        tmp_path,
+        ScriptedGateway([]),
+        workspace_enabled=True,
+        canvas_enabled=True,
+        canvas_tools_enabled=True,
+    )
+    monkeypatch.setenv("AGCORE_WORKSPACE_ALLOWED_SERVICES", "hd2ai-beta")
+    monkeypatch.setenv("AGCORE_CANVAS_ALLOWED_SERVICES", "hd2ai-beta")
+
+    # Seed a beta workspace
+    beta_scope = _scope("alice", "tenant-a", "hd2ai-beta")
+    ws_dir = tmp_path / "allowed" / "beta-only-ws"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    ws = ws_rt.manager.open_folder(beta_scope, str(ws_dir), name="beta-only-ws", root_id="rw_root")
+
+    hdr_beta = _proxy_headers("alice", "tenant-a", "hd2ai-beta")
+    hdr_admin = _proxy_headers("alice", "tenant-a", "hd2ai-admin")
+    hdr_public = _proxy_headers("alice", "tenant-a", "hd2ai-public")
+
+    from app.tools.policy import tool_policy
+
+    # Policy surface: beta sees R2 tools, admin & public see ZERO R2 tools
+    beta_tools = set(tool_policy.allowed_tools_for_service("hd2ai-beta"))
+    admin_tools = set(tool_policy.allowed_tools_for_service("hd2ai-admin"))
+    public_tools = set(tool_policy.allowed_tools_for_service("hd2ai-public"))
+    assert "workspace_list_files" in beta_tools and "canvas.create_artifact" in beta_tools
+    assert not any(t.startswith("workspace_") or t.startswith("canvas.") for t in admin_tools)
+    assert not any(t.startswith("workspace_") or t.startswith("canvas.") for t in public_tools)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1) hd2ai-beta: Workspace API, Canvas API, workspace_id Chat + Canvas SSE ALL allowed
+        assert (await client.get("/api/v1/workspaces", headers=hdr_beta)).status_code == 200
+        assert (await client.get("/api/v1/canvas/capabilities", headers=hdr_beta)).status_code == 200
+
+        gw_beta = ScriptedGateway(
+            [
+                {
+                    "content": None,
+                    "tool_calls": [
+                        ToolCall(
+                            id="tc_beta_art",
+                            function=FunctionCall(
+                                name="canvas.create_artifact",
+                                arguments=json.dumps(
+                                    {
+                                        "title": "Beta Draft",
+                                        "artifact_type": "markdown",
+                                        "content": "# Beta\nIsolated R2 artifact.\n",
+                                    }
+                                ),
+                            ),
+                        )
+                    ],
+                },
+                {"content": "Beta 워크스페이스+캔버스 실행 완료"},
+            ]
+        )
+        monkeypatch.setattr("app.runtime.graph.gateway_for_service", lambda svc, c: gw_beta)
+        rs_beta = await client.post(
+            "/api/v1/agent/runs",
+            json={"message": "베타 캔버스 생성", "workspace_id": ws.workspace_id, "stream": True},
+            headers=hdr_beta,
+        )
+        assert rs_beta.status_code == 200
+        beta_events = _parse_sse(rs_beta.text)
+        assert "artifact.created" in [e["event"] for e in beta_events]
+        assert beta_events[-1]["event"] == "run.completed"
+        assert "workspace_list_files" in gw_beta.calls[0]["tools"]
+        assert "canvas.create_artifact" in gw_beta.calls[0]["tools"]
+
+        # 2) hd2ai-admin & hd2ai-public: Workspace/Canvas API -> 403, workspace_id -> 422, Normal Chat -> 200/completed with ZERO R2 tools
+        for svc_name, hdr in (("hd2ai-admin", hdr_admin), ("hd2ai-public", hdr_public)):
+            r_ws = await client.get("/api/v1/workspaces", headers=hdr)
+            assert r_ws.status_code == 403, f"{svc_name}: {r_ws.text}"
+            assert r_ws.json()["detail"]["code"] == "workspace_disabled_for_service"
+
+            r_cv = await client.get("/api/v1/canvas/capabilities", headers=hdr)
+            assert r_cv.status_code == 403, f"{svc_name}: {r_cv.text}"
+            assert r_cv.json()["detail"]["code"] == "canvas_disabled_for_service"
+
+            r_run_ws = await client.post(
+                "/api/v1/agent/runs",
+                json={"message": "워크스페이스 접근 시도", "workspace_id": ws.workspace_id, "stream": False},
+                headers=hdr,
+            )
+            assert r_run_ws.status_code == 422, f"{svc_name}: {r_run_ws.text}"
+            assert r_run_ws.json()["detail"] == "workspace_disabled_for_service"
+
+            gw_plain = ScriptedGateway([{"content": f"{svc_name} 일반 대화 정상 응답"}])
+            monkeypatch.setattr("app.runtime.graph.gateway_for_service", lambda svc, c, g=gw_plain: g)
+            r_plain = await client.post(
+                "/api/v1/agent/runs",
+                json={"message": "일반 인사", "stream": False},
+                headers=hdr,
+            )
+            assert r_plain.status_code == 202
+            fin = await _wait_terminal(client, r_plain.json()["run_id"], hdr)
+            assert fin["status"] == "completed"
+            assert fin["answer"] == f"{svc_name} 일반 대화 정상 응답"
+            exposed = set(gw_plain.calls[0]["tools"])
+            assert not any(t.startswith("workspace_") or t.startswith("canvas.") for t in exposed), f"{svc_name} leaked R2 tools: {exposed}"
