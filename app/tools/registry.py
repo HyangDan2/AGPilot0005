@@ -58,13 +58,33 @@ class ToolRegistry:
         self._tools.pop(name, None)
         self._handlers.pop(name, None)
 
+    def _ensure_r2_tools(self) -> None:
+        """CP-03: Lazily register R2 Workspace & Canvas tools when their feature flags are ON."""
+        from app.config import is_workspace_enabled
+
+        if is_workspace_enabled():
+            from app.workspace.tools import install_workspace_tools
+
+            install_workspace_tools(self)
+        if canvas_tools_enabled():
+            from app.canvas.tools import install_canvas_tools, install_canvas_workspace_tools
+
+            install_canvas_tools(self)
+            if is_workspace_enabled():
+                install_canvas_workspace_tools(self)
+
     def get_handler(self, name: str) -> Optional[Callable[..., Any]]:
+        if name not in self._handlers:
+            self._ensure_r2_tools()
         return self._handlers.get(name)
 
     def get_registration(self, name: str) -> Optional[ToolRegistration]:
+        if name not in self._tools:
+            self._ensure_r2_tools()
         return self._tools.get(name)
 
     def list_tools(self, service: Optional[str] = None) -> List[ToolRegistration]:
+        self._ensure_r2_tools()
         res = []
         for reg in self._tools.values():
             if service and reg.allowed_services and service not in reg.allowed_services:

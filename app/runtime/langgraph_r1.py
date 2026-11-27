@@ -502,6 +502,79 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                         "result_size_bytes": tr.result_size_bytes,
                     },
                 )
+            # CP-03 #5: Emit Canvas artifact SSE events into the unified Agent SSE stream
+            recent_tool_msgs = [m for m in st.messages[-len(validated_tc_objs):] if m.role == "tool"]
+            for tmsg in recent_tool_msgs:
+                tname = tmsg.name or ""
+                if not tname.startswith("canvas."):
+                    continue
+                try:
+                    tpayload = json.loads(tmsg.content or "{}")
+                except Exception:
+                    tpayload = {}
+                if not isinstance(tpayload, dict):
+                    continue
+                if tpayload.get("error"):
+                    await _emit_with_fence(
+                        ctx,
+                        "artifact.error",
+                        {
+                            "tool_name": tname,
+                            "tool_call_id": tmsg.tool_call_id,
+                            "code": tpayload.get("code") or "canvas_tool_error",
+                            "message": tpayload.get("message") or "canvas tool failed",
+                        },
+                    )
+                    continue
+                art = tpayload.get("artifact") if isinstance(tpayload.get("artifact"), dict) else {}
+                art_id = art.get("artifact_id") or tpayload.get("artifact_id")
+                if tname in ("canvas.create_artifact", "canvas.load_from_workspace") and art_id:
+                    await _emit_with_fence(
+                        ctx,
+                        "artifact.created",
+                        {
+                            "artifact_id": art_id,
+                            "title": art.get("title"),
+                            "artifact_type": art.get("artifact_type"),
+                            "revision": art.get("current_revision", 1),
+                            "workspace_id": art.get("workspace_id") or st.workspace_id,
+                            "tool_call_id": tmsg.tool_call_id,
+                        },
+                    )
+                elif tname == "canvas.propose_edit" and art_id:
+                    prop = tpayload.get("proposal") if isinstance(tpayload.get("proposal"), dict) else {}
+                    await _emit_with_fence(
+                        ctx,
+                        "artifact.edit.proposed",
+                        {
+                            "artifact_id": art_id,
+                            "proposal_id": prop.get("proposal_id") or tpayload.get("proposal_id"),
+                            "base_revision": prop.get("base_revision"),
+                            "tool_call_id": tmsg.tool_call_id,
+                        },
+                    )
+                elif tname == "canvas.apply_edit" and art_id:
+                    await _emit_with_fence(
+                        ctx,
+                        "artifact.edit.applied",
+                        {
+                            "artifact_id": art_id,
+                            "revision": art.get("current_revision"),
+                            "tool_call_id": tmsg.tool_call_id,
+                        },
+                    )
+                elif tname in ("canvas.restore_revision", "canvas.save_to_workspace") and art_id:
+                    await _emit_with_fence(
+                        ctx,
+                        "artifact.updated",
+                        {
+                            "artifact_id": art_id,
+                            "revision": art.get("current_revision") or tpayload.get("artifact_revision"),
+                            "save_state": tpayload.get("save_state"),
+                            "workspace_id": tpayload.get("workspace_id") or art.get("workspace_id") or st.workspace_id,
+                            "tool_call_id": tmsg.tool_call_id,
+                        },
+                    )
             if any_tool_err:
                 outcome = "failed"
             elif any_tool_unknown:

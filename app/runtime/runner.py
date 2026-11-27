@@ -239,6 +239,45 @@ class AgentRunner:
 
             active_tool_names = [t.name for t in registry.list_tools(service=service_id)]
             messages = [GatewayMessage(role="system", content=ContextAdapter.build_system_message(active_tool_names))]
+            workspace_id: Optional[str] = (req.workspace_id or "").strip() or None
+            if workspace_id is not None:
+                from app.config import is_workspace_enabled
+
+                if not is_workspace_enabled():
+                    raise DocumentReferenceError("workspace_disabled")
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workspace_id):
+                    raise DocumentReferenceError("invalid_workspace_id")
+                from app.workspace.manager import WorkspaceFailure
+                from app.workspace.runtime import get_runtime as _get_workspace_runtime
+
+                ws_scope = caller_scope
+                if ws_scope is None:
+                    from app.core.auth import ExecutionScope
+
+                    ws_scope = ExecutionScope(
+                        authenticated=is_authenticated,
+                        auth_source="dev_local",
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                        service_id=service_id,
+                        role="user",
+                    )
+                try:
+                    ws_identity = _get_workspace_runtime().manager.ensure_open(workspace_id, ws_scope)
+                except WorkspaceFailure as exc:
+                    raise DocumentReferenceError(exc.error.code.value) from exc
+                ws_mode = "읽기 전용" if getattr(ws_identity, "read_only", False) else "읽기/쓰기"
+                messages.append(
+                    GatewayMessage(
+                        role="system",
+                        content=(
+                            f"활성 워크스페이스 컨텍스트: workspace_id={workspace_id}, "
+                            f"name={ws_identity.name}, mode={ws_mode}. "
+                            "워크스페이스 파일 탐색·읽기·검색·수정 및 캔버스 연계 시 등록된 도구 스키마를 자율적으로 활용하고 "
+                            "이 workspace_id만 사용하세요."
+                        ),
+                    )
+                )
             if refs:
                 messages.append(GatewayMessage(
                     role="system",
@@ -260,6 +299,7 @@ class AgentRunner:
                 authenticated=is_authenticated,
                 execution_scope=caller_scope,
                 context_refs=refs,
+                workspace_id=workspace_id,
                 document_titles=titles,
                 messages=messages,
                 max_steps=min(opts.max_steps, get_runtime_config().max_agent_steps) if opts and opts.max_steps else get_runtime_config().max_agent_steps,

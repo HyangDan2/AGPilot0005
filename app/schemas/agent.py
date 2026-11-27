@@ -18,6 +18,7 @@ class AgentRunRequest(BaseModel):
     options: Optional[AgentRunOptions] = None
     history: List[Dict[str, str]] = Field(default_factory=list, max_length=16)
     analysis_refs: List[str] = Field(default_factory=list, max_length=10)
+    workspace_id: Optional[str] = None
 
 class ToolExecutionTrace(BaseModel):
     step: int

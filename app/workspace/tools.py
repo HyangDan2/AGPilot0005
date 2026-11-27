@@ -1034,3 +1034,61 @@ class WorkspaceToolAdapter:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{key} is required")
         return value.strip()
+
+
+WORKSPACE_TOOL_NAMES: Tuple[str, ...] = READ_TOOLS + WRITE_TOOLS
+
+
+def install_workspace_tools(tool_registry: Any) -> List[str]:
+    """CP-03: Register all 11 Workspace Agent Tools into the AGCore ToolRegistry."""
+    from app.core.auth import current_execution_scope
+    from app.workspace.runtime import get_runtime as _get_workspace_runtime
+
+    installed: List[str] = []
+    for spec in TOOL_MANIFEST["tools"]:
+        tool_name = spec["name"]
+        if tool_registry.get_registration(tool_name) is not None:
+            installed.append(tool_name)
+            continue
+
+        def _make_handler(tname: str):
+            async def _handler(**kwargs: Any) -> Dict[str, Any]:
+                scope = current_execution_scope.get()
+                if scope is None or not getattr(scope, "authenticated", False):
+                    return {
+                        "error": True,
+                        "status": "error",
+                        "code": "forbidden",
+                        "message": "authenticated ExecutionScope is required for workspace tools",
+                    }
+                rt = _get_workspace_runtime()
+                ctx = ToolInvocationContext(scope=scope)
+                out = rt.tools.invoke(tname, kwargs, ctx)
+                # CP-02 #7: Never report server-side tool success when local_browser requires client_write
+                inner = out.get("result") if isinstance(out, dict) else None
+                if isinstance(inner, dict) and inner.get("client_write") is not None:
+                    return {
+                        "error": True,
+                        "status": "error",
+                        "tool": tname,
+                        "code": "provider_mismatch",
+                        "message": "local_browser workspace requires client_write completion which is unsupported in server tool runtime",
+                        "client_write_required": True,
+                        "client_write": inner.get("client_write"),
+                    }
+                if isinstance(out, dict) and out.get("status") != "ok":
+                    return {"error": True, **out}
+                return out
+
+            _handler.__name__ = tname
+            return _handler
+
+        tool_registry.register(
+            name=tool_name,
+            description=spec["description"],
+            parameters=spec["input_schema"],
+            handler=_make_handler(tool_name),
+            is_read_only=(tool_name in READ_TOOLS),
+        )
+        installed.append(tool_name)
+    return installed

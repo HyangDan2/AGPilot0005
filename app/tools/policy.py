@@ -37,7 +37,38 @@ BUILTIN_TOOLS = [
     # WO-C18 workspace-aware tools (their own opt-in switch: AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED)
     "canvas.save_to_workspace",
     "canvas.load_from_workspace",
+    # R2 Workspace Agent tools (11 tools, opt-in via AGCORE_WORKSPACE_ENABLED; CP-03)
+    "workspace_list_files",
+    "workspace_find_files",
+    "workspace_get_file_info",
+    "workspace_read_file",
+    "workspace_search_text",
+    "workspace_retrieve",
+    "workspace_create_file",
+    "workspace_patch_file",
+    "workspace_move_file",
+    "workspace_delete_file",
+    "workspace_create_directory",
 ]
+
+WORKSPACE_TOOLS = {
+    "workspace_list_files",
+    "workspace_find_files",
+    "workspace_get_file_info",
+    "workspace_read_file",
+    "workspace_search_text",
+    "workspace_retrieve",
+    "workspace_create_file",
+    "workspace_patch_file",
+    "workspace_move_file",
+    "workspace_delete_file",
+    "workspace_create_directory",
+}
+
+CANVAS_WORKSPACE_TOOLS = {
+    "canvas.save_to_workspace",
+    "canvas.load_from_workspace",
+}
 
 DEFAULT_POLICY: Dict[str, Any] = {
     "schema": 1,
@@ -83,6 +114,27 @@ DEFAULT_POLICY: Dict[str, Any] = {
                 "web.search",
                 "math.calculate",
                 "system.get_datetime",
+                # R2 Workspace & Canvas tools (feature-flag gated in is_tool_allowed; CP-03)
+                "workspace_list_files",
+                "workspace_find_files",
+                "workspace_get_file_info",
+                "workspace_read_file",
+                "workspace_search_text",
+                "workspace_retrieve",
+                "workspace_create_file",
+                "workspace_patch_file",
+                "workspace_move_file",
+                "workspace_delete_file",
+                "workspace_create_directory",
+                "canvas.create_artifact",
+                "canvas.read_artifact",
+                "canvas.list_artifacts",
+                "canvas.propose_edit",
+                "canvas.list_revisions",
+                "canvas.restore_revision",
+                "canvas.export_artifact",
+                "canvas.save_to_workspace",
+                "canvas.load_from_workspace",
             ],
             "max_tool_calls": 16,
         },
@@ -197,6 +249,20 @@ class ToolPolicyStore:
         if tool_name in BUILTIN_TOOLS:
             if not providers.get("builtin", {}).get("enabled", True):
                 return False, "builtin_provider_disabled"
+            # CP-02 / CP-03: Feature-flag gating for R2 Workspace and Canvas tools on service-scoped runs
+            if service_id:
+                if tool_name in WORKSPACE_TOOLS:
+                    from app.config import is_workspace_enabled
+
+                    if not is_workspace_enabled():
+                        return False, "workspace_disabled"
+                if tool_name.startswith("canvas."):
+                    from app.config import is_canvas_tools_enabled, is_workspace_enabled
+
+                    if not is_canvas_tools_enabled():
+                        return False, "canvas_tools_disabled"
+                    if tool_name in CANVAS_WORKSPACE_TOOLS and not is_workspace_enabled():
+                        return False, "workspace_disabled"
             # NG-01: Respect global AGTOOLS_ENABLED switch across all document.* tools
             if tool_name.startswith("document.") and not settings.AGTOOLS_ENABLED:
                 return False, "agtools_disabled"
