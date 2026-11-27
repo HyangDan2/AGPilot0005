@@ -682,6 +682,13 @@ Smoke run over HTTP (`uvicorn` on 127.0.0.1, dev workspace provider, 2026-11-27)
 | list with `?workspace_id` after close | `409 workspace_closed` |
 | export after close | `409 workspace_closed` |
 
+Path-gate parity (checked against the Workspace/RAG branch itself): 23 representative paths
+(`a.md`, `한글 폴더/문서.md`, absolute, `..`, `.`, `//`, drive letter, backslash, NUL, 256-char
+segment, 1025-char path, trailing slash, …) were validated with
+`app/workspace/contracts.py::validate_relative_path` loaded from `origin/feat/r2-workspace-rag` and
+with the Canvas mirror — **0 mismatches**, and all **22** contract error codes are mapped
+(`WORKSPACE_ERROR_CODES`).
+
 ## 12. Not implemented / not verified
 
 | Item | State |
