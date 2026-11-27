@@ -211,6 +211,215 @@ def _cleanup_r2_singletons():
             registry.unregister(name)
 
 
+@pytest.mark.asyncio
+async def test_hotfix07_managed_binding_persists_and_never_switches_workspace(monkeypatch, tmp_path):
+    workspace, _ = _setup_r2_env(monkeypatch, tmp_path, ScriptedGateway([{"content": "OK"}]))
+    scope = _scope()
+    headers = _proxy_headers()
+    folder_a = workspace.manager.new_workspace(scope, "folder-a")
+    folder_b = workspace.manager.new_workspace(scope, "folder-b")
+    bind_path = "/api/v1/conversations/managed-a/workspace"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.put(bind_path, headers=headers, json={})).status_code == 422
+        for _ in range(2):
+            result = await client.put(bind_path, headers=headers, json={"workspace_id": folder_a.workspace_id})
+            assert result.status_code == 200
+            assert result.json() == {"conversation_id": "managed-a", "workspace_id": folder_a.workspace_id}
+
+        set_runtime(WorkspaceRuntime.build(workspace.settings))
+        for other in (None, folder_b.workspace_id):
+            conflict = await client.put(bind_path, headers=headers, json={"workspace_id": other})
+            assert conflict.status_code == 409
+            assert conflict.json()["detail"] == "conversation_workspace_conflict"
+            rejected_run = await client.post("/api/v1/agent/runs", headers=headers, json={
+                "message": "Change folder", "conversation_id": "managed-a", "workspace_id": other,
+            })
+            assert rejected_run.status_code == 409
+
+        for isolated_headers in (
+            _proxy_headers(user="bob"), _proxy_headers(tenant="tenant-b"),
+            _proxy_headers(service="hd2ai-beta"),
+        ):
+            unauthorized = await client.put(bind_path, headers=isolated_headers, json={
+                "workspace_id": folder_a.workspace_id,
+            })
+            assert unauthorized.status_code == 404
+            distinct = await client.put(bind_path, headers=isolated_headers, json={"workspace_id": None})
+            assert distinct.status_code == 200 and distinct.json()["workspace_id"] is None
+
+        no_assignment = await client.post("/api/v1/agent/runs", headers=headers, json={
+            "message": "Legacy message", "conversation_id": "legacy-unbound",
+        })
+        assert no_assignment.status_code == 202
+        assert (await _wait_terminal(client, no_assignment.json()["run_id"], headers))["status"] == "completed"
+        assert workspace.store.find_conversation_workspace(
+            scope.tenant_id, scope.owner_id, scope.service_id, "legacy-unbound",
+        ) is None
+
+        general = await client.put(
+            "/api/v1/conversations/managed-general/workspace", headers=headers, json={"workspace_id": None},
+        )
+        assert general.status_code == 200
+        switch = await client.post("/api/v1/agent/runs", headers=headers, json={
+            "message": "Attach folder", "conversation_id": "managed-general", "bind_workspace": True,
+            "workspace_id": folder_a.workspace_id,
+        })
+        assert switch.status_code == 409
+
+        competing = await asyncio.gather(*(
+            client.put("/api/v1/conversations/managed-race/workspace", headers=headers, json={"workspace_id": value})
+            for value in (folder_a.workspace_id, folder_b.workspace_id)
+        ))
+        assert sorted(result.status_code for result in competing) == [200, 409]
+
+        workspace.manager.close_workspace(folder_a.workspace_id, scope)
+        closed = await client.post("/api/v1/agent/runs", headers=headers, json={
+            "message": "Resume", "conversation_id": "managed-a",
+        })
+        assert closed.status_code == 409 and closed.json()["detail"] == "workspace_closed"
+        monkeypatch.setattr("app.workspace.binding.get_settings", lambda: workspace.settings)
+        monkeypatch.setenv("AGCORE_WORKSPACE_ENABLED", "false")
+        disabled = await client.post("/api/v1/agent/runs", headers=headers, json={
+            "message": "Resume", "conversation_id": "managed-a",
+        })
+        assert disabled.status_code == 403 and disabled.json()["detail"] == "workspace_disabled_for_service"
+
+
+@pytest.mark.asyncio
+async def test_hotfix07_omni_tools_get_bound_scope_without_model_ids(monkeypatch, tmp_path):
+    from app.tools.policy import tool_policy
+    from app.tools.registry import registry
+
+    class CapturedSchemas(ScriptedGateway):
+        async def execute(self, messages, tools=None, **kwargs):
+            self.schemas = {t.function.name: t.function.parameters for t in tools or []}
+            if tools:
+                self.initial_schemas = self.schemas
+            return await super().execute(messages, tools=tools, **kwargs)
+
+    def call(name, arguments, call_id):
+        return ToolCall(id=call_id, function=FunctionCall(name=name, arguments=json.dumps(arguments)))
+
+    gateway = CapturedSchemas([])
+    monkeypatch.setenv("AGCORE_CANVAS_WORKSPACE_TOOLS_ENABLED", "true")
+    workspace, canvas = _setup_r2_env(monkeypatch, tmp_path, gateway)
+    scope = _scope()
+    headers = _proxy_headers()
+    folder = workspace.manager.new_workspace(scope, "folder-a")
+    other = workspace.manager.new_workspace(scope, "folder-b")
+    workspace.manager.write_file(folder.workspace_id, scope, WorkspaceWriteRequest(
+        path="notes.md", content="distinctive dummy notes for search", create_parents=True,
+    ))
+    workspace.indexer.run_pending()
+    foreign_artifact, *_ = canvas.manager.create(
+        scope, title="Other session", artifact_type="markdown", content="private for other session",
+        conversation_id="other-session", workspace_id=other.workspace_id,
+    )
+
+    async def external_workspace(workspace_id):
+        return {"workspace_id": workspace_id}
+
+    parameters = {
+        "type": "object", "properties": {"workspace_id": {"type": "string"}}, "required": ["workspace_id"],
+    }
+    registry.register("test.external", "Independent test context", parameters, external_workspace)
+    original_allow = tool_policy.is_tool_allowed
+    monkeypatch.setattr(tool_policy, "is_tool_allowed", lambda name, service: (
+        (True, None) if name == "test.external" else original_allow(name, service)
+    ))
+    gateway.script = [
+        {"tool_calls": [call("workspace_list_files", {}, "tc-list")]},
+        {"tool_calls": [call("workspace_read_file", {"path": "notes.md"}, "tc-read")]},
+        {"tool_calls": [call("workspace_retrieve", {"query": "distinctive", "mode": "keyword"}, "tc-rag")]},
+        {"tool_calls": [call("workspace_list_files", {"workspace_id": other.workspace_id}, "tc-wrong-folder")]},
+        {"tool_calls": [call("canvas.read_artifact", {"artifact_id": foreign_artifact.artifact_id}, "tc-wrong-artifact")]},
+        {"tool_calls": [call("canvas.create_artifact", {
+            "title": "Scoped artifact", "artifact_type": "markdown", "content": "hello world",
+        }, "tc-create")]},
+        {"content": "Complete"},
+    ]
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            conversation_id = "managed-tools"
+            assert (await client.put(f"/api/v1/conversations/{conversation_id}/workspace", headers=headers, json={
+                "workspace_id": folder.workspace_id,
+            })).status_code == 200
+            result = await client.post("/api/v1/agent/runs", headers=headers, json={
+                "message": "Use my folder", "stream": True, "conversation_id": conversation_id,
+            })
+            assert result.status_code == 200
+            events = _parse_sse(result.text)
+            assert any(event["event"] == "run.completed" for event in events), result.text
+            traces = await _wait_terminal(client, events[0]["data"]["run_id"], headers)
+            by_id = {trace["tool_call_id"]: trace for trace in traces["traces"]}
+            for call_id in ("tc-list", "tc-read", "tc-rag", "tc-create"):
+                assert by_id[call_id]["status"] == "completed"
+                assert by_id[call_id]["arguments"]["workspace_id"] == folder.workspace_id
+            assert by_id["tc-wrong-folder"]["error_code"] == "conversation_workspace_conflict"
+            assert by_id["tc-wrong-artifact"]["error_code"] == "conversation_workspace_conflict"
+            assert "workspace_id" not in gateway.initial_schemas["workspace_read_file"]["properties"]
+            assert "workspace_id" not in gateway.initial_schemas["canvas.load_from_workspace"]["required"]
+            assert gateway.initial_schemas["test.external"] == parameters
+            artifact_event = next(event["data"] for event in events if event["event"] == "artifact.created")
+            artifact_id = artifact_event["artifact_id"]
+            assert artifact_event["conversation_id"] == conversation_id
+            artifact = canvas.manager.get(scope, artifact_id)["artifact"]
+            assert artifact["workspace_id"] == folder.workspace_id
+            assert artifact["conversation_id"] == conversation_id
+
+            wrong_save = await client.post(f"/api/v1/canvas/artifacts/{artifact_id}/save-to-workspace", headers=headers, json={
+                "workspace_id": other.workspace_id, "path": "wrong.md",
+            })
+            assert wrong_save.status_code == 409
+            valid_save = await client.post(f"/api/v1/canvas/artifacts/{artifact_id}/save-to-workspace", headers=headers, json={
+                "path": "scoped.md",
+            })
+            assert valid_save.status_code == 200 and valid_save.json()["workspace_id"] == folder.workspace_id
+            assert (await client.get("/api/v1/canvas/artifacts", headers=headers, params={
+                "conversation_id": conversation_id, "workspace_id": other.workspace_id,
+            })).status_code == 409
+
+            second = "managed-tools-second"
+            assert (await client.put(f"/api/v1/conversations/{second}/workspace", headers=headers, json={
+                "workspace_id": folder.workspace_id,
+            })).status_code == 200
+            loaded = []
+            for selected in (conversation_id, second, second):
+                response = await client.post("/api/v1/canvas/artifacts/from-workspace", headers=headers, json={
+                    "workspace_id": folder.workspace_id, "conversation_id": selected, "path": "notes.md",
+                })
+                assert response.status_code == 201, response.text
+                body = response.json()
+                assert body["artifact"]["conversation_id"] == selected
+                loaded.append(body["artifact"]["artifact_id"])
+            assert loaded[0] != loaded[1] == loaded[2]
+
+            general = "managed-general-tools"
+            assert (await client.put(f"/api/v1/conversations/{general}/workspace", headers=headers, json={
+                "workspace_id": None,
+            })).status_code == 200
+            gateway.calls.clear()
+            gateway.script = [
+                {"tool_calls": [call("workspace_list_files", {}, "tc-general-workspace")]},
+                {"tool_calls": [call("canvas.create_artifact", {
+                    "title": "General artifact", "artifact_type": "markdown", "content": "general hello",
+                }, "tc-general-canvas")]},
+                {"content": "Complete"},
+            ]
+            general_run = await client.post("/api/v1/agent/runs", headers=headers, json={
+                "message": "General chat", "conversation_id": general, "stream": True,
+            })
+            assert general_run.status_code == 200
+            assert "workspace_list_files" not in gateway.initial_schemas
+            assert "canvas.save_to_workspace" not in gateway.initial_schemas
+            general_events = _parse_sse(general_run.text)
+            general_created = next(event["data"] for event in general_events if event["event"] == "artifact.created")
+            saved = canvas.manager.get(scope, general_created["artifact_id"])["artifact"]
+            assert saved["conversation_id"] == general and saved["workspace_id"] is None
+    finally:
+        registry.unregister("test.external")
+
+
 # ---------------------------------------------------------------------------
 # Scenario 1: Feature Flag OFF default + Normal Chat + AM-06 Fail-Fast
 # ---------------------------------------------------------------------------

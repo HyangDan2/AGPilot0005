@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -96,6 +96,15 @@ CREATE TABLE IF NOT EXISTS workspace_conversation_ref (
     created_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, conversation_id),
     FOREIGN KEY (workspace_id) REFERENCES workspace(workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS conversation_workspace_binding (
+    tenant_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    service_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    workspace_id TEXT,
+    PRIMARY KEY (tenant_id, owner_id, service_id, conversation_id)
 );
 
 CREATE TABLE IF NOT EXISTS workspace_artifact_ref (
@@ -706,6 +715,53 @@ class WorkspaceStore:
                 "INSERT OR IGNORE INTO workspace_conversation_ref(workspace_id, conversation_id, created_at) VALUES(?,?,?)",
                 (workspace_id, conversation_id, at),
             )
+
+    def find_conversation_workspace(
+        self, tenant_id: str, owner_id: str, service_id: str, conversation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.read() as conn:
+            return self._select_conversation_workspace(conn, (tenant_id, owner_id, service_id, conversation_id))
+
+    @staticmethod
+    def _select_conversation_workspace(
+        conn: sqlite3.Connection, key: tuple[str, str, str, str],
+    ) -> Optional[Dict[str, Any]]:
+        return _row(conn.execute(
+            "SELECT conversation_id, workspace_id FROM conversation_workspace_binding "
+            "WHERE tenant_id=? AND owner_id=? AND service_id=? AND conversation_id=?", key,
+        ).fetchone())
+
+    @classmethod
+    def find_existing_conversation_workspace(
+        cls, db_path: Path, tenant_id: str, owner_id: str, service_id: str, conversation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Read persisted bindings while the Workspace engine is disabled."""
+        if not db_path.is_file():
+            return None
+        with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_workspace_binding'"
+            ).fetchone()
+            if table is None:  # existing databases from releases before managed bindings
+                return None
+            return cls._select_conversation_workspace(conn, (tenant_id, owner_id, service_id, conversation_id))
+
+    def bind_conversation_workspace(
+        self, tenant_id: str, owner_id: str, service_id: str, conversation_id: str,
+        workspace_id: Optional[str],
+    ) -> Dict[str, Any]:
+        key = (tenant_id, owner_id, service_id, conversation_id)
+        with self.write() as conn:
+            conn.execute(
+                "INSERT INTO conversation_workspace_binding VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (tenant_id, owner_id, service_id, conversation_id) DO NOTHING",
+                (*key, workspace_id),
+            )
+            binding = self._select_conversation_workspace(conn, key)
+            if binding is None:
+                raise RuntimeError("conversation workspace binding was not persisted")
+            return binding
 
     def list_conversation_refs(self, workspace_id: str) -> List[Dict[str, Any]]:
         with self.read() as conn:

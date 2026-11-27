@@ -1154,6 +1154,8 @@ def install_workspace_tools(tool_registry: Any) -> List[str]:
             parameters=spec["input_schema"],
             handler=_make_handler(tool_name),
             is_read_only=(tool_name in READ_TOOLS),
+            requires_workspace_context=True,
+            context_inputs=("workspace_id",),
         )
         installed.append(tool_name)
     return installed

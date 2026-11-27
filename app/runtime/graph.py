@@ -9,6 +9,7 @@ from app.schemas.gateway import GatewayMessage
 from app.tools.dispatcher import dispatcher
 from app.tools.registry import registry
 from app.adapters.document import document_owner_id, tool_token_budget
+from app.core.auth import current_run_workspace_binding
 
 async def model_node(
     state: AgentState,
@@ -72,7 +73,7 @@ async def model_node(
         pruned_msgs = public_grounded_messages(state, max_body_chars=max_body_chars)
     
     # 2. Get tool definitions for this service
-    tools = registry.get_definitions(service=state.service_id)
+    tools = registry.get_definitions(service=state.service_id, binding=state.workspace_binding)
     first_document_step = bool(state.context_refs) and state.tool_call_count == 0
     if first_document_step:
         tools = [tool for tool in tools if tool.function.name == "document.get_outline"]
@@ -266,6 +267,7 @@ async def tool_node(
     scope_token = current_execution_scope.set(state.execution_scope) if state.execution_scope is not None else None
     approvals_token = current_run_approvals.set(frozenset(state.approvals or ()))
     conv_token = current_run_conversation_id.set(state.conversation_id)
+    workspace_token = current_run_workspace_binding.set(state.workspace_binding)
     try:
         results = await dispatcher.execute_batch(
             calls=calls,
@@ -278,6 +280,7 @@ async def tool_node(
             constraints=constraints,
         )
     finally:
+        current_run_workspace_binding.reset(workspace_token)
         current_run_conversation_id.reset(conv_token)
         current_run_approvals.reset(approvals_token)
         if scope_token is not None:

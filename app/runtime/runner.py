@@ -269,14 +269,19 @@ class AgentRunner:
                 except WorkspaceFailure as exc:
                     raise DocumentReferenceError(exc.error.code.value) from exc
                 ws_mode = "읽기 전용" if getattr(ws_identity, "read_only", False) else "읽기/쓰기"
+                workspace_details = f"name={ws_identity.name}, mode={ws_mode}."
+                if req.bind_workspace:
+                    workspace_guidance = "현재 대화의 워크스페이스는 실행 시 자동으로 적용됩니다."
+                else:
+                    workspace_details = f"workspace_id={workspace_id}, {workspace_details}"
+                    workspace_guidance = "이 workspace_id만 사용하세요."
                 messages.append(
                     GatewayMessage(
                         role="system",
                         content=(
-                            f"활성 워크스페이스 컨텍스트: workspace_id={workspace_id}, "
-                            f"name={ws_identity.name}, mode={ws_mode}. "
-                            "워크스페이스 파일 탐색·읽기·검색·수정 및 캔버스 연계 시 등록된 도구 스키마를 자율적으로 활용하고 "
-                            "이 workspace_id만 사용하세요."
+                            f"활성 워크스페이스 컨텍스트: {workspace_details} "
+                            "워크스페이스 파일 탐색·읽기·검색·수정 및 캔버스 연계 시 등록된 도구 스키마를 자율적으로 활용하세요. "
+                            f"{workspace_guidance}"
                         ),
                     )
                 )
@@ -303,6 +308,7 @@ class AgentRunner:
                 execution_scope=caller_scope,
                 context_refs=refs,
                 workspace_id=workspace_id,
+                workspace_bound=req.bind_workspace,
                 approvals=list(req.approvals or ()),
                 document_titles=titles,
                 messages=messages,

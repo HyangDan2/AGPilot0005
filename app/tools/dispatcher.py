@@ -233,6 +233,23 @@ class ToolDispatcher:
             return DispatchResult(call_id, func_name, error_json, trace, is_error=True)
 
         # 2.2 Validate arguments against JSON Schema (R1-FIX-12 B)
+        from app.core.auth import current_run_workspace_binding
+
+        binding = current_run_workspace_binding.get()
+        if binding is not None:
+            if binding.workspace_id is None and reg.requires_workspace_context:
+                trace.status = "failed"
+                trace.error_code = "workspace_context_required"
+                return DispatchResult(call_id, func_name, json.dumps({"error": True, "code": trace.error_code}), trace, is_error=True)
+            for key, value in reg.context_arguments(binding).items():
+                if key in args and args[key] != value:
+                    trace.status = "failed"
+                    trace.error_code = "conversation_workspace_conflict"
+                    return DispatchResult(call_id, func_name, json.dumps({"error": True, "code": trace.error_code}), trace, is_error=True)
+                if value is not None:
+                    args[key] = value
+                else:
+                    args.pop(key, None)
         schema_err = _validate_args_against_schema(args, getattr(reg, "parameters", None))
         if schema_err:
             trace.status = "failed"

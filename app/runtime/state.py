@@ -1,6 +1,7 @@
 """Agent Runtime State Definition for LangGraph."""
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
+from app.core.auth import ConversationWorkspace
 from app.schemas.agent import ToolExecutionTrace
 from app.schemas.gateway import GatewayMessage, ToolCall
 
@@ -15,6 +16,7 @@ class AgentState(BaseModel):
     execution_scope: Optional[Any] = None
     context_refs: List[str] = Field(default_factory=list)
     workspace_id: Optional[str] = None
+    workspace_bound: bool = False
     approvals: List[str] = Field(default_factory=list)
     document_titles: Dict[str,str] = Field(default_factory=dict)
     citations: List[Dict[str,Any]] = Field(default_factory=list)
@@ -47,3 +49,9 @@ class AgentState(BaseModel):
     custom_client: Optional[Any] = None
 
     model_config = {"arbitrary_types_allowed": True}
+
+    @property
+    def workspace_binding(self) -> Optional[ConversationWorkspace]:
+        if not self.workspace_bound or self.conversation_id is None:
+            return None
+        return ConversationWorkspace(self.conversation_id, self.workspace_id)

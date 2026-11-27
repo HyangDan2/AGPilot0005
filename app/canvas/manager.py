@@ -42,6 +42,7 @@ from app.canvas.workspace import (
     read_workspace_file,
     write_workspace_file,
 )
+from app.core.auth import ConversationWorkspace, current_run_workspace_binding
 
 
 def scope_ids(scope: Any) -> tuple[str, str, str]:
@@ -50,6 +51,23 @@ def scope_ids(scope: Any) -> tuple[str, str, str]:
         str(getattr(scope, "owner_id", "") or ""),
         str(getattr(scope, "service_id", "") or ""),
     )
+
+
+def _conversation_binding(scope: Any, conversation_id: Optional[str]) -> Optional[ConversationWorkspace]:
+    from app.workspace.binding import find_conversation_workspace
+
+    running = current_run_workspace_binding.get()
+    if running is not None and running.conversation_id == conversation_id:
+        return running
+    return find_conversation_workspace(scope, conversation_id)
+
+
+def _resolve_workspace(binding: Optional[ConversationWorkspace], workspace_id: Optional[str]) -> Optional[str]:
+    if binding is None:
+        return workspace_id
+    if workspace_id is not None and binding.workspace_id != workspace_id:
+        raise CanvasError(CanvasErrorCode.CONVERSATION_WORKSPACE_CONFLICT)
+    return binding.workspace_id
 
 
 def assert_workspace_level(
@@ -113,6 +131,11 @@ def owned_artifact(
     ):
         # Deliberately indistinguishable from "missing" so ids of other users are not confirmed.
         raise CanvasError(CanvasErrorCode.ARTIFACT_NOT_FOUND, context={"artifact_id": artifact_id})
+    running = current_run_workspace_binding.get()
+    if running is not None and (artifact.conversation_id, artifact.workspace_id) != (
+        running.conversation_id, running.workspace_id,
+    ):
+        raise CanvasError(CanvasErrorCode.CONVERSATION_WORKSPACE_CONFLICT)
     return artifact
 
 
@@ -254,6 +277,8 @@ class ArtifactManager:
         clean_title = sanitize_title(title, max_chars=self.settings.max_title_chars)
         if conversation_id is not None:
             conversation_id = validate_identifier(conversation_id, "conversation_id")
+        binding = _conversation_binding(scope, conversation_id)
+        workspace_id = _resolve_workspace(binding, workspace_id)
         if workspace_id is not None:
             workspace_id = validate_identifier(workspace_id, "workspace_id")
             # WO-C17 / C-FIX-01 & CP-02 #4: creating directly into a workspace requires write;
@@ -300,6 +325,8 @@ class ArtifactManager:
         stored, stored_revision, duplicate = self.storage.create_artifact(
             artifact, revision, content, event_key=idempotency_key
         )
+        if binding is not None and (stored.conversation_id, stored.workspace_id) != (conversation_id, workspace_id):
+            raise CanvasError(CanvasErrorCode.CONVERSATION_WORKSPACE_CONFLICT)
         validation = (
             validate_structured_json(content) if spec.key == "structured_json" else None
         )
@@ -325,6 +352,8 @@ class ArtifactManager:
         page_limit = min(int(limit or self.settings.default_page_limit), self.settings.max_list_limit)
         offset = max(0, int(offset))
         tenant_id, owner_id, service_id = scope_ids(scope)
+        binding = _conversation_binding(scope, conversation_id)
+        workspace_id = _resolve_workspace(binding, workspace_id)
         if workspace_id is not None:
             # WO-C17 / C-FIX-01: an explicit workspace filter is a read of that workspace.
             assert_workspace_level(
@@ -332,7 +361,8 @@ class ArtifactManager:
                 required="read", operation="artifact.list",
             )
 
-        linked = self.storage.count_artifacts(
+        general = binding is not None and binding.workspace_id is None
+        linked = 0 if general else self.storage.count_artifacts(
             tenant_id=tenant_id,
             owner_id=owner_id,
             service_id=service_id,
@@ -349,6 +379,7 @@ class ArtifactManager:
                 conversation_id=conversation_id,
                 workspace_id=workspace_id,
                 artifact_type=artifact_type,
+                has_workspace=False if general else None,
                 limit=page_limit,
                 offset=offset,
             )
@@ -527,6 +558,14 @@ class ArtifactManager:
         if workspace_id is None and conversation_id is None:
             raise CanvasError(CanvasErrorCode.INVALID_REQUEST, "workspace_id or conversation_id is required")
 
+        original_binding = _conversation_binding(scope, artifact.conversation_id)
+        if original_binding is not None and conversation_id not in (None, original_binding.conversation_id):
+            raise CanvasError(CanvasErrorCode.CONVERSATION_WORKSPACE_CONFLICT)
+        target_binding = original_binding or _conversation_binding(scope, conversation_id)
+        if target_binding is not None:
+            _resolve_workspace(target_binding, artifact.workspace_id)
+            workspace_id = _resolve_workspace(target_binding, workspace_id)
+
         workspace_sync: Optional[Dict[str, Any]] = None
         if workspace_id is not None:
             workspace_id = validate_identifier(workspace_id, "workspace_id")
@@ -570,6 +609,8 @@ class ArtifactManager:
         documented way out of a workspace whose access was revoked, and it neither reads nor
         changes workspace content."""
         artifact = owned_artifact(self.storage, artifact_id, scope)
+        if _conversation_binding(scope, artifact.conversation_id) is not None:
+            raise CanvasError(CanvasErrorCode.CONVERSATION_WORKSPACE_CONFLICT)
         if kind == "workspace":
             # WO-C18-04: detaching also drops the save state; the workspace file itself is untouched.
             self.storage.delete_workspace_link(artifact.artifact_id)
@@ -632,6 +673,7 @@ class ArtifactManager:
             scope, artifact_id, revision, required="read"
         )
         workspace_id = validate_identifier(workspace_id, "workspace_id")
+        _resolve_workspace(_conversation_binding(scope, artifact.conversation_id), workspace_id)
         access = assert_workspace_level(
             self.workspace, workspace_id, scope,
             required="write", operation="artifact.export_to_workspace",
@@ -722,6 +764,8 @@ class ArtifactManager:
         """
 
         workspace_id = validate_identifier(workspace_id, "workspace_id")
+        binding = _conversation_binding(scope, conversation_id)
+        _resolve_workspace(binding, workspace_id)
         # CP-02 #4: Read-only workspace allows loading into a Canvas edit buffer;
         # saving/writing back to the workspace still enforces required="write" (403 read_only_workspace).
         access = assert_workspace_level(
@@ -737,10 +781,16 @@ class ArtifactManager:
         existing = self.storage.find_workspace_link(
             tenant_id=tenant_id, owner_id=owner_id, service_id=service_id,
             workspace_id=workspace_id, relative_path=source.relative_path,
+            conversation_id=binding.conversation_id if binding is not None else None,
         )
-        if existing is not None and self.storage.get_artifact(existing.artifact_id) is None:
-            self.storage.delete_workspace_link(existing.artifact_id)
-            existing = None
+        if existing is not None:
+            linked_artifact = self.storage.get_artifact(existing.artifact_id)
+            if linked_artifact is None:
+                self.storage.delete_workspace_link(existing.artifact_id)
+                existing = None
+            elif (linked_artifact.conversation_id != conversation_id
+                  and _conversation_binding(scope, linked_artifact.conversation_id) is not None):
+                existing = None
 
         source_payload = {
             "workspace_id": workspace_id,
@@ -875,6 +925,7 @@ class ArtifactManager:
         target_workspace = (
             validate_identifier(workspace_id, "workspace_id") if workspace_id else (link.workspace_id if link else None)
         )
+        target_workspace = _resolve_workspace(_conversation_binding(scope, artifact.conversation_id), target_workspace)
         if not target_workspace:
             raise CanvasError(
                 CanvasErrorCode.INVALID_REQUEST,

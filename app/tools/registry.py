@@ -1,8 +1,9 @@
 """Tool Registry and Specification Management."""
 import inspect
 import os
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
+from typing import Any, Callable, Coroutine, Dict, List, Literal, Optional, Set
 from pydantic import BaseModel
+from app.core.auth import ConversationWorkspace
 from app.schemas.gateway import ToolDefinition, ToolFunctionDefinition
 from app.tools.builtin.system import echo, get_datetime
 from app.tools.builtin.math import calculate
@@ -20,6 +21,9 @@ def canvas_tools_enabled() -> bool:
     return (os.environ.get(CANVAS_TOOLS_ENV) or "").strip().lower() in _TRUTHY
 
 
+ContextInput = Literal["conversation_id", "workspace_id"]
+
+
 class ToolRegistration(BaseModel):
     name: str
     description: str
@@ -27,6 +31,22 @@ class ToolRegistration(BaseModel):
     is_async: bool = True
     allowed_services: Optional[List[str]] = None
     is_read_only: bool = True  # Can be executed in parallel
+    requires_workspace_context: bool = False
+    context_inputs: tuple[ContextInput, ...] = ()
+
+    def context_arguments(self, binding: ConversationWorkspace) -> Dict[str, Optional[str]]:
+        """Resolve only context inputs explicitly enabled by the trusted adapter."""
+        return {key: getattr(binding, key) for key in self.context_inputs}
+
+    def model_parameters(self, binding: Optional[ConversationWorkspace]) -> Dict[str, Any]:
+        if binding is None or not self.context_inputs:
+            return self.parameters
+        supplied = self.context_arguments(binding)
+        return {
+            **self.parameters,
+            "properties": {k: v for k, v in self.parameters.get("properties", {}).items() if k not in supplied},
+            "required": [key for key in self.parameters.get("required", []) if key not in supplied],
+        }
 
 class ToolRegistry:
     def __init__(self):
@@ -42,6 +62,8 @@ class ToolRegistry:
         handler: Callable[..., Any],
         allowed_services: Optional[List[str]] = None,
         is_read_only: bool = True,
+        requires_workspace_context: bool = False,
+        context_inputs: tuple[ContextInput, ...] = (),
     ):
         reg = ToolRegistration(
             name=name,
@@ -50,6 +72,8 @@ class ToolRegistry:
             is_async=inspect.iscoroutinefunction(handler),
             allowed_services=allowed_services,
             is_read_only=is_read_only,
+            requires_workspace_context=requires_workspace_context,
+            context_inputs=context_inputs,
         )
         self._tools[name] = reg
         self._handlers[name] = handler
@@ -101,7 +125,9 @@ class ToolRegistry:
             res.append(reg)
         return res
 
-    def get_definitions(self, service: Optional[str] = None) -> List[ToolDefinition]:
+    def get_definitions(
+        self, service: Optional[str] = None, *, binding: Optional[ConversationWorkspace] = None,
+    ) -> List[ToolDefinition]:
         """Returns OpenAI-compatible ToolDefinition list for AI Gateway."""
         tools = self.list_tools(service)
         return [
@@ -110,10 +136,11 @@ class ToolRegistry:
                 function=ToolFunctionDefinition(
                     name=t.name,
                     description=t.description,
-                    parameters=t.parameters,
+                    parameters=t.model_parameters(binding),
                 ),
             )
             for t in tools
+            if binding is None or binding.workspace_id is not None or not t.requires_workspace_context
         ]
 
     def _register_default_tools(self):

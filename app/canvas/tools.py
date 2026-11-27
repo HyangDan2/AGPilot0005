@@ -577,6 +577,9 @@ def install_canvas_tools(tool_registry: Any = None, *, ai_exposed_only: bool = T
             parameters=spec["parameters"],
             handler=_HANDLERS[name],
             is_read_only=bool(spec.get("read_only")),
+            context_inputs=tuple(
+                key for key in ("conversation_id", "workspace_id") if key in spec["parameters"]["properties"]
+            ),
         )
         registered.append(name)
     if workspace_tools_enabled():
@@ -605,6 +608,10 @@ def install_canvas_workspace_tools(tool_registry: Any = None) -> List[str]:
             parameters=spec["parameters"],
             handler=_WORKSPACE_HANDLERS[name],
             is_read_only=bool(spec.get("read_only")),
+            requires_workspace_context=True,
+            context_inputs=tuple(
+                key for key in ("conversation_id", "workspace_id") if key in spec["parameters"]["properties"]
+            ),
         )
         registered.append(name)
     return registered

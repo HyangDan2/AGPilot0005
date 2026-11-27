@@ -538,6 +538,7 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                             "artifact_type": art.get("artifact_type"),
                             "revision": art.get("current_revision", 1),
                             "workspace_id": art.get("workspace_id") or st.workspace_id,
+                            "conversation_id": art.get("conversation_id") or st.conversation_id,
                             "tool_call_id": tmsg.tool_call_id,
                         },
                     )

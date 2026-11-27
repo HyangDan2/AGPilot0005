@@ -6,6 +6,58 @@
     "version": "1.1.0"
   },
   "paths": {
+    "/api/v1/conversations/{conversation_id}/workspace": {
+      "put": {
+        "tags": [
+          "Conversations"
+        ],
+        "summary": "Set Conversation Workspace",
+        "operationId": "set_conversation_workspace_api_v1_conversations__conversation_id__workspace_put",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationWorkspaceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationWorkspace"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/health": {
       "get": {
         "tags": [
@@ -313,6 +365,51 @@
   },
   "components": {
     "schemas": {
+      "ConversationWorkspace": {
+        "properties": {
+          "conversation_id": {
+            "type": "string",
+            "title": "Conversation Id"
+          },
+          "workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversation_id",
+          "workspace_id"
+        ],
+        "title": "ConversationWorkspace"
+      },
+      "ConversationWorkspaceRequest": {
+        "properties": {
+          "workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workspace_id"
+        ],
+        "title": "ConversationWorkspaceRequest"
+      },
       "AgentRunOptions": {
         "properties": {
           "max_steps": {
@@ -448,6 +545,11 @@
               }
             ],
             "title": "Workspace Id"
+          },
+          "bind_workspace": {
+            "type": "boolean",
+            "title": "Bind Workspace",
+            "default": false
           },
           "execution_mode": {
             "anyOf": [

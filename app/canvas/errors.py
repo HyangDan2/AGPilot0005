@@ -49,11 +49,13 @@ class CanvasErrorCode(str, Enum):
     WORKSPACE_NOT_FOUND = "workspace_not_found"
     WORKSPACE_FILE_NOT_FOUND = "file_not_found"
     WORKSPACE_FILE_EXISTS = "file_exists"
+    CONVERSATION_WORKSPACE_CONFLICT = "conversation_workspace_conflict"
     INVALID_PATH = "invalid_path"
     INDEX_NOT_READY = "index_not_ready"
 
 
 ERROR_STATUS: Dict[CanvasErrorCode, int] = {
+    CanvasErrorCode.CONVERSATION_WORKSPACE_CONFLICT: 409,
     CanvasErrorCode.ARTIFACT_NOT_FOUND: 404,
     CanvasErrorCode.REVISION_NOT_FOUND: 404,
     CanvasErrorCode.REVISION_CONFLICT: 409,

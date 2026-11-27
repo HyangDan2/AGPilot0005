@@ -3,6 +3,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Literal, Optional
+from starlette.concurrency import run_in_threadpool
+from app.api.conversations import resolve_run_binding
 from app.config import is_durable_analysis_enabled_for_service
 from app.core.auth import (
     current_execution_scope,
@@ -45,6 +47,8 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
     if any(m.get('role') not in ('user', 'assistant') or set(m) - {'role', 'content'} for m in req.history) or len(json.dumps(req.history, ensure_ascii=False).encode()) > 24000:
         raise HTTPException(422, 'invalid_task_history')
 
+    if req.conversation_id or req.bind_workspace:
+        req = await run_in_threadpool(resolve_run_binding, req, scope)
     mode = req.execution_mode
     workspace_active = bool((req.workspace_id or "").strip())
     has_document_refs = bool(req.context_refs or req.analysis_refs)

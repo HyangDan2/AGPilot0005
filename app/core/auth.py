@@ -38,6 +38,17 @@ current_run_approvals: ContextVar[FrozenSet[str]] = ContextVar("current_run_appr
 current_run_conversation_id: ContextVar[Optional[str]] = ContextVar("current_run_conversation_id", default=None)
 
 
+@dataclass(frozen=True)
+class ConversationWorkspace:
+    conversation_id: str
+    workspace_id: Optional[str]
+
+
+current_run_workspace_binding: ContextVar[Optional[ConversationWorkspace]] = ContextVar(
+    "current_run_workspace_binding", default=None,
+)
+
+
 def has_user_approval(
     approvals: FrozenSet[str],
     *,

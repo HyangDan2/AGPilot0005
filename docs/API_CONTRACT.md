@@ -98,6 +98,10 @@ AGCore는 운영 환경(라즈베리파이 Nginx SSO 프록시)과 로컬 독립
 
 모드를 생략하면 `workspace_id`가 있는 요청은 Workspace 실행으로 처리합니다. 그 밖의 기존 요청은 `AGCORE_DURABLE_ANALYSIS_SERVICES`에 포함된 서비스의 문서·분석 참조에 대해 저장형 분석을 사용합니다. 배포 설정에 기존 서비스 ID를 명시하면 이전 클라이언트의 자동 분석 동작을 유지할 수 있습니다.
 
+빈 세션을 생성할 때 `PUT /api/v1/conversations/{conversation_id}/workspace`에 `{"workspace_id":"…"}` 또는 일반 대화의 `{"workspace_id":null}`을 전송합니다. 같은 세션 ID로 같은 값을 재전송할 수 있으며, 다른 Workspace로 변경하려면 새 세션 ID를 사용해야 합니다. 서버는 인증된 Tenant, Owner, Service 범위 안에서 세션 ID와 Workspace를 저장하고 충돌에 `409 conversation_workspace_conflict`를 반환합니다.
+
+관리 대상 세션의 실행 요청에는 `conversation_id`, `bind_workspace: true`, 명시적 `workspace_id` 값을 사용합니다. 기존 바인딩이 있는 요청은 `workspace_id`를 생략할 때 저장된 값을 적용합니다. 바인딩이 없고 `bind_workspace`를 생략한 기존 클라이언트는 이전 실행 계약을 따릅니다. 등록된 도구의 세션 및 Workspace 입력은 서버가 적용하고, 모델이 다른 값을 제공하면 해당 도구 실행을 거절합니다.
+
 #### Response (비스트림 모드: `stream: false`, Status: `202 Accepted`)
 ```json
 {

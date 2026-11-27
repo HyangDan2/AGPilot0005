@@ -128,6 +128,7 @@ class CanvasStorage(Protocol):
         service_id: str,
         workspace_id: str,
         relative_path: str,
+        conversation_id: Optional[str] = None,
     ) -> Optional[WorkspaceFileLink]: ...
 
     def upsert_workspace_link(self, link: WorkspaceFileLink) -> WorkspaceFileLink: ...
@@ -940,6 +941,7 @@ class SqliteCanvasStorage:
         service_id: str,
         workspace_id: str,
         relative_path: str,
+        conversation_id: Optional[str] = None,
     ) -> Optional[WorkspaceFileLink]:
         """The artifact most recently bound to this workspace file in this scope, if any.
 
@@ -951,9 +953,10 @@ class SqliteCanvasStorage:
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT * FROM canvas_workspace_links WHERE tenant_id=? AND owner_id=? AND service_id=? "
-                "AND workspace_id=? AND relative_path=? ORDER BY updated_at DESC LIMIT 1",
-                (tenant_id, owner_id, service_id, workspace_id, relative_path),
+                "SELECT l.* FROM canvas_workspace_links l JOIN canvas_artifacts a ON a.artifact_id=l.artifact_id "
+                "WHERE l.tenant_id=? AND l.owner_id=? AND l.service_id=? AND l.workspace_id=? AND l.relative_path=? "
+                "AND (? IS NULL OR a.conversation_id=?) ORDER BY l.updated_at DESC LIMIT 1",
+                (tenant_id, owner_id, service_id, workspace_id, relative_path, conversation_id, conversation_id),
             ).fetchone()
             return self._row_to_workspace_link(row) if row else None
         finally:

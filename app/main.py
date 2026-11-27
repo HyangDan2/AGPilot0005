@@ -14,6 +14,7 @@ from app.api.document_analysis import router as document_analysis_router
 from app.api.demo import router as demo_router
 from app.api.health import router as health_router
 from app.api.config import router as config_router
+from app.api.conversations import router as conversations_router
 from app.api.tools_admin import router as tools_admin_router
 from app.api.canvas import router as canvas_router
 from app.workspace.api import router as workspace_router
@@ -125,6 +126,7 @@ app.include_router(health_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
 app.include_router(tools_admin_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
+app.include_router(conversations_router, prefix="/api/v1")
 app.include_router(document_analysis_router, prefix="/api/v1")
 app.include_router(canvas_router, prefix="/api/v1")
 app.include_router(workspace_router)
