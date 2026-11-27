@@ -81,8 +81,22 @@ class WorkspaceManager:
         self.storage = storage
         self.settings = settings
         self.clock = clock
+        self._file_listeners: List[Callable[[str, Optional[Dict[str, Any]]], None]] = []
 
     # ------------------------------------------------------------------ helpers
+    def add_file_listener(self, listener: Callable[[str, Optional[Dict[str, Any]]], None]) -> None:
+        """Register a change sink (the indexer) without a hard dependency on it."""
+
+        self._file_listeners.append(listener)
+
+    def _notify_file(self, workspace_id: str, file_id: str) -> None:
+        record = self.store.get_file(workspace_id, file_id)
+        for listener in list(self._file_listeners):
+            try:
+                listener(workspace_id, record)
+            except Exception:
+                continue
+
     @staticmethod
     def _scope_ids(scope: ScopeView) -> tuple[str, str, str]:
         tenant = (getattr(scope, "tenant_id", "") or "").strip()
@@ -433,6 +447,7 @@ class WorkspaceManager:
             )
             self._emit(workspace_id, file_id, "file.updated", revision)
         self._prune_revisions(tenant, workspace_id, file_id)
+        self._notify_file(workspace_id, file_id)
         return self.get_file_metadata(workspace_id, file_id, scope)
 
     def _prune_revisions(self, tenant_id: str, workspace_id: str, file_id: str) -> None:

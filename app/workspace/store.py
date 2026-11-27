@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS workspace_index_job (
     error_code TEXT,
     error_detail TEXT,
     content_hash TEXT,
+    force INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT
@@ -533,6 +534,17 @@ class WorkspaceStore:
     def create_index_job(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Insert a PENDING job unless an equivalent pending/running job exists."""
 
+        record = {
+            "attempts": 0,
+            "max_attempts": 3,
+            "error_code": None,
+            "error_detail": None,
+            "content_hash": None,
+            "force": 0,
+            "started_at": None,
+            "finished_at": None,
+            **record,
+        }
         with self.write() as conn:
             existing = conn.execute(
                 "SELECT * FROM workspace_index_job WHERE file_id=? AND file_revision=? "
@@ -543,9 +555,9 @@ class WorkspaceStore:
                 return dict(existing)
             conn.execute(
                 """INSERT INTO workspace_index_job(job_id, workspace_id, file_id, file_revision, state, attempts,
-                        max_attempts, error_code, error_detail, content_hash, created_at, started_at, finished_at)
+                        max_attempts, error_code, error_detail, content_hash, force, created_at, started_at, finished_at)
                    VALUES(:job_id, :workspace_id, :file_id, :file_revision, :state, :attempts, :max_attempts,
-                        :error_code, :error_detail, :content_hash, :created_at, :started_at, :finished_at)""",
+                        :error_code, :error_detail, :content_hash, :force, :created_at, :started_at, :finished_at)""",
                 record,
             )
             return dict(conn.execute("SELECT * FROM workspace_index_job WHERE job_id=?", (record["job_id"],)).fetchone())
@@ -644,6 +656,43 @@ class WorkspaceStore:
             )
             return cursor.rowcount
 
+    def files_awaiting_index(self, workspace_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        sql = (
+            "SELECT f.* FROM workspace_file f WHERE f.kind='file' AND f.deleted_at IS NULL "
+            "AND f.index_status IN ('PENDING','STALE') "
+            "AND NOT EXISTS (SELECT 1 FROM workspace_index_job j WHERE j.file_id=f.file_id AND j.state IN ('PENDING','INDEXING'))"
+        )
+        params: List[Any] = []
+        if workspace_id:
+            sql += " AND f.workspace_id=?"
+            params.append(workspace_id)
+        sql += " ORDER BY f.updated_at ASC LIMIT ?"
+        params.append(max(1, limit))
+        with self.read() as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    def files_with_revision_mismatch(self, workspace_id: str) -> List[Dict[str, Any]]:
+        with self.read() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT f.file_id, f.revision, c.file_revision FROM workspace_file f "
+                    "JOIN workspace_chunk c ON c.file_id = f.file_id "
+                    "WHERE f.workspace_id=? AND f.deleted_at IS NULL AND c.file_revision != f.revision "
+                    "GROUP BY f.file_id",
+                    (workspace_id,),
+                ).fetchall()
+            ]
+
+    def status_counts(self, workspace_id: str) -> Dict[str, int]:
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT IFNULL(index_status,'none') AS state, COUNT(*) AS c FROM workspace_file "
+                "WHERE workspace_id=? AND kind='file' AND deleted_at IS NULL GROUP BY index_status",
+                (workspace_id,),
+            ).fetchall()
+        return {row["state"]: int(row["c"]) for row in rows}
+
     def jobs_for_workspace_states(self, workspace_id: str) -> Dict[str, int]:
         with self.read() as conn:
             rows = conn.execute(
@@ -675,6 +724,74 @@ class WorkspaceStore:
                     "INSERT INTO workspace_chunk_fts(chunk_id, workspace_id, file_id, body) VALUES(?,?,?,?)",
                     (chunk["chunk_id"], chunk["workspace_id"], chunk["file_id"], chunk.get("fts_body") or ""),
                 )
+
+    def replace_chunks_if_current(
+        self,
+        workspace_id: str,
+        file_id: str,
+        revision: int,
+        chunks: Sequence[Dict[str, Any]],
+    ) -> bool:
+        """Atomically replace a file's chunks only if `revision` is still the current one.
+
+        The revision/deleted check and the write happen in one IMMEDIATE transaction, so a
+        slower worker for an older revision can never overwrite a newer index.
+        """
+
+        with self.write() as conn:
+            row = conn.execute(
+                "SELECT revision, deleted_at FROM workspace_file WHERE workspace_id=? AND file_id=?",
+                (workspace_id, file_id),
+            ).fetchone()
+            if row is None or row["deleted_at"] is not None or int(row["revision"]) != int(revision):
+                return False
+            old = conn.execute("SELECT chunk_id FROM workspace_chunk WHERE file_id=?", (file_id,)).fetchall()
+            for item in old:
+                conn.execute("DELETE FROM workspace_chunk_fts WHERE chunk_id=?", (item["chunk_id"],))
+            conn.execute(
+                "DELETE FROM workspace_chunk_vector WHERE chunk_id IN (SELECT chunk_id FROM workspace_chunk WHERE file_id=?)",
+                (file_id,),
+            )
+            conn.execute("DELETE FROM workspace_chunk WHERE file_id=?", (file_id,))
+            for chunk in chunks:
+                conn.execute(
+                    """INSERT INTO workspace_chunk(chunk_id, workspace_id, file_id, file_revision, chunk_index, content,
+                            content_hash, token_count, page_number, section, offset_start, offset_end, parser_version,
+                            chunking_version, created_at)
+                       VALUES(:chunk_id, :workspace_id, :file_id, :file_revision, :chunk_index, :content,
+                            :content_hash, :token_count, :page_number, :section, :offset_start, :offset_end,
+                            :parser_version, :chunking_version, :created_at)""",
+                    chunk,
+                )
+                conn.execute(
+                    "INSERT INTO workspace_chunk_fts(chunk_id, workspace_id, file_id, body) VALUES(?,?,?,?)",
+                    (chunk["chunk_id"], chunk["workspace_id"], chunk["file_id"], chunk.get("fts_body") or ""),
+                )
+            return True
+
+    def upsert_vectors_if_current(
+        self, file_id: str, revision: int, rows: Sequence[Tuple[str, str, str, int, bytes]]
+    ) -> int:
+        """Upsert vectors only for chunks that still belong to this file revision."""
+
+        if not rows:
+            return 0
+        written = 0
+        with self.write() as conn:
+            for chunk_id, workspace_id, index_key, dim, vector in rows:
+                exists = conn.execute(
+                    "SELECT 1 FROM workspace_chunk WHERE chunk_id=? AND file_id=? AND file_revision=?",
+                    (chunk_id, file_id, revision),
+                ).fetchone()
+                if exists is None:
+                    continue
+                conn.execute(
+                    "INSERT INTO workspace_chunk_vector(chunk_id, workspace_id, index_key, dim, vector) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(chunk_id, index_key) DO UPDATE SET vector=excluded.vector, dim=excluded.dim",
+                    (chunk_id, workspace_id, index_key, dim, vector),
+                )
+                written += 1
+        return written
 
     def delete_chunks(self, file_id: str) -> None:
         with self.write() as conn:
