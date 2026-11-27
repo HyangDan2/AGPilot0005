@@ -29,6 +29,11 @@ class CanvasErrorCode(str, Enum):
     STORAGE_FAILURE = "storage_failure"
     UNAUTHENTICATED = "unauthenticated"
     FORBIDDEN = "forbidden"
+    # WO-C17 additions
+    PROPOSAL_ALREADY_APPLIED = "proposal_already_applied"
+    PROPOSAL_REJECTED = "proposal_rejected"
+    USER_APPROVAL_REQUIRED = "user_approval_required"
+    CANVAS_DISABLED = "canvas_disabled"
 
 
 ERROR_STATUS: Dict[CanvasErrorCode, int] = {
@@ -50,6 +55,11 @@ ERROR_STATUS: Dict[CanvasErrorCode, int] = {
     CanvasErrorCode.STORAGE_FAILURE: 500,
     CanvasErrorCode.UNAUTHENTICATED: 401,
     CanvasErrorCode.FORBIDDEN: 403,
+    # WO-C17 additions
+    CanvasErrorCode.PROPOSAL_ALREADY_APPLIED: 409,
+    CanvasErrorCode.PROPOSAL_REJECTED: 409,
+    CanvasErrorCode.USER_APPROVAL_REQUIRED: 403,
+    CanvasErrorCode.CANVAS_DISABLED: 503,
 }
 
 

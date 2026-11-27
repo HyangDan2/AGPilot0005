@@ -37,6 +37,10 @@ CANVAS_TOOL_NAMES = (
     "canvas.export_artifact",
 )
 
+# WO-C17 / C-FIX-06: the model never sees the tool that writes a revision from a proposal. Applying
+# is a user act; exposing it here would let a tool call stand in for the user's approval.
+AI_EXPOSED_TOOL_NAMES = tuple(name for name in CANVAS_TOOL_NAMES if name != "canvas.apply_edit")
+
 CANVAS_TOOL_MANIFEST: List[Dict[str, Any]] = [
     {
         "name": "canvas.create_artifact",
@@ -156,9 +160,12 @@ CANVAS_TOOL_MANIFEST: List[Dict[str, Any]] = [
     },
     {
         "name": "canvas.apply_edit",
-        "description": "사용자가 승인한 Edit Proposal을 적용해 신규 Revision을 생성합니다.",
+        "description": "사용자가 화면에서 승인한 Edit Proposal을 적용해 신규 Revision을 생성합니다. AI Tool 호출만으로는 승인으로 간주되지 않습니다.",
         "read_only": False,
         "side_effect": "creates a new revision from the proposal",
+        "requires_user_approval": True,
+        "ai_exposed": False,
+        "approval_boundary": "user_action only — a tool call returns 403 user_approval_required",
         "parameters": {
             "type": "object",
             "additionalProperties": False,
@@ -368,9 +375,20 @@ async def propose_edit(
 
 
 async def apply_edit(proposal_id: str, change_reason: Optional[str] = None) -> Dict[str, Any]:
+    """Refused by design (WO-C17 / C-FIX-06).
+
+    A tool call is not a user approval. The handler only proceeds when a verified interactive
+    approval is present in the execution context, which the tool dispatcher never sets, so the
+    model receives ``403 user_approval_required`` and no revision is written.
+    """
     try:
         scope = _scope_or_error()
-        return _service().proposals.apply(scope, proposal_id, change_reason=change_reason)
+        from app.canvas.approval import current_user_approval, require_user_approval
+
+        approval = require_user_approval(current_user_approval.get(), proposal_id=proposal_id)
+        return _service().proposals.apply(
+            scope, proposal_id, change_reason=change_reason, approval=approval,
+        )
     except CanvasError as exc:
         return _error(exc)
 
@@ -428,17 +446,26 @@ _HANDLERS = {
 }
 
 
-def install_canvas_tools(tool_registry: Any = None) -> List[str]:
-    """Register the eight Canvas tools on the Dynamic Tool Registry (idempotent)."""
+def install_canvas_tools(tool_registry: Any = None, *, ai_exposed_only: bool = True) -> List[str]:
+    """Register the Canvas tools on the Dynamic Tool Registry (idempotent).
+
+    ``ai_exposed_only`` (default) registers the seven model-facing tools and leaves
+    ``canvas.apply_edit`` out: the model cannot apply a proposal at all until the R1.3 integration
+    provides a verified user-approval channel. Pass ``ai_exposed_only=False`` only for admin
+    tooling that supplies a real approval.
+    """
     if tool_registry is None:
         from app.tools.registry import registry as default_registry
 
         target = default_registry
     else:
         target = tool_registry
+    allowed = set(AI_EXPOSED_TOOL_NAMES) if ai_exposed_only else set(CANVAS_TOOL_NAMES)
     registered: List[str] = []
     for spec in CANVAS_TOOL_MANIFEST:
         name = spec["name"]
+        if name not in allowed:
+            continue
         target.register(
             name=name,
             description=spec["description"],
@@ -451,10 +478,20 @@ def install_canvas_tools(tool_registry: Any = None) -> List[str]:
 
 
 def manifest() -> Dict[str, Any]:
+    from app.canvas.approval import approval_policy
+
     return {
         "version": "r2-canvas/v1",
         "registry": "AGCore Dynamic Tool Registry (app/tools/registry.py)",
-        "tools": CANVAS_TOOL_MANIFEST,
+        "tools": [
+            {**tool, "ai_exposed": tool["name"] in AI_EXPOSED_TOOL_NAMES}
+            for tool in CANVAS_TOOL_MANIFEST
+        ],
+        "approval_boundary": {
+            **approval_policy(),
+            "ai_exposed_tools": list(AI_EXPOSED_TOOL_NAMES),
+            "withheld_tools": [name for name in CANVAS_TOOL_NAMES if name not in AI_EXPOSED_TOOL_NAMES],
+        },
         "scope": {
             "source": "current_execution_scope (verified ExecutionScope)",
             "client_supplied_identity": False,
@@ -462,6 +499,7 @@ def manifest() -> Dict[str, Any]:
         },
         "integration": {
             "runtime_tool_calling": "not connected in R2 (R1.3 integration stage; registration requires AGCORE_CANVAS_TOOLS_ENABLED)",
+            "ai_exposed_tools": len(AI_EXPOSED_TOOL_NAMES),
             "verification": "dev API / adapter only; no real LLM call was made",
             "exposure": "registered only when AGCORE_CANVAS_TOOLS_ENABLED is on; no shipped tool profile lists them",
         },

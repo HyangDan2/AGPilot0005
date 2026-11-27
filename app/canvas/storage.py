@@ -37,7 +37,7 @@ from app.canvas.errors import CanvasError, CanvasErrorCode
 from app.canvas.models import Artifact, EditProposal, PatchRequest, Revision
 from app.canvas.patching import PatchComputation, compute_patch
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def iso_now(epoch: Optional[float] = None) -> str:
@@ -70,8 +70,15 @@ class CanvasStorage(Protocol):
     def list_artifacts(
         self, *, tenant_id: str, owner_id: str, service_id: str,
         conversation_id: Optional[str] = None, workspace_id: Optional[str] = None,
-        artifact_type: Optional[str] = None, limit: int = 25, offset: int = 0,
+        artifact_type: Optional[str] = None, has_workspace: Optional[bool] = None,
+        limit: int = 25, offset: int = 0,
     ) -> Tuple[List[Artifact], int]: ...
+
+    def count_artifacts(
+        self, *, tenant_id: str, owner_id: str, service_id: str,
+        conversation_id: Optional[str] = None, workspace_id: Optional[str] = None,
+        artifact_type: Optional[str] = None, has_workspace: Optional[bool] = None,
+    ) -> int: ...
 
     def update_title(self, artifact_id: str, title: str, updated_at: str) -> Artifact: ...
 
@@ -104,6 +111,15 @@ class CanvasStorage(Protocol):
 
     def save_proposal(self, proposal: EditProposal) -> EditProposal: ...
 
+    def apply_proposal(
+        self, proposal_id: str, request: PatchRequest, *, actor: str,
+        actor_id: Optional[str] = None,
+    ) -> Tuple[EditProposal, Artifact, Revision, PatchComputation]: ...
+
+    def count_pruned_revisions(self, artifact_id: str) -> int: ...
+
+    def list_pruned_revisions(self, artifact_id: str) -> List[Dict[str, Any]]: ...
+
     def list_proposals(
         self, artifact_id: str, *, status: Optional[str] = None, limit: int = 50, offset: int = 0,
     ) -> Tuple[List[EditProposal], int]: ...
@@ -119,6 +135,7 @@ class SqliteCanvasStorage:
         *,
         max_content_bytes: int = 512 * 1024,
         max_revisions: int = 100,
+        min_retained_revisions: int = 20,
         busy_timeout_ms: int = 5000,
         clock=None,
     ) -> None:
@@ -126,6 +143,8 @@ class SqliteCanvasStorage:
         self.blob_root = Path(blob_root)
         self.max_content_bytes = int(max_content_bytes)
         self.max_revisions = int(max_revisions)
+        # WO-C17 / C-FIX-04: the newest window is always kept; pruning only touches older rows.
+        self.min_retained_revisions = max(1, min(int(min_retained_revisions), self.max_revisions - 1))
         self.busy_timeout_ms = int(busy_timeout_ms)
         self._clock = clock
         self._lock = threading.Lock()
@@ -250,6 +269,15 @@ class SqliteCanvasStorage:
                     );
                     CREATE INDEX IF NOT EXISTS idx_canvas_proposals_artifact
                         ON canvas_edit_proposals(artifact_id, status, created_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS canvas_revision_prunes (
+                        artifact_id TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        content_hash TEXT,
+                        pruned_at REAL NOT NULL,
+                        reason TEXT NOT NULL,
+                        PRIMARY KEY (artifact_id, revision)
+                    );
                     """
                 )
                 conn.execute(
@@ -478,11 +506,12 @@ class SqliteCanvasStorage:
         finally:
             conn.close()
 
-    def list_artifacts(
-        self, *, tenant_id: str, owner_id: str, service_id: str,
+    @staticmethod
+    def _artifact_filters(
+        *, tenant_id: str, owner_id: str, service_id: str,
         conversation_id: Optional[str] = None, workspace_id: Optional[str] = None,
-        artifact_type: Optional[str] = None, limit: int = 25, offset: int = 0,
-    ) -> Tuple[List[Artifact], int]:
+        artifact_type: Optional[str] = None, has_workspace: Optional[bool] = None,
+    ) -> Tuple[str, List[Any]]:
         clauses = ["tenant_id=? AND owner_id=? AND service_id=? AND deleted_at IS NULL"]
         params: List[Any] = [tenant_id, owner_id, service_id]
         if conversation_id is not None:
@@ -494,7 +523,41 @@ class SqliteCanvasStorage:
         if artifact_type is not None:
             clauses.append("artifact_type=?")
             params.append(artifact_type)
-        where = " AND ".join(clauses)
+        if has_workspace is True:
+            clauses.append("workspace_id IS NOT NULL")
+        elif has_workspace is False:
+            clauses.append("workspace_id IS NULL")
+        return " AND ".join(clauses), params
+
+    def count_artifacts(
+        self, *, tenant_id: str, owner_id: str, service_id: str,
+        conversation_id: Optional[str] = None, workspace_id: Optional[str] = None,
+        artifact_type: Optional[str] = None, has_workspace: Optional[bool] = None,
+    ) -> int:
+        where, params = self._artifact_filters(
+            tenant_id=tenant_id, owner_id=owner_id, service_id=service_id,
+            conversation_id=conversation_id, workspace_id=workspace_id,
+            artifact_type=artifact_type, has_workspace=has_workspace,
+        )
+        conn = self._connect()
+        try:
+            return int(conn.execute(
+                f"SELECT COUNT(*) AS c FROM canvas_artifacts WHERE {where}", params
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
+    def list_artifacts(
+        self, *, tenant_id: str, owner_id: str, service_id: str,
+        conversation_id: Optional[str] = None, workspace_id: Optional[str] = None,
+        artifact_type: Optional[str] = None, has_workspace: Optional[bool] = None,
+        limit: int = 25, offset: int = 0,
+    ) -> Tuple[List[Artifact], int]:
+        where, params = self._artifact_filters(
+            tenant_id=tenant_id, owner_id=owner_id, service_id=service_id,
+            conversation_id=conversation_id, workspace_id=workspace_id,
+            artifact_type=artifact_type, has_workspace=has_workspace,
+        )
         conn = self._connect()
         try:
             conn.row_factory = sqlite3.Row
@@ -588,87 +651,213 @@ class SqliteCanvasStorage:
         self, request: PatchRequest, *, actor: str, actor_id: Optional[str] = None,
         event_key: Optional[str] = None, proposal_id: Optional[str] = None,
     ) -> Tuple[Artifact, Revision, PatchComputation]:
-        now = self._now()
         with self._tx() as conn:
-            row = self._select_artifact(conn, request.artifact_id, include_deleted=False)
-            if row is None:
-                raise CanvasError(CanvasErrorCode.ARTIFACT_NOT_FOUND, context={"artifact_id": request.artifact_id})
-            artifact = self._row_to_artifact(row)
-            if artifact.current_revision != request.base_revision:
-                raise CanvasError(
-                    CanvasErrorCode.REVISION_CONFLICT,
-                    "base_revision is not the current revision",
-                    retryable=True,
-                    context={
-                        "base_revision": request.base_revision,
-                        "current_revision": artifact.current_revision,
-                    },
-                )
-            current = conn.execute(
-                "SELECT * FROM canvas_revisions WHERE artifact_id=? AND revision=?",
-                (artifact.artifact_id, artifact.current_revision),
-            ).fetchone()
-            if current is None:
-                raise CanvasError(CanvasErrorCode.STORAGE_FAILURE, "current revision row is missing")
-            content = self._read_blob(current["content_hash"])
-            computation = compute_patch(content, request)
+            artifact, revision, computation = self._apply_patch_conn(
+                conn, request, actor=actor, actor_id=actor_id,
+                event_key=event_key, proposal_id=proposal_id,
+            )
+            return artifact, revision, computation
 
-            if not computation.changed:
-                return artifact, self._row_to_revision(current), computation
+    def _apply_patch_conn(
+        self, conn: sqlite3.Connection, request: PatchRequest, *, actor: str,
+        actor_id: Optional[str] = None, event_key: Optional[str] = None,
+        proposal_id: Optional[str] = None, now: Optional[float] = None,
+    ) -> Tuple[Artifact, Revision, PatchComputation]:
+        """Compare, write and retain inside the caller's open transaction."""
+        now = self._now() if now is None else now
+        row = self._select_artifact(conn, request.artifact_id, include_deleted=False)
+        if row is None:
+            raise CanvasError(CanvasErrorCode.ARTIFACT_NOT_FOUND, context={"artifact_id": request.artifact_id})
+        artifact = self._row_to_artifact(row)
+        if artifact.current_revision != request.base_revision:
+            raise CanvasError(
+                CanvasErrorCode.REVISION_CONFLICT,
+                "base_revision is not the current revision",
+                retryable=True,
+                context={
+                    "base_revision": request.base_revision,
+                    "current_revision": artifact.current_revision,
+                },
+            )
+        current = conn.execute(
+            "SELECT * FROM canvas_revisions WHERE artifact_id=? AND revision=?",
+            (artifact.artifact_id, artifact.current_revision),
+        ).fetchone()
+        if current is None:
+            raise CanvasError(CanvasErrorCode.STORAGE_FAILURE, "current revision row is missing")
+        content = self._read_blob(current["content_hash"])
+        computation = compute_patch(content, request)
 
-            revision_total = conn.execute(
-                "SELECT COUNT(*) AS c FROM canvas_revisions WHERE artifact_id=?",
-                (artifact.artifact_id,),
-            ).fetchone()["c"]
-            if revision_total >= self.max_revisions:
-                raise CanvasError(
-                    CanvasErrorCode.REVISION_LIMIT_REACHED,
-                    "artifact reached its revision retention limit",
-                    context={"max_revisions": self.max_revisions, "current_revision": artifact.current_revision},
-                )
+        if not computation.changed:
+            return artifact, self._row_to_revision(current), computation
 
-            content_hash, size_bytes = self._write_blob(computation.content)
-            new_revision = artifact.current_revision + 1
+        content_hash, size_bytes = self._write_blob(computation.content)
+        new_revision = artifact.current_revision + 1
+        conn.execute(
+            """
+            INSERT INTO canvas_revisions (
+                artifact_id, revision, content_hash, size_bytes, actor, change_reason,
+                operation, base_revision, created_at, created_by, proposal_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                artifact.artifact_id, new_revision, content_hash, size_bytes, actor,
+                request.change_reason, request.operation, artifact.current_revision,
+                now, actor_id, proposal_id,
+            ),
+        )
+        updated = conn.execute(
+            "UPDATE canvas_artifacts SET current_revision=?, content_hash=?, updated_at=? "
+            "WHERE artifact_id=? AND current_revision=?",
+            (new_revision, content_hash, now, artifact.artifact_id, artifact.current_revision),
+        )
+        if updated.rowcount != 1:
+            raise CanvasError(
+                CanvasErrorCode.REVISION_CONFLICT,
+                "concurrent write detected while committing the revision",
+                retryable=True,
+                context={"base_revision": request.base_revision},
+            )
+        if event_key:
             conn.execute(
-                """
-                INSERT INTO canvas_revisions (
-                    artifact_id, revision, content_hash, size_bytes, actor, change_reason,
-                    operation, base_revision, created_at, created_by, proposal_id
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                """,
+                "INSERT INTO canvas_events(scope_key, idempotency_key, event_type, artifact_id, revision, created_at) "
+                "VALUES (?,?,?,?,?,?)",
                 (
-                    artifact.artifact_id, new_revision, content_hash, size_bytes, actor,
-                    request.change_reason, request.operation, artifact.current_revision,
-                    now, actor_id, proposal_id,
+                    scope_key(artifact.tenant_id, artifact.owner_id, artifact.service_id),
+                    event_key, "artifact.updated", artifact.artifact_id, new_revision, now,
                 ),
             )
-            updated = conn.execute(
-                "UPDATE canvas_artifacts SET current_revision=?, content_hash=?, updated_at=? "
-                "WHERE artifact_id=? AND current_revision=?",
-                (new_revision, content_hash, now, artifact.artifact_id, artifact.current_revision),
+        # WO-C17 / C-FIX-04: the cap is enforced by pruning inside the same transaction, so a
+        # long autosave history never bricks the artifact.
+        self._prune_revisions(conn, artifact.artifact_id, current_revision=new_revision, now=now)
+        artifact_row = self._select_artifact(conn, artifact.artifact_id, include_deleted=False)
+        revision_row = conn.execute(
+            "SELECT * FROM canvas_revisions WHERE artifact_id=? AND revision=?",
+            (artifact.artifact_id, new_revision),
+        ).fetchone()
+        return self._row_to_artifact(artifact_row), self._row_to_revision(revision_row), computation
+
+    def _proposal_referenced_revisions(self, conn: sqlite3.Connection, artifact_id: str) -> set:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT base_revision, applied_revision, status FROM canvas_edit_proposals WHERE artifact_id=?",
+            (artifact_id,),
+        ).fetchall()
+        referenced = set()
+        for row in rows:
+            if row["applied_revision"] is not None:
+                referenced.add(int(row["applied_revision"]))
+            if row["status"] in ("proposed", "stale") and row["base_revision"] is not None:
+                referenced.add(int(row["base_revision"]))
+        return referenced
+
+    def _prune_revisions(
+        self, conn: sqlite3.Connection, artifact_id: str, *, current_revision: int,
+        now: Optional[float] = None,
+    ) -> List[int]:
+        """Keep the current revision, the newest retention window and proposal-referenced rows.
+
+        Deletes only as many of the oldest other rows as the cap requires and records each one in
+        ``canvas_revision_prunes``. If even the protected rows would have to go, the write is
+        refused (``revision_limit_reached``) instead of silently breaking a reference.
+        """
+        now = self._now() if now is None else now
+        conn.row_factory = sqlite3.Row
+        total = int(conn.execute(
+            "SELECT COUNT(*) AS c FROM canvas_revisions WHERE artifact_id=?", (artifact_id,)
+        ).fetchone()["c"])
+        if total <= self.max_revisions:
+            return []
+        recent_floor = max(1, current_revision - self.min_retained_revisions + 1)
+        protected = {current_revision} | set(range(recent_floor, current_revision + 1))
+        protected |= self._proposal_referenced_revisions(conn, artifact_id)
+        rows = conn.execute(
+            "SELECT revision, content_hash FROM canvas_revisions WHERE artifact_id=? ORDER BY revision ASC",
+            (artifact_id,),
+        ).fetchall()
+        needed = total - self.max_revisions
+        pruned: List[int] = []
+
+        def _delete(row: sqlite3.Row, reason: str) -> None:
+            conn.execute(
+                "DELETE FROM canvas_revisions WHERE artifact_id=? AND revision=?",
+                (artifact_id, int(row["revision"])),
             )
-            if updated.rowcount != 1:
-                raise CanvasError(
-                    CanvasErrorCode.REVISION_CONFLICT,
-                    "concurrent write detected while committing the revision",
-                    retryable=True,
-                    context={"base_revision": request.base_revision},
-                )
-            if event_key:
-                conn.execute(
-                    "INSERT INTO canvas_events(scope_key, idempotency_key, event_type, artifact_id, revision, created_at) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (
-                        scope_key(artifact.tenant_id, artifact.owner_id, artifact.service_id),
-                        event_key, "artifact.updated", artifact.artifact_id, new_revision, now,
-                    ),
-                )
-            artifact_row = self._select_artifact(conn, artifact.artifact_id, include_deleted=False)
-            revision_row = conn.execute(
-                "SELECT * FROM canvas_revisions WHERE artifact_id=? AND revision=?",
-                (artifact.artifact_id, new_revision),
-            ).fetchone()
-            return self._row_to_artifact(artifact_row), self._row_to_revision(revision_row), computation
+            conn.execute(
+                "INSERT OR REPLACE INTO canvas_revision_prunes(artifact_id, revision, content_hash, pruned_at, reason) "
+                "VALUES (?,?,?,?,?)",
+                (artifact_id, int(row["revision"]), row["content_hash"], now, reason),
+            )
+            pruned.append(int(row["revision"]))
+
+        # Pass 1: oldest rows outside the retention window; baseline (revision 1) goes last here.
+        outside = [row for row in rows if int(row["revision"]) not in protected]
+        outside.sort(key=lambda row: (int(row["revision"]) == 1, int(row["revision"])))
+        for row in outside:
+            if needed <= 0:
+                break
+            _delete(row, "retention_cap")
+            needed -= 1
+
+        # Pass 2: only if proposals pin every older revision, drop the oldest inside the window
+        # (never the current revision and never a proposal-referenced one) so editing continues.
+        if needed > 0:
+            referenced = self._proposal_referenced_revisions(conn, artifact_id)
+            inside = [
+                row for row in rows
+                if int(row["revision"]) not in referenced
+                and int(row["revision"]) != current_revision
+                and int(row["revision"]) in protected
+                and not any(int(row["revision"]) == pruned_rev for pruned_rev in pruned)
+            ]
+            inside.sort(key=lambda row: int(row["revision"]))
+            for row in inside:
+                if needed <= 0:
+                    break
+                _delete(row, "retention_cap_forced")
+                needed -= 1
+
+        if needed > 0:
+            raise CanvasError(
+                CanvasErrorCode.REVISION_LIMIT_REACHED,
+                "artifact reached its revision retention limit and no prunable revision remains",
+                context={
+                    "max_revisions": self.max_revisions,
+                    "current_revision": current_revision,
+                    "protected_revisions": sorted(protected),
+                },
+            )
+        return pruned
+
+    def count_pruned_revisions(self, artifact_id: str) -> int:
+        conn = self._connect()
+        try:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM canvas_revision_prunes WHERE artifact_id=?", (artifact_id,)
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
+    def list_pruned_revisions(self, artifact_id: str) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT revision, content_hash, pruned_at, reason FROM canvas_revision_prunes "
+                "WHERE artifact_id=? ORDER BY revision ASC",
+                (artifact_id,),
+            ).fetchall()
+            return [
+                {
+                    "revision": int(row["revision"]),
+                    "content_hash": row["content_hash"],
+                    "pruned_at": iso_now(row["pruned_at"]),
+                    "reason": row["reason"],
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
 
     def list_revisions(self, artifact_id: str, *, limit: int = 50, offset: int = 0) -> Tuple[List[Revision], int]:
         conn = self._connect()
@@ -820,6 +1009,99 @@ class SqliteCanvasStorage:
             return self._row_to_proposal(row) if row else None
         finally:
             conn.close()
+
+    def apply_proposal(
+        self, proposal_id: str, request: PatchRequest, *, actor: str,
+        actor_id: Optional[str] = None,
+    ) -> Tuple[EditProposal, Artifact, Revision, PatchComputation]:
+        """Apply a proposal and mark it applied inside ONE ``BEGIN IMMEDIATE`` transaction.
+
+        ``BEGIN IMMEDIATE`` takes the write lock first, so two concurrent apply requests are
+        serialized: the second one reads ``status='applied'`` and is refused with
+        ``409 proposal_already_applied``. A rejected proposal is refused with
+        ``409 proposal_rejected``. A stale base revision flips the proposal to ``stale`` and is
+        committed before ``409 proposal_stale`` is raised, so nothing is half-applied.
+        """
+        now = self._now()
+        deferred: Optional[CanvasError] = None
+        result: Optional[Tuple[EditProposal, Artifact, Revision, PatchComputation]] = None
+        with self._tx() as conn:
+            conn.row_factory = sqlite3.Row
+            prow = conn.execute(
+                "SELECT * FROM canvas_edit_proposals WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            if prow is None:
+                raise CanvasError(CanvasErrorCode.PROPOSAL_NOT_FOUND, context={"proposal_id": proposal_id})
+            status = prow["status"]
+            if status == "applied":
+                raise CanvasError(
+                    CanvasErrorCode.PROPOSAL_ALREADY_APPLIED,
+                    "proposal was already applied; a second application is refused",
+                    context={
+                        "proposal_id": proposal_id,
+                        "status": status,
+                        "applied_revision": prow["applied_revision"],
+                    },
+                )
+            if status == "rejected":
+                raise CanvasError(
+                    CanvasErrorCode.PROPOSAL_REJECTED,
+                    "proposal was rejected and cannot be applied",
+                    context={"proposal_id": proposal_id, "status": status},
+                )
+            artifact_row = self._select_artifact(conn, prow["artifact_id"], include_deleted=False)
+            if artifact_row is None:
+                raise CanvasError(
+                    CanvasErrorCode.ARTIFACT_NOT_FOUND, context={"artifact_id": prow["artifact_id"]}
+                )
+            if (
+                (artifact_row["tenant_id"], artifact_row["owner_id"], artifact_row["service_id"])
+                != (prow["tenant_id"], prow["owner_id"], prow["service_id"])
+            ):
+                raise CanvasError(
+                    CanvasErrorCode.STORAGE_FAILURE,
+                    "proposal scope does not match its artifact scope",
+                    context={"proposal_id": proposal_id},
+                )
+            if request.artifact_id != prow["artifact_id"]:
+                raise CanvasError(
+                    CanvasErrorCode.INVALID_REQUEST,
+                    "patch request does not target the proposal's artifact",
+                    context={"proposal_id": proposal_id, "artifact_id": request.artifact_id},
+                )
+            if int(artifact_row["current_revision"]) != int(prow["base_revision"]):
+                conn.execute(
+                    "UPDATE canvas_edit_proposals SET status='stale', updated_at=? "
+                    "WHERE proposal_id=? AND status='proposed'",
+                    (now, proposal_id),
+                )
+                deferred = CanvasError(
+                    CanvasErrorCode.PROPOSAL_STALE,
+                    "artifact changed after the proposal was created; nothing was applied",
+                    retryable=True,
+                    context={
+                        "proposal_base_revision": int(prow["base_revision"]),
+                        "current_revision": int(artifact_row["current_revision"]),
+                    },
+                )
+            else:
+                artifact, revision, computation = self._apply_patch_conn(
+                    conn, request, actor=actor, actor_id=actor_id,
+                    proposal_id=proposal_id, now=now,
+                )
+                conn.execute(
+                    "UPDATE canvas_edit_proposals SET status='applied', applied_revision=?, updated_at=? "
+                    "WHERE proposal_id=? AND status='proposed'",
+                    (revision.revision, now, proposal_id),
+                )
+                applied_row = conn.execute(
+                    "SELECT * FROM canvas_edit_proposals WHERE proposal_id=?", (proposal_id,)
+                ).fetchone()
+                result = (self._row_to_proposal(applied_row), artifact, revision, computation)
+        if deferred is not None:
+            raise deferred
+        assert result is not None
+        return result
 
     def save_proposal(self, proposal: EditProposal) -> EditProposal:
         now = self._now()
