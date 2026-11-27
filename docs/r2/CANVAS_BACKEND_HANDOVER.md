@@ -58,6 +58,11 @@ Companion documents:
 
 Push status: `feat/r2-canvas` **is pushed to `origin`** (branch tip at handover: `git ls-remote origin feat/r2-canvas`). The first push attempt returned HTTP 403 from the GitHub App write path and the immediate retry succeeded; if the connection stops accepting writes, the operator must transfer the branch — never force-push or merge `main`. No pull request was opened and `main` remains at `0d2047f`.
 
+WO-C18 push: `6b1a86e` … `fc6bb7a` were pushed to `origin/feat/r2-canvas` on 2026-11-27
+(`git ls-remote origin feat/r2-canvas`; the handover commit is the tip). No force push, no pull
+request, no merge, no deployment; `main` is still `0d2047f`. Diff vs. the WO-C17/Amendment-01 tip
+`bc40730`: 11 files, +2792/−33, of which 692 lines are the new WO-C18 test module.
+
 ---
 
 ## 2. Module inventory
