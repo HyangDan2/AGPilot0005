@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.canvas.approval import UserApproval, require_user_approval
 from app.canvas.config import CanvasSettings
 from app.canvas.diffing import diff_texts
 from app.canvas.errors import CanvasError, CanvasErrorCode
@@ -287,12 +288,14 @@ class ProposalService:
         patches: PatchEngine,
         settings: CanvasSettings,
         adapter: EditAdapter,
+        workspace: Any = None,
     ) -> None:
         self.storage = storage
         self.manager = manager
         self.patches = patches
         self.settings = settings
         self.adapter = adapter
+        self.workspace = workspace
 
     def create(
         self,
@@ -320,7 +323,10 @@ class ProposalService:
         reject_scope_override(request_payload, source="edit_proposal")
         if not instruction.strip():
             raise CanvasError(CanvasErrorCode.INVALID_REQUEST, "instruction must not be empty")
-        artifact = visible_artifact(self.storage, artifact_id, scope)
+        artifact = visible_artifact(
+            self.storage, artifact_id, scope, workspace=self.workspace,
+            required="write", operation="proposal.create",
+        )
         current = artifact.current_revision
         if base_revision is not None and int(base_revision) != current:
             raise CanvasError(
@@ -431,7 +437,10 @@ class ProposalService:
 
     def get(self, scope: Any, proposal_id: str) -> Dict[str, Any]:
         proposal = self._load(scope, proposal_id)
-        artifact = visible_artifact(self.storage, proposal.artifact_id, scope)
+        artifact = visible_artifact(
+            self.storage, proposal.artifact_id, scope, workspace=self.workspace,
+            required="read", operation="proposal.get",
+        )
         return {
             "proposal": proposal.model_dump(),
             "artifact": artifact.model_dump(),
@@ -447,7 +456,10 @@ class ProposalService:
         limit: int = 50,
         offset: int = 0,
     ) -> Dict[str, Any]:
-        visible_artifact(self.storage, artifact_id, scope)
+        visible_artifact(
+            self.storage, artifact_id, scope, workspace=self.workspace,
+            required="read", operation="proposal.list",
+        )
         items, total = self.storage.list_proposals(artifact_id, status=status, limit=limit, offset=offset)
         return {
             "items": [item.model_dump() for item in items],
@@ -457,35 +469,41 @@ class ProposalService:
         }
 
     def apply(
-        self, scope: Any, proposal_id: str, *, change_reason: Optional[str] = None, actor_id: Optional[str] = None
+        self,
+        scope: Any,
+        proposal_id: str,
+        *,
+        change_reason: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        approval: Optional[UserApproval] = None,
     ) -> Dict[str, Any]:
+        """Apply an approved proposal.
+
+        WO-C17 / C-FIX-06: ``approval`` is mandatory. ``scope`` alone is not an approval — an AI
+        tool call carries a machine scope and would otherwise be able to write in the user's name.
+        WO-C17 / C-FIX-03: the revision insert and the proposal status change commit together.
+        """
+        approval = require_user_approval(approval, proposal_id=proposal_id)
         proposal = self._load(scope, proposal_id)
-        artifact = visible_artifact(self.storage, proposal.artifact_id, scope)
+        artifact = visible_artifact(
+            self.storage, proposal.artifact_id, scope, workspace=self.workspace,
+            required="write", operation="proposal.apply",
+        )
         if proposal.status == "applied":
-            return {
-                "proposal": proposal.model_dump(),
-                "artifact": artifact.model_dump(),
-                "applied": False,
-                "duplicate": True,
-                "event": None,
-            }
+            raise CanvasError(
+                CanvasErrorCode.PROPOSAL_ALREADY_APPLIED,
+                "proposal was already applied; a second application is refused",
+                context={
+                    "proposal_id": proposal_id,
+                    "status": proposal.status,
+                    "applied_revision": proposal.applied_revision,
+                },
+            )
         if proposal.status == "rejected":
             raise CanvasError(
-                CanvasErrorCode.INVALID_REQUEST,
+                CanvasErrorCode.PROPOSAL_REJECTED,
                 "proposal was rejected and cannot be applied",
-                context={"proposal_id": proposal.proposal_id},
-            )
-        if proposal.base_revision != artifact.current_revision:
-            stale = proposal.model_copy(update={"status": "stale", "updated_at": iso_now()})
-            self.storage.save_proposal(stale)
-            raise CanvasError(
-                CanvasErrorCode.PROPOSAL_STALE,
-                "artifact changed after the proposal was created; nothing was applied",
-                retryable=True,
-                context={
-                    "proposal_base_revision": proposal.base_revision,
-                    "current_revision": artifact.current_revision,
-                },
+                context={"proposal_id": proposal_id, "status": proposal.status},
             )
         request = PatchRequest(
             artifact_id=proposal.artifact_id,
@@ -497,38 +515,41 @@ class ProposalService:
             change_reason=change_reason or proposal.change_reason,
             actor="ai",
         )
-        outcome = self.patches.apply(scope, request, actor_id=actor_id, proposal_id=proposal.proposal_id)
-        applied = proposal.model_copy(
-            update={
-                "status": "applied",
-                "applied_revision": outcome.revision.revision,
-                "updated_at": iso_now(),
-            }
+        stored, outcome_artifact, revision, computation = self.storage.apply_proposal(
+            proposal.proposal_id,
+            request,
+            actor="ai",
+            actor_id=actor_id or approval.approved_by,
         )
-        stored = self.storage.save_proposal(applied)
         event = artifact_event(
             "artifact.edit.applied",
             artifact_id=proposal.artifact_id,
             data={
                 "proposal_id": proposal.proposal_id,
-                "revision": outcome.revision.revision,
-                "changed": outcome.changed,
+                "revision": revision.revision,
+                "changed": computation.changed,
                 "actor": "ai",
                 "ai_integration_verified": False,
+                "approval": approval.model_dump(),
             },
             status="applied",
         )
         return {
             "proposal": stored.model_dump(),
-            "artifact": outcome.artifact.model_dump(),
-            "revision": outcome.revision.model_dump(),
+            "artifact": outcome_artifact.model_dump(),
+            "revision": revision.model_dump(),
             "applied": True,
             "duplicate": False,
+            "approval": approval.model_dump(),
             "event": event.model_dump(),
         }
 
     def reject(self, scope: Any, proposal_id: str, *, reason: Optional[str] = None) -> Dict[str, Any]:
         proposal = self._load(scope, proposal_id)
+        visible_artifact(
+            self.storage, proposal.artifact_id, scope, workspace=self.workspace,
+            required="write", operation="proposal.reject",
+        )
         if proposal.status in ("rejected", "applied"):
             return {"proposal": proposal.model_dump(), "rejected": proposal.status == "rejected", "event": None}
         rejected = proposal.model_copy(update={"status": "rejected", "updated_at": iso_now()})
@@ -548,5 +569,8 @@ class ProposalService:
         if proposal is None:
             raise CanvasError(CanvasErrorCode.PROPOSAL_NOT_FOUND, context={"proposal_id": proposal_id})
         # Scope enforcement happens through the artifact the proposal belongs to.
-        visible_artifact(self.storage, proposal.artifact_id, scope)
+        visible_artifact(
+            self.storage, proposal.artifact_id, scope, workspace=self.workspace,
+            required="read", operation="proposal.load",
+        )
         return proposal

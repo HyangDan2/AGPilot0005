@@ -5,13 +5,25 @@ R2-W contract (``docs/r2/WORKSPACE_CONTRACT.md``, ``WORKSPACE_CONTRACT_VERSION =
 four operations only: ``check_workspace_access``, ``get_workspace``, ``register_artifact_reference``
 and ``list_artifact_references``.
 
+Permission model (WO-C17 / C-FIX-01)
+------------------------------------
+The R2-W contract answers with one of four levels: ``read`` / ``write`` / ``admin`` / ``none``.
+Canvas distinguishes two required levels and never conflates them:
+
+* ``read`` — listing, reading content, revisions, diffs, previews, exports, proposals inspection.
+  Satisfied by ``read``, ``write`` or ``admin``.
+* ``write`` — creating an artifact *into* a workspace, linking an artifact to a workspace, renaming,
+  deleting, patching, restoring, creating/applying/rejecting proposals. Satisfied by ``write`` or
+  ``admin`` only. A ``read`` grant can never create or mutate workspace-linked state.
+
 Three providers exist:
 
 * ``RuntimeWorkspaceProvider`` — binds ``app/workspace/contracts.py::WorkspaceProvider`` as soon as
   the Workspace branch is merged. It is imported lazily so this branch builds and tests without it.
 * ``LocalDevWorkspaceProvider`` — in-memory development provider. It is **not** an authorization
   layer: every response carries ``provider_mode: "dev"`` and ``enforced: false``, and the provider
-  refuses to be constructed in production.
+  refuses to be constructed in production. Its levels are still honoured by Canvas' level checks so
+  the dev preview can exercise a ``read``-only and a revoked workspace.
 * ``UnavailableWorkspaceProvider`` — fail-closed default; raises ``workspace_unavailable``.
 """
 from __future__ import annotations
@@ -19,18 +31,22 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from app.canvas.errors import CanvasError, CanvasErrorCode
 
+"""Permission ladder, lowest first. A higher level satisfies every lower requirement."""
+PERMISSION_LADDER = ("none", "read", "write", "admin")
 READ_LEVELS = ("read", "write", "admin")
+WRITE_LEVELS = ("write", "admin")
+LEVEL_RANK = {level: rank for rank, level in enumerate(PERMISSION_LADDER)}
 
 
 class WorkspaceAccess(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     workspace_id: str
-    level: str = "none"  # read | write | admin | none
+    level: str = "none"  # none | read | write | admin
     reason: str = ""
     provider_mode: str = "dev"
     enforced: bool = False
@@ -39,7 +55,32 @@ class WorkspaceAccess(BaseModel):
 
     @property
     def allowed(self) -> bool:
+        """Read access (kept for callers written against the pre-WO-C17 contract)."""
+        return self.can_read
+
+    @property
+    def can_read(self) -> bool:
         return self.level in READ_LEVELS
+
+    @property
+    def can_write(self) -> bool:
+        return self.level in WRITE_LEVELS
+
+    def satisfies(self, required: str) -> bool:
+        required = normalise_required(required)
+        held = LEVEL_RANK.get(self.level, 0)
+        return held >= LEVEL_RANK[required]
+
+
+def normalise_required(required: str) -> str:
+    value = (required or "read").strip().lower()
+    if value not in ("read", "write"):
+        raise CanvasError(
+            CanvasErrorCode.INVALID_REQUEST,
+            "workspace requirement must be 'read' or 'write'",
+            context={"required": required},
+        )
+    return value
 
 
 class WorkspaceGateway(Protocol):
@@ -98,7 +139,16 @@ class LocalDevWorkspaceProvider:
         self._references: Dict[str, list] = {}
 
     def add_workspace(self, workspace_id: str, *, name: str = "", level: str = "admin") -> None:
+        if level not in LEVEL_RANK:
+            raise ValueError(f"unknown workspace level '{level}'")
         self._workspaces[workspace_id] = {"name": name or workspace_id, "level": level}
+
+    def set_level(self, workspace_id: str, level: str) -> None:
+        """Simulate a permission change (grant downgrade / revocation) in the dev preview."""
+        if level not in LEVEL_RANK:
+            raise ValueError(f"unknown workspace level '{level}'")
+        record = self._workspaces.setdefault(workspace_id, {"name": workspace_id})
+        record["level"] = level
 
     def check_access(self, workspace_id: str, scope: Any) -> WorkspaceAccess:
         record = self._workspaces.get(workspace_id)
@@ -126,11 +176,16 @@ class LocalDevWorkspaceProvider:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         access = self.check_access(workspace_id, scope)
-        if not access.allowed:
+        if not access.can_write:
             raise CanvasError(
                 CanvasErrorCode.WORKSPACE_ACCESS_DENIED,
-                "workspace access denied",
-                context={"workspace_id": workspace_id, "provider_mode": self.mode},
+                "workspace write access denied",
+                context={
+                    "workspace_id": workspace_id,
+                    "level": access.level,
+                    "required_level": "write",
+                    "provider_mode": self.mode,
+                },
             )
         reference = {
             "artifact_ref_id": f"arf_dev{uuid_suffix()}",
@@ -248,8 +303,10 @@ def build_workspace_gateway(settings) -> WorkspaceGateway:
             "workspace provider requested but app.workspace is not available on this branch"
         )
     if mode == "dev":
-        if settings.production or not settings.dev_adapters_enabled:
-            return UnavailableWorkspaceProvider("development workspace adapter is disabled")
+        if settings.production or not settings.dev_preview or not settings.dev_adapters_enabled:
+            return UnavailableWorkspaceProvider(
+                "development workspace adapter is disabled (set AGCORE_CANVAS_DEV_PREVIEW=true)"
+            )
         return LocalDevWorkspaceProvider(production=settings.production)
     return UnavailableWorkspaceProvider()
 

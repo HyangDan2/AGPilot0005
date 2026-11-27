@@ -132,6 +132,11 @@ class ArtifactPage(BaseModel):
     total: int
     limit: int
     offset: int
+    # WO-C17 / C-FIX-02: list pages report what was dropped because workspace access is gone,
+    # and never claim an exact total it did not establish.
+    total_exact: bool = True
+    excluded_workspace_denied: int = 0
+    excluded_workspace_unavailable: int = 0
 
 
 class RevisionPage(BaseModel):

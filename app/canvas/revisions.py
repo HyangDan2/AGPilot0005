@@ -33,20 +33,27 @@ from app.canvas.storage import CanvasStorage, iso_now
 
 
 class RevisionManager:
-    def __init__(self, storage: CanvasStorage, settings: CanvasSettings) -> None:
+    def __init__(self, storage: CanvasStorage, settings: CanvasSettings, workspace: Any = None) -> None:
         self.storage = storage
         self.settings = settings
+        self.workspace = workspace
 
     def history(
         self, scope: Any, artifact_id: str, *, limit: Optional[int] = None, offset: int = 0
     ) -> RevisionPage:
-        artifact = visible_artifact(self.storage, artifact_id, scope)
+        artifact = visible_artifact(
+            self.storage, artifact_id, scope, workspace=self.workspace,
+            required="read", operation="revision.history",
+        )
         page_limit = min(int(limit or self.settings.default_page_limit), self.settings.max_list_limit)
         items, total = self.storage.list_revisions(artifact.artifact_id, limit=page_limit, offset=max(0, int(offset)))
         return RevisionPage(items=items, total=total, limit=page_limit, offset=max(0, int(offset)))
 
     def get(self, scope: Any, artifact_id: str, revision: int) -> Dict[str, Any]:
-        artifact = visible_artifact(self.storage, artifact_id, scope)
+        artifact = visible_artifact(
+            self.storage, artifact_id, scope, workspace=self.workspace,
+            required="read", operation="revision.get",
+        )
         revision_row, content = self.storage.read_revision_content(artifact.artifact_id, revision)
         from app.canvas.offsets import content_metrics
 
@@ -67,7 +74,10 @@ class RevisionManager:
         from_revision: Optional[int] = None,
         to_revision: Optional[int] = None,
     ) -> Dict[str, Any]:
-        artifact = visible_artifact(self.storage, artifact_id, scope)
+        artifact = visible_artifact(
+            self.storage, artifact_id, scope, workspace=self.workspace,
+            required="read", operation="revision.diff",
+        )
         current = artifact.current_revision
         target = int(to_revision if to_revision is not None else current)
         source = int(from_revision if from_revision is not None else max(1, target - 1))
@@ -103,7 +113,10 @@ class RevisionManager:
         actor_id: Optional[str] = None,
     ) -> PatchOutcome:
         """Restore an earlier revision by appending a new revision (never destructive)."""
-        artifact = visible_artifact(self.storage, artifact_id, scope)
+        artifact = visible_artifact(
+            self.storage, artifact_id, scope, workspace=self.workspace,
+            required="write", operation="revision.restore",
+        )
         target, target_content = self.storage.read_revision_content(artifact.artifact_id, revision)
         if target.revision == artifact.current_revision:
             raise CanvasError(
@@ -137,9 +150,10 @@ class RevisionManager:
 class PatchEngine:
     """Applies and previews partial edits with explicit conflict handling."""
 
-    def __init__(self, storage: CanvasStorage, settings: CanvasSettings) -> None:
+    def __init__(self, storage: CanvasStorage, settings: CanvasSettings, workspace: Any = None) -> None:
         self.storage = storage
         self.settings = settings
+        self.workspace = workspace
 
     def apply(
         self,
@@ -150,7 +164,10 @@ class PatchEngine:
         idempotency_key: Optional[str] = None,
         proposal_id: Optional[str] = None,
     ) -> PatchOutcome:
-        artifact = visible_artifact(self.storage, request.artifact_id, scope)
+        artifact = visible_artifact(
+            self.storage, request.artifact_id, scope, workspace=self.workspace,
+            required="write", operation="patch.apply",
+        )
         stored, revision, computation = self.storage.apply_patch(
             request, actor=request.actor, actor_id=actor_id, event_key=idempotency_key,
             proposal_id=proposal_id,
@@ -167,7 +184,10 @@ class PatchEngine:
     def preview(self, scope: Any, request: PatchRequest) -> Dict[str, Any]:
         from app.canvas.diffing import diff_texts
 
-        artifact = visible_artifact(self.storage, request.artifact_id, scope)
+        artifact = visible_artifact(
+            self.storage, request.artifact_id, scope, workspace=self.workspace,
+            required="read", operation="patch.preview",
+        )
         if request.base_revision != artifact.current_revision:
             raise CanvasError(
                 CanvasErrorCode.REVISION_CONFLICT,
