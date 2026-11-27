@@ -997,6 +997,16 @@ class WorkspaceManager:
 
     list_workspace_files = list_files
 
+    def list_workspace_files(
+        self,
+        workspace_id: str,
+        scope: ScopeView,
+        parent_id: Optional[str] = None,
+        recursive: bool = False,
+    ) -> List[FileIdentity]:
+        """Alias matching Canvas RuntimeWorkspaceProvider read contract (CP-01)."""
+        return self.list_files(workspace_id, scope, parent_id=parent_id, recursive=recursive)
+
     def get_file_metadata(self, workspace_id: str, file_id: str, scope: ScopeView) -> FileIdentity:
         record = self._file_record(workspace_id, file_id, scope)
         workspace = self.store.get_workspace(workspace_id) or {}

@@ -1550,8 +1550,13 @@ class RuntimeWorkspaceProvider:
         except Exception:
             return None
         factory = getattr(_runtime_provider_factory, "build", None)
-        if factory is None:  # pragma: no cover
-            return None
+        if factory is None:
+            try:
+                from app.workspace.runtime import get_runtime as _get_workspace_runtime
+
+                factory = lambda: _get_workspace_runtime().manager
+            except Exception:
+                return None
         provider = factory()
         return cls(provider) if provider is not None else None
 

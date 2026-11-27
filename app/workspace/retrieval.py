@@ -1,10 +1,10 @@
 """Keyword, vector and hybrid (RRF) retrieval over workspace chunks."""
 from __future__ import annotations
 
+from array import array as float_array
 import hashlib
+import math
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
-import numpy as np
 
 from app.workspace.config import WorkspaceSettings
 from app.workspace.contracts import (
@@ -140,27 +140,22 @@ class WorkspaceRetriever:
         filtered = [row for row in rows if row["file_id"] in files]
         if not filtered:
             return []
-        query_vector = np.asarray(self.embedder.embed_query(query), dtype=np.float32)
-        query_norm = float(np.linalg.norm(query_vector))
+        q_vals = [float(v) for v in self.embedder.embed_query(query)]
+        query_norm = math.sqrt(sum(v * v for v in q_vals))
         if query_norm <= 0:
             return []
-        query_vector = query_vector / query_norm
-        matrix = []
-        usable: List[Dict[str, Any]] = []
+        q_unit = [v / query_norm for v in q_vals]
+        q_dim = len(q_unit)
+        candidates: List[Tuple[float, Dict[str, Any]]] = []
         for row in filtered:
-            vector = np.frombuffer(row["vector"], dtype=np.float32)
-            if vector.shape[0] != query_vector.shape[0]:
+            vec = float_array("f")
+            vec.frombytes(row["vector"])
+            if len(vec) != q_dim:
                 continue
-            norm = float(np.linalg.norm(vector))
+            norm = math.sqrt(sum(v * v for v in vec))
             if norm <= 0:
                 continue
-            matrix.append(vector / norm)
-            usable.append(row)
-        if not matrix:
-            return []
-        similarities = np.asarray(matrix, dtype=np.float32) @ query_vector
-        candidates: List[Tuple[float, Dict[str, Any]]] = []
-        for similarity, row in zip(similarities.tolist(), usable):
+            similarity = sum(a * b for a, b in zip(vec, q_unit)) / norm
             score = float(max(0.0, min(1.0, (similarity + 1.0) / 2.0)))
             if score < min_score:
                 continue

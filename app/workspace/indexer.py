@@ -305,7 +305,8 @@ class WorkspaceIndexer:
             return "embedding_unavailable"
         index_key = getattr(embedder, "index_key", None) or f"{embedder.model_id}:{embedder.dimension}"
         dim = int(embedder.dimension)
-        import numpy as np
+        import array as _array
+        import math as _math
 
         try:
             texts = [row["content"] for row in rows]
@@ -317,13 +318,14 @@ class WorkspaceIndexer:
                 return "embedding_dimension_mismatch"
             prepared = []
             for row, vector in zip(rows, vectors):
-                array = np.asarray(vector, dtype=np.float32)
-                if array.shape[0] != dim:
+                vals = [float(v) for v in vector]
+                if len(vals) != dim:
                     return "embedding_dimension_mismatch"
-                norm = float(np.linalg.norm(array))
+                norm = _math.sqrt(sum(v * v for v in vals))
                 if norm > 0:
-                    array = array / norm
-                prepared.append((row["chunk_id"], workspace_id, index_key, dim, array.tobytes()))
+                    vals = [v / norm for v in vals]
+                buf = _array.array("f", vals).tobytes()
+                prepared.append((row["chunk_id"], workspace_id, index_key, dim, buf))
             self.store.upsert_vectors_if_current(file_id, revision, prepared)
             return None
         except Exception:

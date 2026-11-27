@@ -673,8 +673,8 @@ async def test_c18_capabilities_report_the_switch_point_and_omni_contract(canvas
     omni = caps["omni"]
     assert omni["contract"]["workspace_ssot_sha"] == "907482c"
     assert omni["switch_point"]["ssot"]["ref"] == "origin/feat/r2-workspace-rag"
-    assert omni["switch_point"]["active_source"] in {"canvas_mirror", "app.workspace.contracts"}
-    assert omni["switch_point"]["delegates_to_contract"] is False
+    assert omni["switch_point"]["active_source"] == "app.workspace.contracts"
+    assert omni["switch_point"]["delegates_to_contract"] is True
     assert "validate_relative_path" in omni["switch_point"]["mirror_surface"]
     assert omni["gates"]["core_tools"] == CORE_TOOLS_ENV
     assert omni["gates"]["workspace_tools"] == WORKSPACE_TOOLS_ENV

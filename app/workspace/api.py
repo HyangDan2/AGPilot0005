@@ -8,7 +8,7 @@ from __future__ import annotations
 import functools
 from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.core.auth import ExecutionScope, resolve_caller_scope
@@ -79,12 +79,33 @@ def _ensure_index_ready(runtime: WorkspaceRuntime, workspace_id: str) -> None:
         raise WorkspaceFailure(WorkspaceErrorCode.INDEX_NOT_READY, "workspace has no indexed content yet")
 
 
-def _iter_upload(upload: UploadFile):
-    while True:
-        chunk = upload.file.read(UPLOAD_CHUNK)
-        if not chunk:
-            break
-        yield chunk
+def _parse_multipart_upload(content_type: str, body: bytes) -> tuple[str, Optional[str], bytes, Dict[str, str]]:
+    """Stdlib multipart/form-data parser avoiding external python-multipart dependency."""
+    from email.parser import BytesParser
+    from email.policy import default as email_default
+
+    raw_msg = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
+    msg = BytesParser(policy=email_default).parsebytes(raw_msg)
+    if not msg.is_multipart():
+        raise HTTPException(status_code=400, detail={"code": "invalid_request", "message": "multipart/form-data required"})
+
+    filename = "upload.bin"
+    file_mime: Optional[str] = None
+    file_bytes: Optional[bytes] = None
+    fields: Dict[str, str] = {}
+    for part in msg.iter_parts():
+        field_name = part.get_param("name", header="content-disposition")
+        part_filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+        if field_name == "file" or part_filename is not None:
+            filename = part_filename or filename
+            file_mime = part.get_content_type()
+            file_bytes = payload
+        elif field_name:
+            fields[str(field_name)] = payload.decode("utf-8", errors="replace")
+    if file_bytes is None:
+        raise HTTPException(status_code=422, detail={"code": "invalid_request", "message": "missing multipart file field"})
+    return filename, file_mime, file_bytes, fields
 
 
 # ----------------------------------------------------------------------------- workspaces
@@ -325,35 +346,46 @@ def list_files(
 @router.post("/{workspace_id}/files", status_code=201)
 async def upload_file(
     workspace_id: str,
-    file: UploadFile = File(...),
-    parent_id: Optional[str] = Form(default=None),
-    overwrite: bool = Form(default=False),
-    expected_revision: Optional[int] = Form(default=None),
+    request: Request,
     scope: ExecutionScope = Depends(get_scope),
     runtime: WorkspaceRuntime = Depends(get_workspace_runtime),
 ) -> Dict[str, Any]:
     from starlette.concurrency import run_in_threadpool
 
     runtime.manager.get_workspace(workspace_id, scope)  # access check before reading the body
+    content_type = request.headers.get("content-type") or ""
+    body = await request.body()
+    filename, file_mime, file_bytes, fields = _parse_multipart_upload(content_type, body)
+    parent_id = fields.get("parent_id") or None
+    overwrite = str(fields.get("overwrite", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    raw_expected = fields.get("expected_revision")
+    expected_revision: Optional[int] = None
+    if raw_expected not in (None, ""):
+        try:
+            expected_revision = int(raw_expected)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_request", "message": "invalid expected_revision"}) from exc
+
+    def _chunks():
+        for start in range(0, len(file_bytes), UPLOAD_CHUNK):
+            yield file_bytes[start : start + UPLOAD_CHUNK]
 
     def _upload() -> FileIdentity:
         return runtime.manager.upload_file(
             workspace_id,
             scope,
-            file.filename or "upload.bin",
-            _iter_upload(file),
-            parent_id=parent_id or None,
-            overwrite=bool(overwrite),
+            filename,
+            _chunks(),
+            parent_id=parent_id,
+            overwrite=overwrite,
             expected_revision=expected_revision,
-            mime_type=file.content_type,
+            mime_type=file_mime,
         )
 
     try:
         identity = await run_in_threadpool(_upload)
     except WorkspaceFailure as failure:
         raise _http(failure) from failure
-    finally:
-        await file.close()
     return identity.model_dump(mode="json")
 
 
