@@ -1,15 +1,15 @@
 # AGCore R2-W — Workspace & RAG Foundation Preview · Developer Handover
 
-Status: **Preview complete (CP-W00 … CP-W06) + Amendment 01 folder-based workspace** · 2026-11-27
+Status: **Preview complete (CP-W00 … CP-W06) + Amendment 01 folder-based workspace + Amendment 02 agent architecture** · 2026-11-27
 Branch: `feat/r2-workspace-rag` in every repository · **no `main` merge, no deployment**
 
 ## 1. Repository / commitment matrix
 
 | Repository | Baseline `origin/main` | Branch head | Commits |
 | --- | --- | --- | --- |
-| `HyangDan2/AGPilot0005` (AGCore) | `0d2047f09a67f4cfd44f8c5399523eab3eac2172` = **v1.2.0** | `feat/r2-workspace-rag` | `90907ba` CP-W00 · `6b1562c` CP-W01 · `59f1573` CP-W02 · `dfa72e4` CP-W03 · `1c9d4f1` CP-W04 · `18211e7` CP-W06 docs · `907482c` CP-W00-A01 contract · `87d4141` CP-W01-A01 engine |
+| `HyangDan2/AGPilot0005` (AGCore) | `0d2047f09a67f4cfd44f8c5399523eab3eac2172` = **v1.2.0** | `feat/r2-workspace-rag` | `90907ba` CP-W00 · `6b1562c` CP-W01 · `59f1573` CP-W02 · `dfa72e4` CP-W03 · `1c9d4f1` CP-W04 · `18211e7` CP-W06 docs · `907482c` CP-W00-A01 contract · `87d4141` CP-W01-A01 engine · `449ac82` **A02 agent tools/chat scope** |
 | `HyangDan2/AGPilot0006` (AGTools) | `6d0f57f36c516545d7c5a307f26172c1b958ab2b` | `feat/r2-workspace-rag` (created, **no commits — parser reused unchanged**) | – |
-| `HyangDan2/AGPilot0011` (HD2AI) | `b4913d0d39f8ca223f48bb7b5b7fbd99f6126ebb` | `feat/r2-workspace-rag` | `79e718e` contract types · `0d623d1` CP-W05 UI · `1935d53` CP-W00-A01 types |
+| `HyangDan2/AGPilot0011` (HD2AI) | `b4913d0d39f8ca223f48bb7b5b7fbd99f6126ebb` | `feat/r2-workspace-rag` | `79e718e` contract types · `0d623d1` CP-W05 UI · `1935d53` CP-W00-A01 types · `3da918b` **A02 chat-integrated UI** |
 
 All three branches are pushed. No operating server, database, or R1.3 runtime file was modified.
 
@@ -172,6 +172,14 @@ Screenshots: `/workspace/downloads/r2-w-qa/` (`01-home` … `09-mobile`).
 - **AGTools chunk list has no content** → one detail request per chunk (bounded concurrency 8, cap 5000). A future `include_content` param in AGTools would remove the N+1 (see Backlog).
 - Page numbers for DOCX are `null` (the parser has no page concept) — the contract forbids inventing them.
 - Out of scope by work order: multi-user sharing/co-editing, archive auto-extraction, executable execution, cross-encoder reranking, external vector DB, Coding Agent/Terminal, SigmaWorks statistics, AGPolicy RL.
+- **Amendment 02**: the agent turn executes tools for real, but the answer writer is a deterministic
+  mock (`llm.mock=true`) — no LLM is connected. Tool registration in the R1.3 runtime and the real
+  `workspace_context` overlay on the operating chat endpoint are **not applied** (R2W-B11).
+- **Amendment 02**: Canvas `POST /artifacts/from-workspace` / `save-to-workspace` / `workspace-link`
+  are matched by the directive fields (`workspace_id`, `file_id`, `revision`, `content_hash`,
+  `artifact_ref_id`) but were not called against a running Canvas runtime in this environment.
+- **Amendment 02**: `local_browser` workspaces are read-only agent targets until the `client_read` /
+  `client_write` ack contracts exist (R2W-B9/B10).
 
 ## 10. Canvas connection interface
 
@@ -264,6 +272,140 @@ Client contract files stay byte-identical (`AGPilot0005/clients/workspace-contra
 - Renaming/moving a folder in the UI moves only that row; descendants are reconciled by the next watcher
   pass (their rel paths and index are rebuilt from content hashes).
 
+## 11c. Amendment 02 — Omni Workspace Agent Architecture Correction
+
+WO-R2-W Amendment 02 turns the workspace into an **agent tool surface inside the existing HD2AI chat**.
+The Amendment 01 engine (storage, watcher, indexing, embedding, hybrid retrieval, citation, access
+control) is used unchanged; nothing was re-developed.
+
+### 11c.1 Backend modules (AGPilot0005, commit `449ac82`)
+
+| Module | Responsibility |
+| --- | --- |
+| `tools.py` | The **11 agent tool contracts** (`TOOL_MANIFEST`, version `r2-w/v1+a02`) and their handlers on top of `WorkspaceManager`/`WorkspaceRetriever`/`ContextAssembler`. v1 `workspace_search` / `workspace_get_context` stay callable as deprecated aliases. |
+| `chat.py` | Workspace scope for a chat request: `WorkspaceChatEnvelope`, `WorkspaceChatContext` (the seven fields below), `build_workspace_chat_context`, `attach_workspace_scope`. |
+| `agent.py` | Agentic Execution Preview Adapter: intent analysis → inspection → tool selection → search/read/retrieve → analysis → create/patch → verification → chat response, with a real tool trace. |
+| `api.py` | `POST /workspaces/{id}/chat/context` (scope a chat turn receives) and `POST /workspaces/{id}/agent/turn` (one agent turn). |
+| `manager.py` | Additive `create_directory(path)` (nested folders, real dirs for folder workspaces) used by `workspace_create_directory`. |
+
+### 11c.2 The 11 agent tools
+
+| Tool | Side effects | Notes |
+| --- | --- | --- |
+| `workspace_list_files` | none | metadata only; never returns bodies |
+| `workspace_find_files` | none | name/path substring + glob |
+| `workspace_get_file_info` | none | identity, revisions, chunk count |
+| `workspace_read_file` | none | token budget, `revision`, `offset_chars`; flags prompt injection |
+| `workspace_search_text` | none | exact string, line numbers, works without an index |
+| `workspace_retrieve` | none | keyword/vector/hybrid + citation-backed context |
+| `workspace_create_file` | workspace_write | overwrite needs `overwrite` **and** `confirm_overwrite` |
+| `workspace_patch_file` | workspace_write | edits or markdown section replace; returns previous/new revision + diff |
+| `workspace_move_file` | workspace_write | rename/move; target existing file needs `confirm_overwrite` |
+| `workspace_delete_file` | irreversible_workspace_delete | `confirm=true` (user approval) only |
+| `workspace_create_directory` | workspace_write | nested path |
+
+Security invariants kept: every path goes through `validate_relative_path` (no root escape, no `..`,
+symlink-safe joins), tenant/owner/service isolation is enforced by the manager, the capability
+tprofile can only narrow (`allowed_tools`, `read_only`, `write`, `delete`), and **no terminal/OS
+tool exists** (`assert_manifest_is_agent_only`). Overwrite and delete return `approval_required`
+with the target and the required flags instead of acting.
+
+### 11c.3 Workspace chat scope (metadata only)
+
+`attach_workspace_scope(body, …)` returns the request unchanged when there is no workspace selection —
+the existing chat path keeps 100% of its behaviour. With a selection the request gains
+`workspace_context`:
+
+`workspace_id`, `workspace_root`, `storage_provider`, `execution_scope`, `granted_capabilities`,
+`file_metadata` (counts, index status, top-level names), `retrieval_availability`
+(keyword/vector/hybrid, index key, degradation reasons), and `context_policy.file_contents_included=false`.
+No file body is inserted; content is only fetched by a tool call the model makes.
+
+### 11c.4 Agent loop and intent routing (no fixed RAG pipeline)
+
+| Request | Intent | Tools actually used |
+| --- | --- | --- |
+| "이 폴더의 파일 구성을 설명해줘." | `structure` | `workspace_list_files` only (no body read) |
+| "요구사항 문서를 찾아서 요약해줘." | `find_and_summarize` | `find_files` → `read_file` → `retrieve`(file-scoped) |
+| "관련 문서를 비교해줘." | `compare` | `find_files` ×n → `read_file` ×2 → `retrieve` |
+| "분석 결과를 reports/summary.md에 저장해줘." | `create` | `retrieve` → `read_file` (evidence) → `create_file` → `read_file` (verification) |
+| "기존 summary.md의 결론만 수정해줘." | `patch` | `read_file` → `patch_file`(section) → `read_file` (verification) |
+| "방금 생성한 파일을 Canvas에서 열어줘." | `open_canvas` | `get_file_info` + artifact reference registration |
+
+Rules: a clear filename wins a direct read; an exact string goes to `workspace_search_text`; a
+semantic question goes to `workspace_retrieve`; a structure question never reads bodies. Delete and
+full overwrite stop at an approval card; approving re-runs the same turn with
+`approvals: ["<tool>:<path>"]`. Conversation memory (last created/patched file) makes "방금 생성한 파일"
+work across turns.
+
+### 11c.5 Tool execution vs answer text
+
+Every tool call is real (rows, revisions, on-disk files, artifact references). No LLM is connected in
+this repository, so the answer text is composed deterministically from the tool results and marked
+`llm = {provider: "mock", mock: true, notice: …}`; the UI shows "미리보기 응답 · LLM 미연결" on every turn.
+File excerpts are sanitised (`sanitize_document_text`), instruction-like lines are dropped from quotes,
+and `injection_suspected` is reported per turn.
+
+### 11c.6 Frontend (AGPilot0011, commit `3da918b`)
+
+Removed: the full-screen `WorkspacePanel` modal, the independent `RagChat`, the independent
+`SearchPanel` and `IndexPanel`. Kept/reused: `FileExplorer`, the folder dialog, the preview.
+
+| Piece | Role |
+| --- | --- |
+| `WorkspaceChip` | composer toolbar chip: connected folder name, root path, file/index summary, 파일 / 변경 / 연결 해제 (connect when none) |
+| `WorkspaceFolderDialog` | folder selection only (server folder / browser local folder, or pick an existing workspace) |
+| `WorkspaceDrawer` | optional auxiliary explorer sidebar (reused `FileExplorer`, index counts, live refresh) |
+| `WorkspaceTurnView` | inside the assistant message: intent, tool timeline with duration/revision, file cards (열기 / diff / Canvas 열기), citations, verification line, approval card |
+| `WorkspaceFilePreview` | file/citation preview with revision + download + Canvas 열기 |
+| `workspaceAgent.ts` | transport for `/agent/turn` and `/chat/context`, plus the turn types |
+
+With no workspace connected the chat sends through the original `provider.streamChat` untouched;
+the workspace path is used only when a folder is connected (last workspace restored from
+`localStorage`).
+
+### 11c.7 Canvas handoff (WO-C18 contract on the Canvas side)
+
+`workspace open_canvas` records an artifact reference (`kind=canvas`, `artifact_id=canvas:<file_id>`)
+and returns the directive with `workspace_id`, `file_id`, `path`, `revision`, `content_hash`,
+`artifact_ref_id` and a `canvas_handoff` block:
+
+| Workspace side | Canvas side (WO-C18) |
+| --- | --- |
+| `file_id` + `revision` + `content_hash` in the directive | `POST /artifacts/from-workspace` |
+| `content_hash` (same value as `WorkspaceWriteRequest.expected_content_hash`) | Canvas `last_saved_content_hash` → `409` on mismatch |
+| `PUT /workspaces/{id}/file` with `expected_content_hash` | `POST /artifacts/{id}/save-to-workspace` |
+| `GET /workspaces/{id}/artifact-references?kind=canvas` | `GET /artifacts/{id}/workspace-link` |
+
+`VITE_CANVAS_URL` opens the Canvas app with `workspace_id`, `file_id`, `revision`, `content_hash`,
+`artifact_ref`. Without it the chat opens the workspace file preview and says the Canvas app is not
+wired in this build — the reference is still recorded.
+
+**Amendment 01 contract gaps reported by the Canvas side** (kept open, not silently patched):
+1. **`client_read`** — `local_browser` workspaces cannot return an existing file's body to the server,
+   so an agent read on such a workspace has no server-side fallback and no client read request/
+   response contract exists yet.
+2. **`client_write` acknowledgement** — the server returns a `ClientWriteDirective`, but there is no
+   contract for the browser to report the write result (`content_hash`, `revision`, failure) back, so
+   the workspace cannot confirm a `local_browser` write.
+
+Both are tracked as R2W-B9/B10 in §12; they need a contract addendum before `local_browser`
+workspaces can be full agent targets.
+
+### 11c.8 Verification
+
+```bash
+cd /workspace/repos/AGPilot0005
+python -m pytest tests/test_r2_workspace_am02_agent.py -q   # 11 passed (6 scenarios + security + chat scope + HTTP)
+python -m pytest tests/test_r2_workspace_*.py -q            # 102 passed
+python -m pytest -q                                         # 275 passed
+cd /workspace/repos/AGPilot0011/hd2ai-admin
+npx tsc -p tsconfig.app.json --noEmit && npx vite build    # clean
+```
+
+Headless Chromium QA: `/workspace/qa/am02_qa.py` → screenshots in `/workspace/downloads/r2-w-am02-qa/`
+(`01-chat-without-workspace` … `15-mobile-chat`); see `QA_REPORT.md` §A2.
+
 ## 12. Backlog
 
 | ID | Item | Priority |
@@ -276,3 +418,8 @@ Client contract files stay byte-identical (`AGPilot0005/clients/workspace-contra
 | R2W-B6 | Streaming context/citation SSE for long analyses | P3 |
 | R2W-B7 | File move via drag & drop in the UI (API already supports `parent_id`) | P3 |
 | R2W-B8 | Agent-facing answer verification loop (citation id check already exposed via `/citations/validate`) | P3 |
+| R2W-B9 | **A02 gap**: `client_read` contract for `local_browser` workspaces (server → browser read request/response) so agent read/search works without server-side path access | P1 |
+| R2W-B10 | **A02 gap**: `client_write` acknowledgement contract (browser reports `content_hash`/`revision`/failure after a `ClientWriteDirective`) so the workspace can confirm a local-browser write | P1 |
+| R2W-B11 | Register the 11 agent tools in the R1.3 runtime tool registry and pass the real `workspace_context` on chat requests (blocked until R1.3 closes) | P0 (R1.3) |
+| R2W-B12 | Connect a real LLM to `agent.py` (answer writer stays labelled mock until then) and validate Canvas `from-workspace` / `save-to-workspace` against a running Canvas runtime | P1 |
+| R2W-B13 | Semantic query rewrite before `workspace_find_files` for Korean document references ("요구사항 문서" → filename/content match) | P3 |

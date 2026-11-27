@@ -181,3 +181,84 @@ python3 /workspace/qa/am01_qa.py   # needs playwright + chromium system libs
 - `local_browser` handles are session-scoped in the browser; reconnect after reload by picking again.
 - Folder rename/move propagates to descendants on the next watcher pass.
 - No UI screenshot artifacts in this run (A1.3).
+
+## A2. Amendment 02 — agent architecture on real workspace files
+
+Date: 2026-11-27 KST · Backend `449ac82`, frontend `3da918b` (`feat/r2-workspace-rag`, no merge/deploy).
+Lean Engineering Policy v1.1: only the changed surface was tested; the pre-existing suite was reused.
+
+### A2.1 Automated tests
+
+| Suite | Command | Result |
+| --- | --- | --- |
+| Amendment 02 (11 tools, chat scope, 6 acceptance scenarios, approval, injection, HTTP) | `pytest tests/test_r2_workspace_am02_agent.py -q` | **11 passed** |
+| R2-W workspace suites (contract → A02) | `pytest tests/test_r2_workspace_*.py -q` | **102 passed** |
+| Full AGCore suite | `pytest -q` | **275 passed** (previously 226; +11 new, 0 regressions) |
+| Frontend types/build | `tsc -p tsconfig.app.json --noEmit`, `vite build` | pass (no type errors) |
+
+Covered by `test_r2_workspace_am02_agent.py`:
+
+```
+test_tool_manifest_defines_eleven_agent_tools_without_terminal     11 tools, no terminal/exec, read tools side_effects=none
+test_workspace_chat_scope_is_metadata_only_and_optional          no workspace → same object; scope has 7 fields; no body text
+                                                                  (문서 본문 문자열이 컨텍스트에 없음)
+test_agent_tool_security_boundaries                               ../escape.md rejected; overwrite/delete → approval_required
+                                                                  (file untouched); read_only capability denied; cross-owner
+                                                                  workspace_not_found; literal search finds 768 토큰 in 2 files
+test_patch_and_directory_tools                                    archive/2026 folder; 설계.md 결론 rev 1→2 + diff; move;
+                                                                  missing section → section_not_found
+test_six_acceptance_scenarios_in_one_conversation                 the six user requests, one conversation:
+  structure   list_files only, no read_file
+  summarize   find_files → read_file → retrieve(file-scoped)
+  compare     2 distinct files read, comparison text
+  create      reports/summary.md created, re-read verification, hash match
+  patch       summary.md 결론 rev 1→2, diff, section_present
+  canvas      artifact reference registered + canvas directive
+                                                                  all turns llm.mock=true
+test_agent_missing_workspace_and_empty_conversation               no target → needs_input (no write)
+test_delete_needs_user_approval_then_completes                    unapproved delete blocked; approved delete executes
+test_injection_content_is_flagged_and_not_quoted                  “ignore previous instructions” counted, not quoted
+test_intent_analysis_covers_the_six_requests                      intent/target/section parsing
+test_preview_api_exposes_chat_context_and_agent_turn              HTTP: /chat/context metadata-only, /agent/turn structure turn
+```
+
+### A2.2 Headless Chromium (chat UI, preview backend)
+
+Harness `/workspace/qa/am02_qa.py` (Playwright Chromium; `LD_LIBRARY_PATH=/workspace/.tools/chromedeps/usr/lib/x86_64-linux-gnu`).
+Preview backend on `:8210` with a real allowed-root folder (4 documents, local embedding, AGTools off);
+UI = `dist-am02-qa` (`VITE_WORKSPACE_API_BASE=http://127.0.0.1:8210/api/v1/workspaces`).
+
+```
+PASS connect from composer chip      "＋ 워크스페이스 폴더 연결" → dialog → 연결 → chip "📁 lab-docs · /tmp/…/lab-docs · 파일 4"
+PASS 1 structure                     intent 폴더 구성 설명, file list + index status, no body read
+PASS 2 find + summarize              "PDF와 DOCX 문서를 지원한다" summarised, citation chip cit_f92c79dab63e
+PASS 3 compare                       A↔B table (경로/리비전/분량/섹션, A핵심/B핵심)
+PASS 4 create reports/summary.md     file card created rev 1, 검증 본문 재읽기 성공 · 해시 일치
+PASS 5 patch 결론                    file card 수정 rev 1 → 2, diff view, 검증 · 섹션 확인
+PASS 6 canvas                        file card 열림 rev 2 + Canvas 열기, artifact reference 등록
+PASS explorer drawer                 reused FileExplorer sidebar opens/closes from chip
+PASS approval boundary               삭제 요청 → approval card ("사용자 승인이 필요합니다") → 승인하고 실행 →
+                                     archive-old.md actually removed from the folder
+PASS citation preview                citation chip → file preview (revision note + download)
+PASS mobile 390×844                  chip/file cards wrap, no horizontal clip
+CONSOLE_ERRORS [] · UNEXPECTED_RESPONSES [] (only the gateway status probe /admin/hd2ai/api/v1/status 404s: no gateway in preview)
+```
+
+Screenshots: `/workspace/downloads/r2-w-am02-qa/`
+`01-chat-without-workspace` · `02-folder-dialog` · `03-workspace-connected-chip` · `04-scenario1-structure` ·
+`05-scenario2-summary` · `06-scenario3-compare` · `07-scenario4-created` · `08-scenario5-patch` ·
+`09-scenario5-diff` · `10-scenario6-canvas` · `11-explorer-drawer` · `12-approval-required` ·
+`13-approval-executed` · `14-citation-preview` · `15-mobile-chat`
+
+### A2.3 Known gaps (Amendment 02)
+
+- Answer text is a labelled mock (`llm.mock=true`); no LLM is connected.
+- R1.3 runtime registration of the 11 tools and the real chat-request overlay are not applied
+  (R2W-B11; R1.3 must close first). The preview app exposes `/agent/turn` and `/chat/context`.
+- Canvas `from-workspace` / `save-to-workspace` / `workspace-link` are matched field-by-field in the
+  canvas directive (`workspace_id`, `file_id`, `revision`, `content_hash`, `artifact_ref_id`) but were
+  not called against a running Canvas runtime here; `VITE_CANVAS_URL` wiring is untested end-to-end.
+- `local_browser` workspaces: agent read/write still blocked by the missing `client_read` /
+  `client_write` ack contracts (R2W-B9/B10).
+- The QA bundle referenced `theme-toggle.{js,css}` and favicons that `tools/build_brand.py` normally
+  generates; they were copied into the QA `dist` for the run, so the brand build gap is unrelated to A02.

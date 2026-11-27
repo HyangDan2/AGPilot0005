@@ -1,7 +1,7 @@
 # AGCore R2-W — Workspace Shared Contract
 
-Status: **FROZEN PREVIEW CONTRACT (R2-W, v1) + Amendment 01 (folder-based workspace)**
-Contract revision: `r2-w/v1+a01` (`WORKSPACE_CONTRACT_REVISION`)
+Status: **FROZEN PREVIEW CONTRACT (R2-W, v1) + Amendment 01 (folder-based workspace) + Amendment 02 (agent tools & chat scope)**
+Contract revision: `r2-w/v1+a02` (`WORKSPACE_CONTRACT_REVISION`)
 Owner: Workspace/RAG Engineer (`feat/r2-workspace-rag`)
 Consumers: Canvas Engineer (`feat/r2-canvas`), HD2AI Frontend (`AGPilot0011`), Server-HQ Supervisor
 Baseline: AGCore **v1.2.0 (`0d2047f`)**, AGTools **`6d0f57f`**, HD2AI **`b4913d0`**
@@ -9,7 +9,9 @@ Baseline: AGCore **v1.2.0 (`0d2047f`)**, AGTools **`6d0f57f`**, HD2AI **`b4913d0
 Amendment 01 is **additive**. Every v1 type, operation, error code and field keeps its meaning;
 new members are optional for a v1 consumer. Sections §1–§9 are the frozen v1 contract, §A1 is
 Amendment 01 (folder-based workspace). The v1 operation name list (`provider_operations()`) stays
-frozen; Amendment 01 operations are listed by `provider_operations_a01()`.
+frozen; Amendment 01 operations are listed by `provider_operations_a01()`. Amendment 02 (§A2) adds
+**server-side agent tools** and a **chat workspace scope**: it does not add a provider operation and
+the `WorkspaceProvider` interface is unchanged.
 
 This document is the contract between the Workspace/RAG engine (AGPilot0005), the Canvas
 Artifact engine (parallel `feat/r2-canvas` branch) and the HD2AI frontend (AGPilot0011).
@@ -531,3 +533,73 @@ lifecycle in memory: `openFolder`, `newWorkspace`, `closeWorkspace`, `reopenWork
 `disconnectWorkspace` (refuses source deletion), `writeFile` (returns `client_write` for
 `local_browser`) and `syncWorkspace`. The preview router exposes the same paths under
 `/api/v1/workspaces/_mock/*`. A v1 consumer that only calls §2 operations keeps working unchanged.
+
+---
+
+# Amendment 02 — Agent Tools & Chat Workspace Scope
+
+`r2-w/v1+a02`. Two additions, both server-side; no `WorkspaceProvider` operation changes.
+
+## A2.1 Agent tools (11)
+
+`app/workspace/tools.py` → `TOOL_MANIFEST` (`version: r2-w/v1+a02`). These are AGCore **tools**, not
+client provider operations:
+
+| # | Tool | side_effects | Required approval |
+| --- | --- | --- | --- |
+| 1 | `workspace_list_files` | none | – |
+| 2 | `workspace_find_files` | none | – |
+| 3 | `workspace_get_file_info` | none | – |
+| 4 | `workspace_read_file` | none | – |
+| 5 | `workspace_search_text` | none | – |
+| 6 | `workspace_retrieve` | none | – |
+| 7 | `workspace_create_file` | workspace_write | overwrite: `overwrite` + `confirm_overwrite` |
+| 8 | `workspace_patch_file` | workspace_write | – (revisioned edit with `expected_revision`) |
+| 9 | `workspace_move_file` | workspace_write | target exists: `confirm_overwrite` |
+| 10 | `workspace_delete_file` | irreversible_workspace_delete | `confirm=true` (user) |
+| 11 | `workspace_create_directory` | workspace_write | – |
+
+`workspace_search` and `workspace_get_context` remain callable for v1 callers but are no longer in
+the manifest (agents use `workspace_retrieve`). No terminal/OS command tool exists.
+
+A refusal returns status `approval_required` with `context = {action, path, file_id, required[]}` and
+changes nothing; the caller repeats the call with the approval flags.
+
+## A2.2 Chat workspace scope
+
+A chat request may carry `workspace: {workspace_id, enabled?, context_budget_tokens?,
+granted_capabilities?}`. The server attaches `workspace_context` with exactly:
+`workspace_id`, `workspace_root`, `storage_provider`, `execution_scope`, `granted_capabilities`,
+`file_metadata`, `retrieval_availability` (+ `context_policy.file_contents_included = false`).
+File bodies are never part of this block; content is fetched by tool calls. Without a workspace
+selection the request is passed through unchanged.
+
+`POST /api/v1/workspaces/{workspace_id}/chat/context` returns that block;
+`POST /api/v1/workspaces/{workspace_id}/agent/turn` runs one agent turn
+(`message`, `conversation_id?`, `approvals?`, `capability?`, `context_budget_tokens?`) and returns
+`intent`, `plan`, `tool_calls[]`, `citations[]`, `files[]`, `verification`, `pending_approval`,
+`retrieval_availability` and a labelled `llm` block (`mock: true` while no LLM is connected).
+
+## A2.3 Workspace → Canvas handoff (WO-C18)
+
+| Workspace value | Canvas endpoint / field |
+| --- | --- |
+| `workspace_id`, `file_id`, `revision`, `content_hash` | `POST /artifacts/from-workspace` |
+| `content_hash` | `last_saved_content_hash` → `409` when the canvas copy is newer |
+| `PUT /workspaces/{id}/file` + `expected_content_hash` | `POST /artifacts/{id}/save-to-workspace` |
+| artifact reference (`kind=canvas`) | `GET /artifacts/{id}/workspace-link` |
+
+Open contract gaps (backlog R2W-B9/B10):
+1. **`client_read`** — no request/response contract for the server to ask the browser for an
+   existing file body in a `local_browser` workspace.
+2. **`client_write` acknowledgement** — no contract for the browser to report the result
+   (`content_hash`, `revision`, failure) of a `ClientWriteDirective`.
+
+## A2.4 Errors added by Amendment 02
+
+| code | HTTP | Meaning |
+| --- | --- | --- |
+| `approval_required` | 409 | write/delete needs the user's approval (`confirm*` flags) |
+| `patch_conflict` | 409 | `edits[].find` missing or ambiguous |
+| `section_not_found` | 404 | markdown section to replace does not exist |
+| `capability_denied` | 403 | tool not granted by the capability profile / read-only |
