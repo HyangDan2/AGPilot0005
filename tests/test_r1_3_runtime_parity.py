@@ -486,6 +486,7 @@ async def test_parity_06_dynamic_tool_discovery(engine, monkeypatch, tmp_path):
 async def test_parity_07_document_analysis_and_durable_orchestrator(engine, monkeypatch, tmp_path):
     gw = ScriptedGateway([{"content": "unused"}])
     _, headers = _setup_parity_env(monkeypatch, tmp_path, engine, gw)
+    monkeypatch.setenv("AGCORE_DURABLE_ANALYSIS_SERVICES", headers["X-HD2Lab-Service"])
 
     # Part A: Durable TaskOrchestrator boundary via /api/v1/agent/runs with context_refs
     created_calls: List[Dict[str, Any]] = []

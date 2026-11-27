@@ -102,25 +102,43 @@ class AllowedRootPolicy:
         deny_symlinks: bool = True,
         protected_paths: Iterable[Path | str] = (),
     ) -> None:
-        self.roots = tuple(roots)
+        self.roots = tuple(
+            root for root in roots
+            if Path(root.path).expanduser().is_absolute() and ".." not in Path(root.path).parts
+        )
         self.deny_symlinks = deny_symlinks
         self.protected_paths = tuple(Path(p).expanduser().resolve() for p in protected_paths)
 
     # -- scope --------------------------------------------------------------------
     @staticmethod
-    def _expand(root: AllowedRoot, tenant_id: str, owner_id: str) -> Path:
-        text = root.path
-        if "{owner}" in text:
-            text = text.replace("{owner}", _safe_scope_segment(owner_id))
-        if "{tenant}" in text:
-            text = text.replace("{tenant}", _safe_scope_segment(tenant_id))
-        return Path(text).expanduser()
+    def _expand(root: AllowedRoot, tenant_id: str, owner_id: str) -> Tuple[Path, Path, Path]:
+        template = Path(root.path).expanduser()
+        parts = template.parts
+        if root.scope in {"owner", "tenant"} and "{tenant}" not in parts:
+            if "{owner}" in parts:
+                owner_index = parts.index("{owner}")
+                template = Path(*parts[:owner_index], "{tenant}", *parts[owner_index:])
+            else:
+                template /= "{tenant}"
+        if root.scope == "owner" and "{owner}" not in template.parts:
+            template /= "{owner}"
+
+        scope_values = {"{tenant}": _safe_scope_segment(tenant_id), "{owner}": _safe_scope_segment(owner_id)}
+        boundary = next((index for index, part in enumerate(template.parts) if part in scope_values), len(template.parts))
+        base = Path(*template.parts[:boundary])
+        # Resolve system aliases above the configured base while preserving the base and
+        # every tenant/owner segment for the no-symlink check below.
+        anchor = _resolve_lenient(base.parent)
+        suffix = [scope_values.get(part, part) for part in template.parts[boundary:]]
+        if base != base.parent:
+            suffix.insert(0, base.name)
+        return anchor.joinpath(*suffix), base.parent.joinpath(*suffix), anchor
 
     def visible_roots(self, tenant_id: str, owner_id: str) -> List[ResolvedRoot]:
         out: List[ResolvedRoot] = []
         seen: set[str] = set()
         for root in self.roots:
-            path = self._expand(root, tenant_id, owner_id)
+            path, _, _ = self._expand(root, tenant_id, owner_id)
             key = f"{root.root_id}:{path}"
             if key in seen:
                 continue
@@ -168,27 +186,26 @@ class AllowedRootPolicy:
 
         # Pick the root by the *textual* path first, so a symlink at the root boundary is reported
         # as a symlink rather than as an unrelated root miss, then verify the resolved path.
-        text_roots: List[Tuple[int, AllowedRoot, Path, Path]] = []
-        for item in self.visible_roots(tenant_id, owner_id):
-            if root_id is not None and item.root.root_id != root_id:
+        text_roots: List[Tuple[int, AllowedRoot, Path, Path, Path]] = []
+        for root in self.roots:
+            if root_id is not None and root.root_id != root_id:
                 continue
-            expanded_root = Path(item.path).expanduser()
-            root_path = _resolve_lenient(expanded_root)
-            if not _is_inside(candidate_in, expanded_root):
+            expanded_root, configured_root, anchor = self._expand(root, tenant_id, owner_id)
+            if _is_inside(candidate_in, expanded_root):
+                candidate_text = candidate_in
+            elif _is_inside(candidate_in, configured_root):
+                candidate_text = expanded_root / candidate_in.relative_to(configured_root)
+            else:
                 continue
-            text_roots.append((len(str(root_path)), item.root, root_path, expanded_root))
+            text_roots.append((len(str(expanded_root)), root, expanded_root, anchor, candidate_text))
         if not text_roots:
             raise RootPolicyError("path_outside_allowed_root", "path is outside every allowed root")
         text_roots.sort(key=lambda entry: entry[0], reverse=True)
-        _, matched, root_path, expanded_root = text_roots[0]
+        _, matched, expanded_root, anchor, candidate_text = text_roots[0]
         if self.deny_symlinks:
-            try:
-                if expanded_root.exists() and stat.S_ISLNK(os.lstat(expanded_root).st_mode):
-                    raise RootPolicyError("symlink_escape", "allowed root is a symlink")
-            except OSError:
-                pass
-            self._assert_no_symlink_components(expanded_root, candidate_in)
-        candidate = _resolve_lenient(candidate_in)
+            self._assert_no_symlink_components(anchor, candidate_text)
+        root_path = _resolve_lenient(expanded_root)
+        candidate = _resolve_lenient(candidate_text)
         if not _is_inside(candidate, root_path):
             reason = "symlink_escape" if self.deny_symlinks else "path_outside_allowed_root"
             raise RootPolicyError(reason, "path escapes the allowed root")
@@ -198,7 +215,7 @@ class AllowedRootPolicy:
         if must_exist:
             try:
                 info = os.lstat(candidate)
-            except FileNotFoundError as exc:
+            except (FileNotFoundError, NotADirectoryError) as exc:
                 raise RootPolicyError("root_unavailable", "root does not exist") from exc
             if stat.S_ISLNK(info.st_mode):
                 raise RootPolicyError("symlink_escape", "root is a symlink")
@@ -247,22 +264,19 @@ class AllowedRootPolicy:
     def _assert_metadata_separate(self, root: Path) -> None:
         resolved_root = _resolve_lenient(root)
         for protected in self.protected_paths:
-            if _is_inside(protected, resolved_root):
+            if _is_inside(protected, resolved_root) or _is_inside(resolved_root, protected):
                 raise RootPolicyError(
                     "metadata_overlap", "workspace root would contain the workspace metadata store"
                 )
 
 
 def _safe_scope_segment(value: str) -> str:
-    """Collision-free, traversal-safe directory segment for tenant/owner isolation (CP-02)."""
+    """Encode scope IDs in distinct, traversal-safe, case-insensitive directory segments."""
     raw = str(value or "")
-    # Pure ASCII [A-Za-z0-9_-] within length limit without traversal risk stays readable
-    is_pure = bool(raw) and len(raw) <= 64 and all(ch.isalnum() or ch in {"-", "_"} for ch in raw) and raw not in {".", ".."}
-    if is_pure:
+    readable = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+    if raw and len(raw) <= 64 and all(ch in readable for ch in raw):
         return raw
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-    prefix = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in raw).strip("_")[:32] or "scope"
-    return f"{prefix}__{digest}"
+    return "~" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _resolve_lenient(path: Path | str) -> Path:

@@ -280,6 +280,24 @@ def test_deleted_file_during_indexing_never_reappears(env):
     assert env.store.search_keyword(env.workspace_id, fts_query("deleted"), limit=5) == []
 
 
+def test_late_indexer_result_keeps_new_revision_pending(env, monkeypatch):
+    uploaded = _upload(env, content=b"revision one")
+    first_job = env.store.claim_next_job(env.indexer.clock())
+
+    def replace_during_embedding(*_):
+        new_revision = _upload(env, content=b"revision two", overwrite=True)
+        assert new_revision.revision == 2
+        return None
+
+    monkeypatch.setattr(env.indexer, "embedder", object())
+    monkeypatch.setattr(env.indexer, "_embed_chunks", replace_during_embedding)
+    env.indexer.process_job(first_job)
+    file = env.store.get_file(env.workspace_id, uploaded.file_id)
+    assert file["revision"] == 2
+    assert file["index_status"] == IndexState.PENDING.value
+    assert env.store.get_job(first_job["job_id"])["state"] == IndexState.CANCELLED.value
+
+
 def test_retry_then_failed_with_reason(env):
     env.stub.error = ExtractionError("parser_unavailable", "down")
     uploaded = _upload(env, content=b"retry me")

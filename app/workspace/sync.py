@@ -67,7 +67,7 @@ class FolderSyncService:
 
     def _sync_locked(self, workspace: Dict[str, Any], *, full: bool = False) -> WorkspaceSyncResult:
         workspace_id = workspace["workspace_id"]
-        root = Path(workspace["root_path"] or "")
+        root = self.manager._root_path(workspace)
         started = self.clock()
         entries, errors = folder.scan_root(
             root,
@@ -75,6 +75,8 @@ class FolderSyncService:
             max_entries=self.settings.scan_max_entries,
             max_depth=self.settings.scan_max_depth,
         )
+        # Absence from a partial scan is not evidence of deletion or a move.
+        partial_scan = any(error["code"] in {"max_depth", "scan_truncated", "unreadable"} for error in errors)
         scan: Dict[str, folder.FolderEntry] = {entry.relative_path: entry for entry in entries}
         rows = self.store.list_external_files(workspace_id)
         by_rel: Dict[str, Dict[str, Any]] = {row["rel_path"]: row for row in rows if row.get("rel_path")}
@@ -112,7 +114,7 @@ class FolderSyncService:
         vanished = [
             row
             for rel, row in by_rel.items()
-            if rel not in scan and row["kind"] == FileKind.FILE.value and row.get("rel_path")
+            if not partial_scan and rel not in scan and row["kind"] == FileKind.FILE.value and row.get("rel_path")
         ]
         by_hash: Dict[str, List[Dict[str, Any]]] = {}
         for row in vanished:
@@ -176,7 +178,7 @@ class FolderSyncService:
 
         # 3. Whatever is still missing is gone.
         for rel, row in list(by_rel.items()):
-            if rel in scan:
+            if partial_scan or rel in scan:
                 continue
             if row["kind"] == FileKind.FOLDER.value:
                 continue
@@ -185,7 +187,8 @@ class FolderSyncService:
 
         # 4. Folder rows with no scanned path and no live children are removed too.
         for rel in sorted(
-            (rel for rel, row in by_rel.items() if row["kind"] == FileKind.FOLDER.value and rel not in scan),
+            (rel for rel, row in by_rel.items()
+             if not partial_scan and row["kind"] == FileKind.FOLDER.value and rel not in scan),
             key=lambda item: item.count("/"),
             reverse=True,
         ):

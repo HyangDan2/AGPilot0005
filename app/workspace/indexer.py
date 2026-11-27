@@ -106,18 +106,12 @@ class WorkspaceIndexer:
                 "finished_at": None,
             }
             job = self.store.create_index_job(record)
-            if job["state"] in {IndexState.PENDING.value, IndexState.INDEXING.value}:
-                self.store.mark_index_status(
-                    workspace_id,
-                    file_id,
-                    IndexState.PENDING.value,
-                    error=None,
-                    at=self.clock(),
-                )
+            if job["state"] == IndexState.PENDING.value:
+                self._mark_status(job, IndexState.PENDING, at=self.clock())
             return job
 
     def reconcile(self, workspace_id: Optional[str] = None, limit: int = 25) -> int:
-        """Create jobs for files left PENDING/STALE without an active job (queue cap, restart)."""
+        """Create jobs for files awaiting indexing without an active job."""
 
         created = 0
         for record in self.store.files_awaiting_index(workspace_id, limit=limit):
@@ -150,6 +144,15 @@ class WorkspaceIndexer:
     def process_job(self, job: Dict[str, Any]) -> None:
         self._process(job)
 
+    def _mark_status(
+        self, job: Dict[str, Any], state: IndexState, *, at: str, error: Optional[str] = None
+    ) -> bool:
+        return self.store.mark_index_status(
+            job["workspace_id"], job["file_id"], state.value, at=at,
+            error=error, expected_revision=int(job["file_revision"]),
+            active_job_id=job["job_id"] if state is IndexState.INDEXING else None,
+        )
+
     def _fail(
         self,
         job: Dict[str, Any],
@@ -162,12 +165,12 @@ class WorkspaceIndexer:
         max_attempts = int(job.get("max_attempts") or self.settings.index_max_attempts)
         at = self.clock()
         if retryable and attempts < max_attempts:
-            self.store.requeue_job(job["job_id"], at, error_code=code)
-            self.store.mark_index_status(job["workspace_id"], job["file_id"], IndexState.PENDING.value, error=code, at=at)
+            if self.store.requeue_job(job["job_id"], at, error_code=code):
+                self._mark_status(job, IndexState.PENDING, error=code, at=at)
             return
-        self.store.finish_job(job["job_id"], IndexState.FAILED.value, at=at, error_code=code, error_detail=detail)
-        self.store.mark_index_status(job["workspace_id"], job["file_id"], IndexState.FAILED.value, error=code, at=at)
-        self.manager._emit(job["workspace_id"], job["file_id"], "index.status_changed", int(job["file_revision"]), {"state": "FAILED", "code": code})
+        if self.store.finish_job(job["job_id"], IndexState.FAILED.value, at=at, error_code=code, error_detail=detail):
+            if self._mark_status(job, IndexState.FAILED, error=code, at=at):
+                self.manager._emit(job["workspace_id"], job["file_id"], "index.status_changed", int(job["file_revision"]), {"state": "FAILED", "code": code})
 
     def _process(self, job: Dict[str, Any]) -> None:
         workspace_id = job["workspace_id"]
@@ -191,11 +194,13 @@ class WorkspaceIndexer:
             and file_record.get("content_hash")
             and file_record.get("content_hash") == job.get("content_hash", file_record.get("content_hash"))
         ):
-            self.store.finish_job(job["job_id"], IndexState.READY.value, at=at)
-            self.store.mark_index_status(workspace_id, file_id, IndexState.READY.value, error=None, at=at)
+            if self.store.finish_job(job["job_id"], IndexState.READY.value, at=at):
+                self._mark_status(job, IndexState.READY, at=at)
             return
 
-        self.store.mark_index_status(workspace_id, file_id, IndexState.INDEXING.value, error=None, at=at)
+        if not self._mark_status(job, IndexState.INDEXING, at=at):
+            self.store.finish_job(job["job_id"], IndexState.CANCELLED.value, at=at, error_code="stale_revision")
+            return
         self.manager._emit(workspace_id, file_id, "index.status_changed", revision, {"state": "INDEXING"})
 
         try:
@@ -216,11 +221,12 @@ class WorkspaceIndexer:
             if revision_row is not None:
                 expected_hash = revision_row.get("content_hash")
             if expected_hash and actual_hash and expected_hash != actual_hash:
-                self.store.finish_job(job["job_id"], IndexState.CANCELLED.value, at=self.clock(), error_code="stale_revision")
-                self.store.mark_index_status(workspace_id, file_id, IndexState.STALE.value, error="stale_revision", at=self.clock())
+                stale_at = self.clock()
+                if self.store.finish_job(job["job_id"], IndexState.CANCELLED.value, at=stale_at, error_code="stale_revision"):
+                    self._mark_status(job, IndexState.STALE, error="stale_revision", at=stale_at)
                 return
 
-            ingestor = self.ingestor.for_scope(tenant_id, file_record.get("owner_id") or "")
+            ingestor = self.ingestor.for_scope(tenant_id, workspace["owner_id"])
             result = ingestor.extract(file_record["name"], file_record.get("mime_type"), data)
 
             chunk_rows = self._build_chunk_rows(
@@ -231,7 +237,9 @@ class WorkspaceIndexer:
                 parser_version=result.parser_version,
                 chunking_version=result.chunking_version,
             )
-            written = self.store.replace_chunks_if_current(workspace_id, file_id, revision, chunk_rows)
+            written = self.store.replace_chunks_if_current(
+                workspace_id, file_id, revision, chunk_rows, active_job_id=job["job_id"],
+            )
             if not written:
                 self.store.finish_job(job["job_id"], IndexState.CANCELLED.value, at=self.clock(), error_code="stale_revision")
                 return
@@ -241,8 +249,10 @@ class WorkspaceIndexer:
                 embedding_error = self._embed_chunks(workspace_id, file_id, revision, chunk_rows)
 
             finished = self.clock()
-            self.store.finish_job(job["job_id"], IndexState.READY.value, at=finished, error_code=embedding_error)
-            self.store.mark_index_status(workspace_id, file_id, IndexState.READY.value, error=embedding_error, at=finished)
+            if not self.store.finish_job(job["job_id"], IndexState.READY.value, at=finished, error_code=embedding_error):
+                return
+            if not self._mark_status(job, IndexState.READY, error=embedding_error, at=finished):
+                return
             self.manager._emit(
                 workspace_id,
                 file_id,
@@ -430,7 +440,8 @@ class WorkspaceIndexer:
         worker = self._worker
         if worker and worker.is_alive():
             worker.join(timeout=timeout)
-        self._worker = None
+        if worker is not None and not worker.is_alive():
+            self._worker = None
 
     def _loop(self, interval: float) -> None:
         concurrency = max(1, int(self.settings.index_max_concurrency))
@@ -440,7 +451,7 @@ class WorkspaceIndexer:
                 try:
                     futures = [future for future in futures if not future.done()]
                     self.reconcile()
-                    while len(futures) < concurrency:
+                    while not self._stop.is_set() and len(futures) < concurrency:
                         job = self.store.claim_next_job(self.clock())
                         if job is None:
                             break

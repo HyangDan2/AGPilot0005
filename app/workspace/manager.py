@@ -399,9 +399,11 @@ class WorkspaceManager:
             is WorkspaceStorageProvider.LOCAL_BROWSER
         )
 
-    def _require_open(self, record: Dict[str, Any]) -> None:
+    def _require_open(self, record: Dict[str, Any], *, for_write: bool = False) -> None:
         if record.get("lifecycle_state") == WorkspaceLifecycleState.CLOSED.value:
             raise WorkspaceFailure(WorkspaceErrorCode.WORKSPACE_CLOSED, workspace_id=record.get("workspace_id"))
+        if self._is_folder_backed(record):
+            self._root_path(record, for_write=for_write)
 
     def ensure_open(self, workspace_id: str, scope: ScopeView) -> WorkspaceIdentity:
         """Access check plus lifecycle gate, for read surfaces outside the file API."""
@@ -411,15 +413,24 @@ class WorkspaceManager:
         return self.workspace_identity(record)
 
     def _require_writable(self, record: Dict[str, Any]) -> None:
-        self._require_open(record)
+        self._require_open(record, for_write=True)
         if int(record.get("read_only") or 0):
             raise WorkspaceFailure(WorkspaceErrorCode.READ_ONLY_WORKSPACE, workspace_id=record.get("workspace_id"))
 
-    def _root_path(self, record: Dict[str, Any]) -> Path:
+    def _root_path(self, record: Dict[str, Any], *, for_write: bool = False) -> Path:
         root_path = record.get("root_path") or ""
         if not root_path:
             raise WorkspaceFailure(WorkspaceErrorCode.ROOT_UNAVAILABLE, workspace_id=record.get("workspace_id"))
-        return Path(root_path)
+        try:
+            return self.allowed_root_policy.resolve(
+                record["tenant_id"],
+                record["owner_id"],
+                root_path,
+                root_id=record.get("root_id"),
+                for_write=for_write,
+            ).path
+        except RootPolicyError as exc:
+            raise self._root_failure(exc) from exc
 
     # -- open / new / local browser ------------------------------------------------
     def open_folder(
@@ -506,11 +517,20 @@ class WorkspaceManager:
             roots = policy.visible_roots(tenant, owner)
             if not roots:
                 raise WorkspaceFailure(WorkspaceErrorCode.PATH_OUTSIDE_ALLOWED_ROOT, "no allowed root configured")
-            default = next((item for item in roots if item.root.is_default), roots[0])
-            if not default.writable:
-                raise WorkspaceFailure(WorkspaceErrorCode.READ_ONLY_WORKSPACE, "default root is read-only")
-            base = default.path
-            resolved = default
+            if root_id is None:
+                selected_root = next((item for item in roots if item.root.is_default), roots[0])
+            else:
+                selected_root = next((item for item in roots if item.root.root_id == root_id), None)
+                if selected_root is None:
+                    raise WorkspaceFailure(WorkspaceErrorCode.PATH_OUTSIDE_ALLOWED_ROOT, "unknown allowed root")
+            try:
+                resolved = policy.resolve(
+                    tenant, owner, str(selected_root.path),
+                    root_id=selected_root.root.root_id, must_exist=False, for_write=True,
+                )
+            except RootPolicyError as exc:
+                raise self._root_failure(exc) from exc
+            base = resolved.path
         try:
             policy.assert_inside(base, clean_name)
         except RootPolicyError as exc:
@@ -879,7 +899,7 @@ class WorkspaceManager:
     def _delete_source_tree(self, record: Dict[str, Any]) -> int:
         """Delete only the files this workspace tracks, then empty folders (never a blind rmtree)."""
 
-        root = Path(record.get("root_path") or "")
+        root = self._root_path(record, for_write=True)
         removed = 0
         rows = sorted(
             self.store.list_files(record["workspace_id"], recursive=True, include_deleted=False),
@@ -911,10 +931,12 @@ class WorkspaceManager:
             raise WorkspaceFailure(WorkspaceErrorCode.PROVIDER_MISMATCH, workspace_id=workspace_id)
         try:
             result = self.sync_service.sync(record, full=full)
-        except folderfs.FolderError as exc:
+        except (WorkspaceFailure, folderfs.FolderError) as exc:
             self.store.upsert_watch_state(
                 workspace_id, {"last_scan_at": self.clock(), "last_error": str(exc)[:300], "updated_at": self.clock()}
             )
+            if isinstance(exc, WorkspaceFailure):
+                raise
             raise self._folder_failure(exc) from exc
         self._record_sync(workspace_id, result, error=("; ".join(item.get("code", "") for item in result.errors[:3]) or None))
         return result
@@ -1878,8 +1900,8 @@ class WorkspaceManager:
     def recover(self) -> Dict[str, int]:
         """Restart recovery: requeue interrupted jobs, sweep temp files, drop orphan blobs.
 
-        Folder-backed workspaces are re-validated: a root that vanished while the server was down
-        closes its workspace instead of leaving a watcher pointed at nothing.
+        Folder-backed workspaces are re-validated before workers can read them. A missing
+        or out-of-scope root closes its workspace without removing files or index metadata.
         """
 
         requeued = self.store.stale_indexing_jobs(self.clock())
@@ -1890,18 +1912,22 @@ class WorkspaceManager:
                 continue
             if not self._is_folder_backed(workspace):
                 continue
-            root = Path(workspace.get("root_path") or "")
-            if root.exists() and root.is_dir():
+            try:
+                self._root_path(workspace)
                 continue
+            except WorkspaceFailure as exc:
+                reason = exc.error.code.value
             stamp = self.clock()
+            for file_row in self.store.list_files(workspace["workspace_id"], recursive=True):
+                self.store.cancel_jobs_for_file(file_row["file_id"], stamp, reason=reason)
             self.store.update_workspace(
                 workspace["workspace_id"],
                 {"lifecycle_state": WorkspaceLifecycleState.CLOSED.value, "closed_at": stamp, "updated_at": stamp},
             )
             self.store.upsert_watch_state(
-                workspace["workspace_id"], {"watching": 0, "last_error": "root_unavailable", "updated_at": stamp}
+                workspace["workspace_id"], {"watching": 0, "last_error": reason, "updated_at": stamp}
             )
-            self._emit(workspace["workspace_id"], None, "workspace.closed", 0, {"reason": "root_unavailable"})
+            self._emit(workspace["workspace_id"], None, "workspace.closed", 0, {"reason": reason})
             closed += 1
         known: List[Path] = []
         for workspace in self.store.list_all_workspaces():

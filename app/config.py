@@ -70,6 +70,7 @@ class Settings(BaseModel):
     SQLITE_BUSY_TIMEOUT_MS: int = int(os.environ.get("AGCORE_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 
     # Persistent, bounded full-document analysis (separate from general Agent limits).
+    DURABLE_ANALYSIS_SERVICES: str = os.environ.get("AGCORE_DURABLE_ANALYSIS_SERVICES", "")
     ANALYSIS_DIR: str = os.environ.get("AGCORE_ANALYSIS_DIR", "/var/lib/hd2lab-agcore/analysis")
     ANALYSIS_MAX_CHUNKS: int = int(os.environ.get("AGCORE_ANALYSIS_MAX_CHUNKS", "1000"))
     ANALYSIS_MAX_MODEL_CALLS: int = int(os.environ.get("AGCORE_ANALYSIS_MAX_MODEL_CALLS", "500"))
@@ -106,6 +107,11 @@ def _parse_allowed_services(env_name: str, fallback_raw: str) -> Optional[Set[st
         raw = fallback_raw
     tokens = {item.strip() for item in (raw or "").split(",") if item.strip()}
     return tokens or None
+
+
+def is_durable_analysis_enabled_for_service(service_id: str) -> bool:
+    allowed = _parse_allowed_services("AGCORE_DURABLE_ANALYSIS_SERVICES", settings.DURABLE_ANALYSIS_SERVICES)
+    return bool(allowed and (service_id in allowed or "*" in allowed))
 
 
 def is_workspace_enabled() -> bool:

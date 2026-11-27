@@ -404,9 +404,10 @@ class WorkspaceStore:
             return [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT * FROM workspace WHERE status != 'deleted' AND lifecycle_state='open' "
-                    "AND root_path IS NOT NULL AND root_path != '' AND read_only = 0 "
-                    "ORDER BY updated_at ASC LIMIT ?",
+                    "SELECT w.* FROM workspace w LEFT JOIN workspace_watch_state s "
+                    "ON s.workspace_id=w.workspace_id WHERE w.status != 'deleted' AND w.lifecycle_state='open' "
+                    "AND w.root_path IS NOT NULL AND w.root_path != '' AND w.read_only = 0 "
+                    "ORDER BY s.last_scan_at ASC, w.workspace_id ASC LIMIT ?",
                     (max(1, int(limit)),),
                 ).fetchall()
             ]
@@ -619,11 +620,19 @@ class WorkspaceStore:
         *,
         error: Optional[str] = None,
         at: Optional[str] = None,
-    ) -> None:
-        fields: Dict[str, Any] = {"index_status": status, "index_error": error}
-        if at:
-            fields["index_updated_at"] = at
-        self.update_file(workspace_id, file_id, fields)
+        expected_revision: Optional[int] = None,
+        active_job_id: Optional[str] = None,
+    ) -> bool:
+        with self.write() as conn:
+            cursor = conn.execute(
+                "UPDATE workspace_file SET index_status=?, index_error=?, "
+                "index_updated_at=COALESCE(?, index_updated_at) WHERE workspace_id=? AND file_id=? "
+                "AND deleted_at IS NULL AND (? IS NULL OR revision=?) "
+                "AND (? IS NULL OR EXISTS (SELECT 1 FROM workspace_index_job WHERE job_id=? AND state='INDEXING'))",
+                (status, error, at, workspace_id, file_id, expected_revision, expected_revision,
+                 active_job_id, active_job_id),
+            )
+            return cursor.rowcount > 0
 
     # -- revisions ----------------------------------------------------------------
     def add_revision(self, record: Dict[str, Any]) -> None:
@@ -810,7 +819,9 @@ class WorkspaceStore:
 
         with self.write() as conn:
             row = conn.execute(
-                "SELECT * FROM workspace_index_job WHERE state='PENDING' ORDER BY created_at ASC, job_id ASC LIMIT 1"
+                "SELECT j.* FROM workspace_index_job j JOIN workspace w ON w.workspace_id=j.workspace_id "
+                "WHERE j.state='PENDING' AND w.lifecycle_state='open' AND w.status != 'deleted' "
+                "ORDER BY j.created_at ASC, j.job_id ASC LIMIT 1"
             ).fetchone()
             if row is None:
                 return None
@@ -828,20 +839,23 @@ class WorkspaceStore:
         at: str,
         error_code: Optional[str] = None,
         error_detail: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         with self.write() as conn:
-            conn.execute(
-                "UPDATE workspace_index_job SET state=?, finished_at=?, error_code=?, error_detail=? WHERE job_id=?",
+            cursor = conn.execute(
+                "UPDATE workspace_index_job SET state=?, finished_at=?, error_code=?, error_detail=? "
+                "WHERE job_id=? AND state='INDEXING'",
                 (state, at, error_code, error_detail, job_id),
             )
+            return cursor.rowcount > 0
 
-    def requeue_job(self, job_id: str, at: str, error_code: Optional[str] = None) -> None:
+    def requeue_job(self, job_id: str, at: str, error_code: Optional[str] = None) -> bool:
         with self.write() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE workspace_index_job SET state='PENDING', started_at=NULL, finished_at=NULL, "
-                "error_code=?, error_detail=NULL WHERE job_id=?",
+                "error_code=?, error_detail=NULL WHERE job_id=? AND state='INDEXING'",
                 (error_code, job_id),
             )
+            return cursor.rowcount > 0
 
     def cancel_jobs_for_file(self, file_id: str, at: str, reason: str = "file_changed") -> int:
         with self.write() as conn:
@@ -872,8 +886,9 @@ class WorkspaceStore:
 
     def files_awaiting_index(self, workspace_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
         sql = (
-            "SELECT f.* FROM workspace_file f WHERE f.kind='file' AND f.deleted_at IS NULL "
-            "AND f.index_status IN ('PENDING','STALE') "
+            "SELECT f.* FROM workspace_file f JOIN workspace w ON w.workspace_id=f.workspace_id "
+            "WHERE f.kind='file' AND f.deleted_at IS NULL AND w.lifecycle_state='open' AND w.status != 'deleted' "
+            "AND f.index_status IN ('PENDING','STALE','INDEXING') "
             "AND NOT EXISTS (SELECT 1 FROM workspace_index_job j WHERE j.file_id=f.file_id AND j.state IN ('PENDING','INDEXING'))"
         )
         params: List[Any] = []
@@ -945,6 +960,8 @@ class WorkspaceStore:
         file_id: str,
         revision: int,
         chunks: Sequence[Dict[str, Any]],
+        *,
+        active_job_id: Optional[str] = None,
     ) -> bool:
         """Atomically replace a file's chunks only if `revision` is still the current one.
 
@@ -954,8 +971,9 @@ class WorkspaceStore:
 
         with self.write() as conn:
             row = conn.execute(
-                "SELECT revision, deleted_at FROM workspace_file WHERE workspace_id=? AND file_id=?",
-                (workspace_id, file_id),
+                "SELECT revision, deleted_at FROM workspace_file WHERE workspace_id=? AND file_id=? "
+                "AND (? IS NULL OR EXISTS (SELECT 1 FROM workspace_index_job WHERE job_id=? AND state='INDEXING'))",
+                (workspace_id, file_id, active_job_id, active_job_id),
             ).fetchone()
             if row is None or row["deleted_at"] is not None or int(row["revision"]) != int(revision):
                 return False

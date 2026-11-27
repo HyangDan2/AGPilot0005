@@ -72,7 +72,7 @@ Full request/response payloads are in [docs/API_CONTRACT.md](docs/API_CONTRACT.m
 
 ### Document tasks
 
-Requests from `hd2ai-admin`, `hd2ai-beta` or `hd2ai-public` that carry `context_refs` or `analysis_refs` create a persistent Task and answer with `run.deferred` plus a job id; the `/agent/analyses/*` endpoints then read, resume or cancel it. With `Accept: text/event-stream`, the status endpoint emits `analysis.snapshot` events. Each event replaces the previous snapshot, including its answer. The stream ends on a terminal state. Clients can recover using the same job ID via the JSON status endpoint. The task runtime lives in `app/runtime/tasks/` (typed task/plan/budget/evidence state, planner, writer, verifier, answer composition and presentation). A final answer that fails verification stays `partial` or `needs_input` rather than publishing unverified or concatenated group text.
+Configure `AGCORE_DURABLE_ANALYSIS_SERVICES` with the verified service IDs allowed to create durable Tasks through the agent endpoint. For those services, `execution_mode: "document_analysis"` or a legacy request carrying document references without a workspace returns `run.deferred` and a job ID. An active `workspace_id` routes to the Workspace run, even when the request includes earlier document references. The `/agent/analyses/*` endpoints read, resume, or cancel a durable job. With `Accept: text/event-stream`, the status endpoint emits `analysis.snapshot` events, each replacing the previous snapshot. The stream ends on a terminal state and clients can recover using the same job ID via the JSON status endpoint. The task runtime lives in `app/runtime/tasks/`.
 
 ---
 
@@ -123,6 +123,7 @@ The suite (`tests/`, 16 modules, `pytest-asyncio` auto mode) covers the API surf
 | `AGCORE_ENV`, `AGCORE_ALLOW_MOCK_FALLBACK` | `development`, `true` | Environment and mock-provider policy |
 | `AGCORE_AGTOOLS_URL`, `AGCORE_AGTOOLS_TENANT`, `AGCORE_AGTOOLS_TOKEN` | AGPilot0006 URL, `default_tenant`, — | Document Intelligence connection |
 | `AGCORE_ANALYSIS_DIR`, `AGCORE_ANALYSIS_MAX_CHUNKS`, `AGCORE_ANALYSIS_MAX_MODEL_CALLS`, `AGCORE_ANALYSIS_MAX_SECONDS` | `/var/lib/hd2lab-agcore/analysis`, `1000`, `500`, `7200` | Persistent analysis storage and budget |
+| `AGCORE_DURABLE_ANALYSIS_SERVICES` | Empty | Comma-separated service IDs for durable Tasks, or `*` to enable them for all authenticated services |
 | `AGCORE_TASK_MAX_DOCUMENT_CALLS`, `AGCORE_TASK_MAX_REPLANS`, `AGCORE_TASK_MAX_ANSWER_REPAIRS` | `5000`, `2`, `2` | Task budget and repair limits |
 
 In production the gateway token is injected either as `AGCORE_GATEWAY_TOKEN` or through systemd `LoadCredential=agcore_gateway_token:…` (read from `CREDENTIALS_DIRECTORY/agcore_gateway_token`). The gateway Unix socket is owned by the `www-data` group, so the unit needs `SupplementaryGroups=www-data`, and `AGCORE_ALLOW_MOCK_FALLBACK=false` should be set in production.

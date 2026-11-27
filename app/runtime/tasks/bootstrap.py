@@ -1,5 +1,6 @@
 """Composition root. Existing HTTP/Gateway/filesystem adapters are reused."""
 import time
+from app.config import is_durable_analysis_enabled_for_service
 from .ports import JsonTaskRepository
 from .orchestrator import TaskOrchestrator
 from .services import ModelInvoker, RequestPlanner, AnswerWriter, AnswerVerifier, ApiEvidenceSelector
@@ -35,7 +36,7 @@ class AnalysisServices:
         tenant_id=None,
     ):
         scoped_owner = self._effective_owner(owner, tenant_id)
-        if service not in ('hd2ai-admin', 'hd2ai-beta', 'hd2ai-public'):
+        if not is_durable_analysis_enabled_for_service(service):
             return await self.legacy.create(scoped_owner, service, message, refs, reasoning_effort=reasoning_effort)
         refs = list(dict.fromkeys(refs))
         modern = []

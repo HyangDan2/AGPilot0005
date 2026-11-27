@@ -1,4 +1,5 @@
 """AGCore Platform FastAPI Application Entrypoint."""
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -18,9 +19,10 @@ from app.api.canvas import router as canvas_router
 from app.workspace.api import router as workspace_router
 from app.tools.policy import tool_policy
 from app.tools.registry import registry
-from app.config import settings
+from app.config import is_workspace_enabled, settings
 from app.core.runtime_config import sync_contracts_from_gateway
 from app.gateway.client import gateway_client
+from app.workspace.runtime import get_runtime as get_workspace_runtime
 
 BASE_PATH = Path(__file__).resolve().parent.parent
 
@@ -31,9 +33,15 @@ async def lifespan(_app: FastAPI):
     validate_boot_configuration()
     await sync_contracts_from_gateway(gateway_client, [gateway_client.route, "hd2ai-admin", "hd2ai-public"])
     await tool_policy.sync_all(registry)
+    workspace = None
     try:
+        if is_workspace_enabled():
+            workspace = await asyncio.to_thread(get_workspace_runtime)
+            workspace.start_workers()
         yield
     finally:
+        if workspace is not None:
+            await asyncio.to_thread(workspace.shutdown)
         from app.tracing.store import shutdown_default_trajectory_logger
         shutdown_default_trajectory_logger(timeout_seconds=5.0)
 

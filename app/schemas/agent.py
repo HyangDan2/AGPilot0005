@@ -20,6 +20,7 @@ class AgentRunRequest(BaseModel):
     history: List[Dict[str, str]] = Field(default_factory=list, max_length=16)
     analysis_refs: List[str] = Field(default_factory=list, max_length=10)
     workspace_id: Optional[str] = None
+    execution_mode: Optional[Literal["chat", "workspace", "document_analysis"]] = None
     approvals: List[str] = Field(default_factory=list, max_length=32)
 
     @field_validator("approvals")

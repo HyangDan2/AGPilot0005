@@ -733,7 +733,7 @@ class WorkspaceToolAdapter:
     def _workspace_retrieve(self, arguments: Dict[str, Any], context: ToolInvocationContext) -> Dict[str, Any]:
         workspace_id = self._require(arguments, "workspace_id")
         query = self._require(arguments, "query")
-        self.manager.get_workspace(workspace_id, context.scope)
+        self.manager.ensure_open(workspace_id, context.scope)
         mode = SearchMode(arguments.get("mode") or SearchMode.HYBRID.value)
         requested = arguments.get("token_budget")
         budget = int(requested) if requested else None
@@ -975,7 +975,7 @@ class WorkspaceToolAdapter:
     def _workspace_search(self, arguments: Dict[str, Any], context: ToolInvocationContext) -> Dict[str, Any]:
         workspace_id = self._require(arguments, "workspace_id")
         query = self._require(arguments, "query")
-        self.manager.get_workspace(workspace_id, context.scope)
+        self.manager.ensure_open(workspace_id, context.scope)
         mode = SearchMode(arguments.get("mode") or SearchMode.HYBRID.value)
         response = self.retriever.search(
             workspace_id,
@@ -989,7 +989,7 @@ class WorkspaceToolAdapter:
     def _workspace_get_context(self, arguments: Dict[str, Any], context: ToolInvocationContext) -> Dict[str, Any]:
         workspace_id = self._require(arguments, "workspace_id")
         query = self._require(arguments, "query")
-        self.manager.get_workspace(workspace_id, context.scope)
+        self.manager.ensure_open(workspace_id, context.scope)
         requested = arguments.get("token_budget")
         budget = int(requested) if requested else None
         if context.context_budget:

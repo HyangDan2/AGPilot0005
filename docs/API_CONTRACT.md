@@ -88,6 +88,16 @@ AGCore는 운영 환경(라즈베리파이 Nginx SSO 프록시)과 로컬 독립
 }
 ```
 
+`execution_mode`은 선택 필드입니다. 요청에 지정할 수 있는 값은 다음과 같습니다.
+
+| 값 | 동작 |
+| --- | --- |
+| `chat` | 일반 Agent 실행. `workspace_id`와 함께 전송하면 `422 workspace_execution_mode_required`. |
+| `workspace` | 활성 Workspace 범위로 Agent 실행. `workspace_id` 누락 시 `422 workspace_id_required`. 기존 문서·분석 참조는 실행 컨텍스트에서 제외합니다. |
+| `document_analysis` | `context_refs` 또는 `analysis_refs`가 있어야 하며 `workspace_id`는 생략합니다. 저장형 분석 생성 후 기존 `run.deferred` 계약을 사용합니다. 참조가 없으면 `422 document_references_required`, 서비스 설정에 허용되지 않으면 `403 document_analysis_disabled_for_service`. |
+
+모드를 생략하면 `workspace_id`가 있는 요청은 Workspace 실행으로 처리합니다. 그 밖의 기존 요청은 `AGCORE_DURABLE_ANALYSIS_SERVICES`에 포함된 서비스의 문서·분석 참조에 대해 저장형 분석을 사용합니다. 배포 설정에 기존 서비스 ID를 명시하면 이전 클라이언트의 자동 분석 동작을 유지할 수 있습니다.
+
 #### Response (비스트림 모드: `stream: false`, Status: `202 Accepted`)
 ```json
 {

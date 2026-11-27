@@ -69,14 +69,18 @@ class WorkspaceRuntime:
         )
         manager.recover()
         if start_worker:
-            indexer.start()
-            watcher.start()
+            runtime.start_workers()
         return runtime
 
+    def start_workers(self) -> None:
+        self.indexer.start()
+        if self.watcher is not None:
+            self.watcher.start()
+
     def shutdown(self) -> None:
-        self.indexer.stop()
         if self.watcher is not None:
             self.watcher.stop()
+        self.indexer.stop()
 
 
 _RUNTIME: Optional[WorkspaceRuntime] = None

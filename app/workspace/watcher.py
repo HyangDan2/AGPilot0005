@@ -72,7 +72,8 @@ class WorkspaceWatcher:
         thread = self._thread
         if thread and thread.is_alive():
             thread.join(timeout=timeout)
-        self._thread = None
+        if thread is not None and not thread.is_alive():
+            self._thread = None
 
     @property
     def running(self) -> bool:

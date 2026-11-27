@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Literal, Optional
+from app.config import is_durable_analysis_enabled_for_service
 from app.core.auth import (
     current_execution_scope,
     require_authenticated_caller,
@@ -43,7 +44,25 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
     owner = scope.owner_id
     if any(m.get('role') not in ('user', 'assistant') or set(m) - {'role', 'content'} for m in req.history) or len(json.dumps(req.history, ensure_ascii=False).encode()) > 24000:
         raise HTTPException(422, 'invalid_task_history')
-    if service_id in ('hd2ai-admin', 'hd2ai-beta', 'hd2ai-public') and (req.context_refs or req.analysis_refs):
+
+    mode = req.execution_mode
+    workspace_active = bool((req.workspace_id or "").strip())
+    has_document_refs = bool(req.context_refs or req.analysis_refs)
+    analysis_enabled = is_durable_analysis_enabled_for_service(service_id)
+    if mode == "workspace" and not workspace_active:
+        raise HTTPException(422, "workspace_id_required")
+    if workspace_active and mode not in (None, "workspace"):
+        raise HTTPException(422, "workspace_execution_mode_required")
+    if mode == "document_analysis":
+        if not has_document_refs:
+            raise HTTPException(422, "document_references_required")
+        if not analysis_enabled:
+            raise HTTPException(403, "document_analysis_disabled_for_service")
+
+    use_analysis = mode == "document_analysis" or (
+        mode is None and not workspace_active and analysis_enabled and has_document_refs
+    )
+    if use_analysis:
         tok = current_execution_scope.set(scope)
         try:
             job = await services(request.app).create(
@@ -68,6 +87,10 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
                 yield 'event: run.deferred\ndata: ' + json.dumps({'run_id': run_id, 'job_id': job['job_id'], 'status': job['status']}) + '\n\n'
             return StreamingResponse(deferred(), media_type='text/event-stream', headers={'Cache-Control':'no-store','X-Accel-Buffering':'no'})
         return JSONResponse({'run_id': run_id, **job}, status_code=202)
+    if workspace_active:
+        # A workspace can remain active while unrelated session attachments are present.
+        # Keep only the selected context so stale attachments cannot redirect or block it.
+        req = req.model_copy(update={"context_refs": [], "analysis_refs": []})
     try:
         session = await runner.create_run(req, service_id=service_id, owner_id=owner, caller_scope=scope)
     except DocumentReferenceError as exc:

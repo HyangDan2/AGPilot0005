@@ -139,11 +139,12 @@ async def test_cancel_and_resume_persist_budget(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_admin_api_deferred_history_and_owner_isolation(tmp_path):
+async def test_admin_api_deferred_history_and_owner_isolation(tmp_path, monkeypatch):
     import httpx
     from app.main import app
     from app.runtime.tasks.bootstrap import AnalysisServices
     from app.runtime.document_analysis import analysis_manager
+    monkeypatch.setenv("AGCORE_DURABLE_ANALYSIS_SERVICES", "hd2ai-admin")
     repo,model,docs,o=setup(tmp_path)
     previous=getattr(app.state,'analysis_services',None)
     app.state.analysis_services=AnalysisServices(analysis_manager,o,repo.store)
@@ -235,11 +236,12 @@ async def test_planner_repairs_invalid_schema_and_keeps_error_checkpoint(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_durable_run_handle_cancel_during_handoff(tmp_path):
+async def test_durable_run_handle_cancel_during_handoff(tmp_path, monkeypatch):
     import httpx
     from app.main import app
     from app.runtime.tasks.bootstrap import AnalysisServices
     from app.runtime.document_analysis import analysis_manager
+    monkeypatch.setenv("AGCORE_DURABLE_ANALYSIS_SERVICES", "hd2ai-admin")
     class Hold(Model):
         async def complete(self,**kwargs):
             await asyncio.sleep(10)
@@ -303,11 +305,12 @@ def test_api_completion_preserves_case_sensitive_source_symbols(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_beta_and_public_services_route_to_orchestrator_with_public_instruction_fallback(tmp_path):
+async def test_beta_and_public_services_route_to_orchestrator_with_public_instruction_fallback(tmp_path, monkeypatch):
     import httpx
     from app.main import app
     from app.runtime.tasks.bootstrap import AnalysisServices
     from app.runtime.document_analysis import analysis_manager
+    monkeypatch.setenv("AGCORE_DURABLE_ANALYSIS_SERVICES", "hd2ai-beta,hd2ai-public")
     repo,model,docs,o=setup(tmp_path)
     previous=getattr(app.state,'analysis_services',None)
     app.state.analysis_services=AnalysisServices(analysis_manager,o,repo.store)

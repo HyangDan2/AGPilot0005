@@ -484,8 +484,18 @@ AGCORE_WORKSPACE_ALLOWED_ROOTS="lab:/srv/hd2lab/workspaces:owner,shared:/srv/hd2
 ```
 
 Format: `root_id:absolute_path:scope` (`owner` \| `tenant` \| `global`); a fourth `:ro` suffix makes
-the root read-only. `GET /workspaces/allowed-roots` lists roots visible to the caller. Validation
-performed on every open and on reopen:
+the root read-only. An owner-scoped base adds `/{tenant}/{owner}`, a tenant-scoped base adds
+`/{tenant}`, and a global root uses its configured path. The configuration may name these
+scope segments explicitly. IDs consisting of lowercase ASCII letters, digits, hyphens or
+underscores up to 64 characters use their original values. Other IDs use `~` followed by the
+full lowercase SHA-256 hash of their UTF-8 bytes.
+
+`GET /workspaces/allowed-roots` lists the expanded paths for the caller. Each downstream
+deployment configures its own folder bases, Workspace database and blob storage. Validate
+existing bindings against the expanded paths before enabling the updated runtime. Copy or
+move only files with verified ownership, keeping the existing Workspace and file IDs.
+
+Validation applies to opening, reopening, active operations, and worker startup:
 
 1. the path is absolute and normalizes inside a declared root (`path_outside_allowed_root`)
 2. no `..` / control characters, and no symlink component inside the root (`symlink_escape`)
