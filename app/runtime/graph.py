@@ -5,11 +5,110 @@ from app.gateway.client import AIGatewayClient, gateway_client, gateway_for_serv
 from app.runtime.context import context_manager, is_context_overflow_error
 from app.runtime.state import AgentState
 from app.runtime.public_grounding import public_outline_calls, public_section_calls, public_chunk_calls, public_grounded_messages
-from app.schemas.gateway import GatewayMessage
+from app.schemas.gateway import GatewayMessage, ToolCall, ToolDefinition
 from app.tools.dispatcher import dispatcher
 from app.tools.registry import registry
 from app.adapters.document import document_owner_id, tool_token_budget
 from app.core.auth import current_run_workspace_binding
+from app.core.session_attachments import is_session_attachment
+from app.config import settings
+from app.knowledge.references import EvidenceTracker, SynthesisBudget, enrichment_query, plan_enrichment, is_workspace_reference_id
+
+
+def attachment_refs(state: AgentState) -> list[str]:
+    """Only the conversation-scoped attachment ids (``att-...``)."""
+
+    return [ref for ref in (state.context_refs or []) if is_session_attachment(ref)]
+
+
+def document_tool_refs(state: AgentState) -> list[str]:
+    """Ids that ``document.*`` tools may use: attachments and legacy AGTools document ids.
+
+    A Workspace file id is a different namespace — its bytes are read with ``workspace_*`` tools,
+    so it never becomes a ``document.*`` argument.
+    """
+
+    return [ref for ref in (state.context_refs or []) if not is_workspace_reference_id(ref)]
+
+
+def _attachment_tool_definitions(
+    tools: list[ToolDefinition], refs: list[str]
+) -> tuple[list[ToolDefinition], dict[str, frozenset[str]]]:
+    """Use the run's authorized attachment references in model-facing schemas."""
+
+    definitions = []
+    allowed_arguments: dict[str, frozenset[str]] = {}
+    for tool in tools:
+        function = tool.function
+        properties = function.parameters.get("properties", {})
+        if not function.name.startswith("document.") or "doc_id" not in properties:
+            definitions.append(tool)
+            continue
+        allowed_arguments[function.name] = frozenset(properties)
+        properties = dict(properties)
+        parameters = {**function.parameters, "properties": properties, "additionalProperties": False}
+        if len(refs) == 1:
+            properties.pop("doc_id")
+            parameters["required"] = [key for key in parameters.get("required", []) if key != "doc_id"]
+        else:
+            properties["doc_id"] = {**properties["doc_id"], "enum": refs}
+        definitions.append(tool.model_copy(update={"function": function.model_copy(update={"parameters": parameters})}))
+    return definitions, allowed_arguments
+
+
+def _bind_attachment_arguments(
+    call: ToolCall, allowed_arguments: frozenset[str], attachment_id: Optional[str]
+) -> ToolCall:
+    """Normalize registered arguments and keep explicit IDs for scope validation."""
+
+    raw = call.function.arguments
+    try:
+        arguments = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return call
+    if not isinstance(arguments, dict):
+        return call
+    arguments = {key: value for key, value in arguments.items() if key in allowed_arguments}
+    if attachment_id is not None and "doc_id" not in arguments:
+        arguments["doc_id"] = attachment_id
+    function = call.function.model_copy(update={"arguments": json.dumps(arguments, ensure_ascii=False)})
+    return call.model_copy(update={"function": function})
+
+
+def _request_text(state: AgentState) -> str:
+    if state.request_message:
+        return state.request_message
+    for message in reversed(state.messages):
+        if message.role == "user" and (message.content or "").strip():
+            return message.content or ""
+    return ""
+
+
+def _enrichment_tool_calls(state: AgentState) -> tuple[list[ToolCall], list[str]]:
+    """Bounded reads for the requested references that still have no evidence."""
+
+    if state.evidence is None or not state.evidence.incomplete:
+        return [], []
+    remaining_attempts = max(0, int(settings.EVIDENCE_ENRICHMENT_LIMIT) - int(state.enrichment_attempts or 0))
+    if remaining_attempts <= 0:
+        return [], []
+    attempted = set(state.enrichment_attempted_keys or [])
+    tracker = EvidenceTracker.from_coverage(state.evidence)
+    candidates = [ref for ref in tracker.missing_references() if ref.document_key not in attempted]
+    if not candidates:
+        return [], []
+    plan = plan_enrichment(candidates[:remaining_attempts], query=enrichment_query(_request_text(state)))
+    calls: list[ToolCall] = []
+    keys: list[str] = []
+    for index, item in enumerate(plan):
+        calls.append(
+            ToolCall(
+                id=f"enrich-{state.step_count}-{index}",
+                function={"name": item.tool_name, "arguments": json.dumps(item.arguments, ensure_ascii=False)},
+            )
+        )
+        keys.append(item.reference_key)
+    return calls, keys
 
 async def model_node(
     state: AgentState,
@@ -74,9 +173,28 @@ async def model_node(
     
     # 2. Get tool definitions for this service
     tools = registry.get_definitions(service=state.service_id, binding=state.workspace_binding)
-    first_document_step = bool(state.context_refs) and state.tool_call_count == 0
+    attachment_ids = attachment_refs(state)
+    first_document_step = bool(document_tool_refs(state)) and state.tool_call_count == 0
     if first_document_step:
         tools = [tool for tool in tools if tool.function.name == "document.get_outline"]
+    attachment_arguments: dict[str, frozenset[str]] = {}
+    if state.workspace_binding is not None and attachment_ids:
+        tools, attachment_arguments = _attachment_tool_definitions(tools, attachment_ids)
+
+    # WO-R21-ADD-01: a draft answer produced before the requested references were read is not
+    # streamed — bounded enrichment reads the missing references and the grounded answer follows.
+    pending_enrichment = False
+    if (
+        not disable_tools
+        and not public_grounding
+        and state.references is not None
+        and state.references.has_requested
+        and state.evidence is not None
+        and state.evidence.incomplete
+        and int(state.enrichment_attempts or 0) < int(settings.EVIDENCE_ENRICHMENT_LIMIT)
+    ):
+        pending_enrichment = True
+
     
     # 3. Call Client (with 1-shot reactive compaction recovery on context overflow)
     model_label = None
@@ -155,7 +273,7 @@ async def model_node(
             pruned_msgs,
             tools_arg=call_tools,
             choice_arg=call_choice,
-            delta_cb=_guarded_on_delta if on_delta is not None else None,
+            delta_cb=(_guarded_on_delta if on_delta is not None else None) if not pending_enrichment else None,
         )
     except Exception as exc:
         if not is_context_overflow_error(exc):
@@ -187,6 +305,13 @@ async def model_node(
         )
     if public_grounding and not content and not tool_calls:
         raise RuntimeError("Public document answer was empty")
+
+    enrichment_keys: list[str] = []
+    if allow_tools and not tool_calls and state.references is not None and state.references.has_requested:
+        enrichment_calls, enrichment_keys = _enrichment_tool_calls(state)
+        if enrichment_calls:
+            tool_calls = enrichment_calls
+            content = None
     
     new_messages = list(state.messages)
     assistant_msg = GatewayMessage(
@@ -202,6 +327,9 @@ async def model_node(
         "pending_tool_calls": tool_calls or [],
         "usage": accumulated_usage,
     }
+    if enrichment_keys:
+        updates["enrichment_attempts"] = int(state.enrichment_attempts or 0) + 1
+        updates["enrichment_attempted_keys"] = list(dict.fromkeys(list(state.enrichment_attempted_keys or []) + enrichment_keys))
     
     if tool_calls:
         updates["status"] = "running"
@@ -209,7 +337,18 @@ async def model_node(
         updates["status"] = "completed"
         updates["final_answer"] = content or ""
         updates["model_label"] = model_label
-        
+
+    if allow_tools and tool_calls and attachment_arguments:
+        attachment_id = attachment_ids[0] if len(attachment_ids) == 1 else None
+        tool_calls = [
+            _bind_attachment_arguments(call, attachment_arguments[call.function.name], attachment_id)
+            if call.function.name in attachment_arguments else call
+            for call in tool_calls
+        ]
+        updates["pending_tool_calls"] = tool_calls
+        if new_messages and new_messages[-1].role == "assistant" and new_messages[-1].tool_calls:
+            new_messages[-1].tool_calls = tool_calls
+
     return updates
 
 async def tool_node(
@@ -228,13 +367,16 @@ async def tool_node(
     new_traces = list(state.traces)
     new_messages = list(state.messages)
     citations = list(state.citations)
-    if validated_calls is None and state.context_refs and state.tool_call_count == 0:
+    attachment_ids = attachment_refs(state)
+    document_ids = document_tool_refs(state)
+    if validated_calls is None and document_ids and state.tool_call_count == 0:
         for index, call in enumerate(calls):
             if call.function.name == "document.get_outline":
-                call.function.arguments = json.dumps({"doc_id": state.context_refs[min(index, len(state.context_refs) - 1)]})
+                call.function.arguments = json.dumps({"doc_id": document_ids[min(index, len(document_ids) - 1)]})
         if new_messages and new_messages[-1].role == "assistant":
             new_messages[-1].tool_calls = calls
     new_tool_count = state.tool_call_count + len(calls)
+    tracker = EvidenceTracker.from_coverage(state.evidence) if state.evidence is not None else None
     
     if on_tool_event:
         for call in calls:
@@ -249,11 +391,24 @@ async def tool_node(
     elif constraints is not None:
         route_input_budget = min(route_input_budget, int(constraints.context_budget_tokens))
     est_used_tokens = max(0, sum(len((m.content or "")) for m in state.messages) // 4)
-    remaining_input_tokens = max(0, route_input_budget - est_used_tokens)
+    # WO-R21-ADD-01: reserve the final synthesis budget before handing tokens to tool results.
+    synthesis_reserve = max(0, int(state.synthesis_reserve_tokens or 0))
+    evidence_budget = route_input_budget
+    if synthesis_reserve:
+        evidence_budget = max(512, route_input_budget - min(synthesis_reserve, max(0, route_input_budget - 512)))
+    if tracker is not None:
+        tracker.set_budget(
+            SynthesisBudget(
+                reserved_tokens=synthesis_reserve,
+                evidence_tokens=max(0, evidence_budget),
+                total_input_budget_tokens=max(0, route_input_budget),
+            )
+        )
+    remaining_input_tokens = max(0, evidence_budget - est_used_tokens)
     # HF-03: Compute Document Tool's own tool_token_budget from the clamped route_input_budget!
     per_tool_budget = context_manager.compute_tool_token_budget(
         state.messages,
-        budget_tokens=route_input_budget,
+        budget_tokens=evidence_budget,
         route=state.service_id,
         tool_count=max(1, len(calls)),
     )
@@ -274,8 +429,8 @@ async def tool_node(
             step=state.step_count,
             service=state.service_id,
             timeout=timeout_override,
-            allowed_document_ids=list(state.context_refs),
-            input_budget_tokens=route_input_budget,
+            allowed_document_ids=document_ids,
+            input_budget_tokens=evidence_budget,
             remaining_input_tokens=remaining_input_tokens,
             constraints=constraints,
         )
@@ -290,6 +445,13 @@ async def tool_node(
     
     for res in results:
         new_traces.append(res.trace)
+        if tracker is not None:
+            try:
+                tracker.record_tool_result(
+                    res.name, dict(res.trace.arguments or {}), res.content, is_error=res.is_error
+                )
+            except (ValueError, TypeError, AttributeError):
+                pass
         if res.name in ('document.read_section','document.read_chunk') and not res.is_error:
             try:
                 data = json.loads(res.content);doc_id=data.get('doc_id') or data.get('document_id')
@@ -325,7 +487,7 @@ async def tool_node(
             )
         )
 
-    return {
+    updates = {
         "messages": new_messages,
         "tool_call_count": new_tool_count,
         'citations': citations,
@@ -333,4 +495,7 @@ async def tool_node(
         "traces": new_traces,
         "status": "running",
     }
+    if tracker is not None:
+        updates["evidence"] = tracker.coverage()
+    return updates
 

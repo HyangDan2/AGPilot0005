@@ -131,8 +131,14 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
             return StreamingResponse(deferred(), media_type='text/event-stream', headers={'Cache-Control':'no-store','X-Accel-Buffering':'no'})
         return JSONResponse({'run_id': run_id, **job}, status_code=202)
     if workspace_active:
-        # Keep the Workspace executor and admit only conversation-scoped attachments.
-        req = req.model_copy(update={"context_refs": managed_attachments, "analysis_refs": []})
+        # Keep the Workspace executor and admit only conversation-scoped attachments and the
+        # Workspace files the client selected for this turn (WO-R21-ADD-01).
+        from app.knowledge.references import is_workspace_reference_id
+
+        admitted = managed_attachments + [
+            ref for ref in req.context_refs if is_workspace_reference_id(ref)
+        ]
+        req = req.model_copy(update={"context_refs": list(dict.fromkeys(admitted)), "analysis_refs": []})
     try:
         session = await runner.create_run(req, service_id=service_id, owner_id=owner, caller_scope=scope)
     except DocumentReferenceError as exc:
@@ -194,13 +200,14 @@ async def get_agent_run(run_id: str, request: Request):
         
     require_run_session(session, request)
     state = session.state
+    coverage = state.evidence.for_report() if state.evidence is not None else None
     return AgentRunResponse(
         run_id=state.run_id,
         agent_id="general-agent",
         session_id=state.session_id,
         status=state.status,
         answer=state.final_answer,
-        model_label=state.model_label if state.status == "completed" else None,
+        model_label=state.model_label if state.status in ("completed", "partial") else None,
         traces=state.traces,
         usage={
             "steps": state.step_count,
@@ -210,6 +217,13 @@ async def get_agent_run(run_id: str, request: Request):
         created_at=session.created_at,
         finished_at=session.finished_at,
         error=state.error,
+        requested_refs=state.references.requested_citation_refs if state.references is not None else [],
+        available_refs=state.references.available_citation_refs if state.references is not None else [],
+        unresolved_refs=[item.model_dump(mode="json") for item in state.references.unresolved] if state.references else [],
+        missing_references=coverage.get("missing_references", []) if coverage else [],
+        partial_reasons=coverage.get("reasons", {}) if coverage else {},
+        evidence_coverage=coverage,
+        synthesis_budget=(coverage.get("budget") if coverage else None),
     )
 
 @router.get("/runs/{run_id}/events")

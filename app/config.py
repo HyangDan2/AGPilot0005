@@ -39,6 +39,9 @@ class Settings(BaseModel):
     MAX_TOOL_RESULT_TOKENS: int = int(os.environ.get("AGCORE_MAX_TOOL_RESULT_TOKENS", "2000"))
     TOOL_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_TOOL_TIMEOUT_SECONDS", "30.0"))
     RUN_TIMEOUT_SECONDS: float = float(os.environ.get("AGCORE_RUN_TIMEOUT_SECONDS", "180.0"))
+    # WO-R21-ADD-01: bounded enrichment + synthesis budget reservation
+    EVIDENCE_ENRICHMENT_LIMIT: int = int(os.environ.get("AGCORE_EVIDENCE_ENRICHMENT_LIMIT", "2"))
+    SYNTHESIS_RESERVE_RATIO: float = float(os.environ.get("AGCORE_SYNTHESIS_RESERVE_RATIO", "0.2"))
     
     # Service Auth Tokens, Credential Scopes & Trusted Proxy (NG-01 / NG-03 Fail-closed)
     SERVICE_TOKENS: str = os.environ.get("AGCORE_SERVICE_TOKENS", "")

@@ -39,6 +39,12 @@ CONTRACT_EXTENSIONS: Tuple[str, ...] = (
     "optimistic-concurrency",
     "vision-interface",
     "keyword-fallback",
+    # WO-R21-ADD-01: one reference + evidence contract for workspace files and session
+    # attachments (see `app/knowledge/references.py`). Consumers must ignore unknown values.
+    "unified-document-reference",
+    "evidence-coverage",
+    "bounded-enrichment",
+    "synthesis-budget-reservation",
 )
 
 

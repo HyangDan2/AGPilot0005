@@ -15,6 +15,7 @@ XLSX는 openpyxl, PPTX는 python-pptx로 생성한 파일을 사용하고, 모�
 | **G** | Vision은 Gateway 모델 능력이 있을 때만 켜지고, 없으면 OCR/텍스트 폴백 또는 명시적 미지원으로 끝난다(내용을 지어내지 않음) | capability 파일 없음 → `available=false`+사유, capability 있음 → 모델 id 보고, 분석 실패 시 OCR 폴백, 전부 불가 시 빈 텍스트+오류 | `tests/test_knowledge_vision.py` (6건), `AGPilot0010/tests/test_capabilities.py` (14건), `AGPilot0005/...::test_vision_delegates_to_engine_capability` |
 | **H** | 아티팩트는 리비전으로 저장되고, 동시 수정은 충돌로 거부되며, 롤백·무결성 검사가 가능하다 | revision 1→2, stale hash/revision → 409 `revision_conflict`, rollback → 새 리비전, validate `ok` | `AGPilot0005/...::test_artifact_create_update_conflict_rollback_and_validate`, `AGPilot0006/tests/test_knowledge_service.py` (10건) |
 | **I** | 두 서비스가 같은 계약을 말하고, 능력 매니페스트와 저하 표시가 일관된다 | 필드셋 골든 일치, 에러 코드 표 일치, manifest `formats/vision/limits`, 검색 degrade 명시 | `AGPilot0005/tests/test_r21_contract_conformance.py` (13건), `AGPilot0006/tests/test_knowledge_contracts.py` (8건), `AGPilot0011/hd2ai-admin/tests/knowledge-client.test.mjs` (6건) |
+| **J** | 워크스페이스 PDF와 세션 첨부 PDF를 한 응답에서 정확히 인용하고, 읽지 못한 자료는 `partial`과 사유로 끝난다 (WO-R21-ADD-01) | `requested_refs`/`available_refs` 분리, `EvidenceCoverage` `covered`, 부분 실패 시 `status=partial` + `missing_references`/`partial_reasons`, 단순 Chat 도구 호출 0건 | `AGPilot0005/tests/test_r21_unified_references.py` (9건) |
 
 ## 실행 방법
 

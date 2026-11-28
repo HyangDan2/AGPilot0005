@@ -61,3 +61,12 @@ class AgentRunResponse(BaseModel):
     created_at: float
     finished_at: Optional[float] = None
     error: Optional[Dict[str, str]] = None
+    # WO-R21-ADD-01: unified document references + evidence coverage travel with the run, so a
+    # partial answer never arrives without the references it could not read and why.
+    requested_refs: List[str] = Field(default_factory=list)
+    available_refs: List[str] = Field(default_factory=list)
+    unresolved_refs: List[Dict[str, Any]] = Field(default_factory=list)
+    missing_references: List[str] = Field(default_factory=list)
+    partial_reasons: Dict[str, str] = Field(default_factory=dict)
+    evidence_coverage: Optional[Dict[str, Any]] = None
+    synthesis_budget: Optional[Dict[str, Any]] = None

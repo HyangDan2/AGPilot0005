@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from app.core.auth import ConversationWorkspace
 from app.schemas.agent import ToolExecutionTrace
 from app.schemas.gateway import GatewayMessage, ToolCall
+from app.knowledge.references import EvidenceCoverage, ReferenceResolution
 
 class AgentState(BaseModel):
     run_id: str
@@ -20,6 +21,14 @@ class AgentState(BaseModel):
     approvals: List[str] = Field(default_factory=list)
     document_titles: Dict[str,str] = Field(default_factory=dict)
     citations: List[Dict[str,Any]] = Field(default_factory=list)
+
+    # WO-R21-ADD-01: unified document references + evidence coverage (None when nothing was requested)
+    references: Optional[ReferenceResolution] = None
+    evidence: Optional[EvidenceCoverage] = None
+    enrichment_attempts: int = 0
+    enrichment_attempted_keys: List[str] = Field(default_factory=list)
+    synthesis_reserve_tokens: int = 0
+    request_message: str = ""
     
     # Message history
     messages: List[GatewayMessage] = Field(default_factory=list)

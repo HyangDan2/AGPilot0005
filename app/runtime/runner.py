@@ -7,7 +7,7 @@ import time
 import uuid
 import re
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
 from app.config import settings
 from app.core.runtime_config import get_runtime_config
 from app.runtime.state import AgentState
@@ -18,6 +18,67 @@ from app.adapters.document import document_adapter, document_owner_id
 from app.core.session_attachments import ATTACHMENT_RUN_PREFIX, is_session_attachment
 from app.runtime.event_bus import RunEventBus
 from app.runtime.fence import HardDeadline, TerminalStateFence
+from app.knowledge.references import (
+    DEFAULT_ENRICHMENT_LIMIT,
+    DocumentReference,
+    EvidenceTracker,
+    ReferenceResolution,
+    ReferenceScope,
+    SynthesisBudget,
+    attachment_reference,
+    is_workspace_reference_id,
+    resolve_references,
+    workspace_reference,
+)
+
+
+def _workspace_inventory(runtime, workspace_id: str, scope, reference_scope: ReferenceScope) -> List[DocumentReference]:
+    """Files this conversation's workspace holds — names and revisions only, no content."""
+
+    from app.workspace.tools import relative_path_of
+
+    inventory: List[DocumentReference] = []
+    for identity in runtime.manager.list_files(workspace_id, scope, recursive=True):
+        if getattr(identity, "kind", None) is not None and getattr(identity.kind, "value", "") != "file":
+            continue
+        try:
+            path = relative_path_of(identity)
+        except Exception:
+            path = None
+        reference = workspace_reference(
+            file_id=identity.file_id,
+            name=identity.name,
+            mime_type=getattr(identity, "mime_type", "") or "application/octet-stream",
+            revision=int(getattr(identity, "revision", 1) or 1),
+            path=path,
+            scope=reference_scope,
+            size_bytes=getattr(identity, "size_bytes", None),
+        )
+        # An inventory entry is available by definition, but not requested until chosen or named.
+        inventory.append(reference.model_copy(update={"matched_by": []}))
+    return inventory
+
+
+def _reference_system_message(resolution: ReferenceResolution) -> str:
+    lines = [
+        "이번 요청에서 사용자가 지정한 자료입니다. 답변 전에 각 자료를 해당 도구로 실제로 읽으세요.",
+    ]
+    for ref in resolution.requested_refs:
+        where = "워크스페이스 파일" if ref.source_type.value == "workspace_file" else "세션 첨부"
+        tool = "workspace_retrieve/workspace_read_file" if where == "워크스페이스 파일" else "document.get_outline/read_section/search"
+        lines.append(
+            f"- [{where}] {ref.name or ref.document_id} (id={ref.document_id}, revision={ref.revision}, "
+            f"citation_ref={ref.citation_ref}, 확인 도구={tool})"
+        )
+    lines.append(
+        "자료 내용을 추측하지 말고, 읽은 근거로만 답하세요. 읽지 못한 자료가 있으면 어떤 자료를 왜 읽지 못했는지 답변에 밝히세요."
+    )
+    if resolution.unresolved:
+        lines.append(
+            "다음 참조는 이 대화 범위에서 확인되지 않았습니다: "
+            + ", ".join(f"{item.mention} ({item.reason})" for item in resolution.unresolved)
+        )
+    return " ".join(lines)
 
 class DocumentReferenceError(ValueError):
     pass
@@ -225,12 +286,16 @@ class AgentRunner:
             # HF-02: Propagate verified ExecutionScope into Document Reference pre-validation (OUTSIDE lock!)
             from app.core.auth import current_execution_scope, current_run_conversation_id
 
+            workspace_file_refs = [ref for ref in refs if is_workspace_reference_id(ref)]
+            if workspace_file_refs and not (req.workspace_id or "").strip():
+                raise DocumentReferenceError("workspace_reference_requires_binding")
+
             owner_token = document_owner_id.set(owner_id)
             scope_token = current_execution_scope.set(caller_scope) if caller_scope is not None else None
             conversation_token = current_run_conversation_id.set(req.conversation_id)
             titles = {}
             try:
-                for ref in refs:
+                for ref in (item for item in refs if not is_workspace_reference_id(item)):
                     outline = await document_adapter.get_outline(ref)
                     if outline.get("error") or outline.get("status") != "completed":
                         raise DocumentReferenceError(f"Document '{ref}' is unavailable or not yet parsed")
@@ -243,6 +308,13 @@ class AgentRunner:
 
             active_tool_names = [t.name for t in registry.list_tools(service=service_id)]
             messages = [GatewayMessage(role="system", content=ContextAdapter.build_system_message(active_tool_names))]
+            reference_scope = ReferenceScope(
+                workspace_id=(req.workspace_id or "").strip() or None,
+                conversation_id=(req.conversation_id or "").strip() or None,
+                session_id=req.session_id,
+            )
+            workspace_inventory: List[DocumentReference] = []
+            workspace_missing: List[tuple] = []
             workspace_id: Optional[str] = (req.workspace_id or "").strip() or None
             if workspace_id is not None:
                 from app.config import is_workspace_enabled, is_workspace_enabled_for_service
@@ -289,6 +361,20 @@ class AgentRunner:
                         ),
                     )
                 )
+                # WO-R21-ADD-01: the workspace inventory is metadata only — it names what this
+                # conversation *may* read. A file becomes `requested` only when the client
+                # selected it or the user named it in the message.
+                try:
+                    workspace_inventory = _workspace_inventory(
+                        _get_workspace_runtime(), workspace_id, ws_scope, reference_scope
+                    )
+                except WorkspaceFailure as exc:
+                    raise DocumentReferenceError(exc.error.code.value) from exc
+                known_file_ids = {item.document_id for item in workspace_inventory}
+                for ref in workspace_file_refs:
+                    if ref not in known_file_ids:
+                        # A file outside this conversation's workspace is refused, never guessed.
+                        raise DocumentReferenceError("workspace_file_not_found")
             if refs:
                 messages.append(GatewayMessage(
                     role="system",
@@ -296,6 +382,42 @@ class AgentRunner:
                              ". 문서 내용을 추측하지 말고 document.search, document.read_section 등으로 확인한 후 답하세요. "
                              "문서 도구에는 이 목록의 doc_id만 사용하세요."),
                 ))
+
+            # WO-R21-ADD-01: one reference contract for workspace files and session attachments.
+            unified_available: List[DocumentReference] = list(workspace_inventory)
+            for ref in (item for item in refs if is_session_attachment(item)):
+                unified_available.append(
+                    attachment_reference(
+                        document_id=ref,
+                        name=titles.get(ref, ""),
+                        scope=reference_scope,
+                    )
+                )
+            unified_explicit = [item for item in refs if is_session_attachment(item) or is_workspace_reference_id(item)]
+            resolution = resolve_references(
+                message=req.message,
+                explicit_ids=unified_explicit,
+                available=unified_available,
+                scope=reference_scope,
+                missing_explicit=workspace_missing,
+            )
+            synthesis_reserve = (
+                max(256, int(settings.CONTEXT_BUDGET_TOKENS * float(settings.SYNTHESIS_RESERVE_RATIO)))
+                if resolution.has_requested else 0
+            )
+            if resolution.has_requested:
+                messages.insert(1, GatewayMessage(role="system", content=_reference_system_message(resolution)))
+            evidence = EvidenceTracker(
+                resolution.requested_refs,
+                enrichment_limit=max(0, int(settings.EVIDENCE_ENRICHMENT_LIMIT)),
+            )
+            evidence.set_budget(
+                SynthesisBudget(
+                    reserved_tokens=synthesis_reserve,
+                    evidence_tokens=max(0, int(settings.CONTEXT_BUDGET_TOKENS) - synthesis_reserve),
+                    total_input_budget_tokens=int(settings.CONTEXT_BUDGET_TOKENS),
+                )
+            )
             for message in req.history:
                 if message.get("role") in ("user", "assistant"):
                     messages.append(GatewayMessage(role=message["role"], content=message.get("content", "")))
@@ -316,6 +438,10 @@ class AgentRunner:
                 approvals=list(req.approvals or ()),
                 document_titles=titles,
                 messages=messages,
+                references=resolution,
+                evidence=evidence.coverage() if resolution.has_requested else None,
+                synthesis_reserve_tokens=synthesis_reserve,
+                request_message=req.message,
                 max_steps=min(opts.max_steps, get_runtime_config().max_agent_steps) if opts and opts.max_steps else get_runtime_config().max_agent_steps,
                 max_tool_calls=min(opts.max_tool_calls, get_runtime_config().max_tool_calls) if opts and opts.max_tool_calls else get_runtime_config().max_tool_calls,
                 stream=req.stream,
@@ -397,9 +523,10 @@ class AgentRunner:
                     session.finished_at = time.time()
                 return
             session.finished_at = time.time()
-            if state.status == "completed":
-                session.fence.try_finalize("completed")
-                await session.emit("run.completed", {
+            if state.status in ("completed", "partial"):
+                session.fence.try_finalize(state.status)
+                coverage = state.evidence
+                terminal_payload = {
                     "citations": state.citations,
                     "answer_kind": "answer",
                     "answer": state.final_answer or "",
@@ -407,12 +534,27 @@ class AgentRunner:
                     "total_steps": state.step_count,
                     "total_tool_calls": state.tool_call_count,
                     "duration_seconds": round(session.finished_at - start_time, 2),
-                    "terminal_status": r1_res.get("terminal_status") or "completed",
+                    "terminal_status": state.status,
                     "fallback_applied": bool(r1_res.get("fallback_applied_any", False)),
                     "reason_code": r1_res.get("last_fallback_reason"),
                     "runtime_engine": "langgraph_r1",
-                })
+                }
+                # WO-R21-ADD-01: a partial answer is still an answer — deliver the secured
+                # evidence and the missing references with their reasons, never silently.
+                terminal_payload["partial"] = state.status == "partial"
+                if state.references is not None:
+                    terminal_payload["references"] = state.references.for_report()
+                if coverage is not None:
+                    terminal_payload["evidence_coverage"] = coverage.for_report()
+                    terminal_payload["missing_references"] = coverage.missing_references()
+                    terminal_payload["partial_reasons"] = coverage.reasons()
+                    terminal_payload["budget"] = coverage.budget.model_dump(mode="json")
+                await session.emit("run.completed", terminal_payload)
             else:
+                if state.evidence is not None:
+                    tracker = EvidenceTracker.from_coverage(state.evidence)
+                    tracker.mark_execution_failure((state.error or {}).get("code"))
+                    state.evidence = tracker.coverage()
                 session.fence.try_finalize("failed")
                 err_info = state.error or {}
                 state.error = {

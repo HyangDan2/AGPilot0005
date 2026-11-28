@@ -349,6 +349,10 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
             st.messages = res["messages"]
             st.step_count = res["step_count"]
             st.pending_tool_calls = res.get("pending_tool_calls", [])
+            if "enrichment_attempts" in res:
+                st.enrichment_attempts = int(res["enrichment_attempts"] or 0)
+            if "enrichment_attempted_keys" in res:
+                st.enrichment_attempted_keys = list(res["enrichment_attempted_keys"] or [])
             if res.get("model_label"):
                 st.model_label = res["model_label"]
             if "final_answer" in res:
@@ -418,9 +422,15 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
 
             if action == ActionType.SAFE_RESPOND.value and terminal_status is None:
                 if (st.final_answer or "").strip():
-                    if run_fence.try_finalize("completed"):
-                        st.status = "completed"
-                        terminal_status = "completed"
+                    safe_state = (
+                        "partial"
+                        if st.evidence is not None and st.evidence.incomplete
+                        else "completed"
+                    )
+                    if run_fence.try_finalize(safe_state):
+                        st.status = safe_state
+                        terminal_status = safe_state
+                        outcome = "partial" if safe_state == "partial" else "success"
                 else:
                     if run_fence.try_finalize("failed"):
                         st.status = "failed"
@@ -475,6 +485,24 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
             st.tool_call_count = t_res["tool_call_count"]
             st.traces = t_res.get("traces", st.traces)
             st.citations = t_res.get("citations", st.citations)
+            if t_res.get("evidence") is not None:
+                st.evidence = t_res["evidence"]
+                if st.evidence.requested:
+                    await _emit_with_fence(
+                        ctx,
+                        "evidence.coverage",
+                        {
+                            "step": st.step_count,
+                            "status": st.evidence.status,
+                            "requested": st.evidence.requested,
+                            "covered": st.evidence.covered,
+                            "missing": st.evidence.missing,
+                            "failed": st.evidence.failed,
+                            "missing_references": st.evidence.missing_references(),
+                            "partial_reasons": st.evidence.reasons(),
+                            "enrichment_attempts": st.evidence.enrichment.attempts,
+                        },
+                    )
             st.pending_tool_calls = []
 
             recent_traces = st.traces[-len(validated_tc_objs):]
@@ -612,11 +640,18 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
             tstat = params.get("terminal_status") or ("completed" if (st.final_answer or "").strip() else "failed")
             if tstat == "completed" and (st.pending_tool_calls or not (st.final_answer or "").strip()):
                 tstat = "failed"
+            # WO-R21-ADD-01: an answer with requested references still unread is `partial`, not `completed`.
+            if tstat == "completed" and st.evidence is not None and st.evidence.incomplete:
+                tstat = "partial"
             terminal_status = tstat
             if tstat == "completed":
                 if run_fence.try_finalize("completed"):
                     st.status = "completed"
                     outcome = "success"
+            elif tstat == "partial":
+                if run_fence.try_finalize("partial"):
+                    st.status = "partial"
+                    outcome = "partial"
             elif tstat == "timeout":
                 if run_fence.try_finalize("failed"):
                     st.status = "failed"

@@ -14,6 +14,7 @@ EventType = Literal[
     "tool.completed",
     "step.completed",
     "answer.delta",
+    "evidence.coverage",
     "run.completed",
     "run.failed",
     "run.cancelled",

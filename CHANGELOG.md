@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased] — R2.1 `feat/r21-document-knowledge-engine`
+### WO-R21-ADD-01 — Unified Document Reference & Evidence Coverage
+- Added `app/knowledge/references.py` (pure, R3-reusable): `DocumentReference` (`source_type`, `document_id`, `scope`, `revision`, `analysis_target`, deterministic `citation_ref`), `ReferenceResolution` separating `available_refs` from `requested_refs` (explicit `context_refs`/`wf_` ids + natural-language name/identifier matching), `EvidenceCoverage` (`covered|missing|failed`, chunks/pages/citation refs, reasons, enrichment attempts, synthesis budget) and `plan_enrichment()`.
+- Runtime: requested references are resolved at run creation; tool results are credited per reference in `tool_node`; missing references trigger bounded enrichment through the existing tools (`AGCORE_EVIDENCE_ENRICHMENT_LIMIT`, default 2); the final synthesis budget is reserved (`AGCORE_SYNTHESIS_RESERVE_RATIO`, default 0.2). A grounded answer with unread requested references now terminates as `partial`, never `completed`.
+- REST/SSE: `AgentRunResponse` adds `requested_refs`, `available_refs`, `unresolved_refs`, `missing_references`, `partial_reasons`, `evidence_coverage`, `synthesis_budget`; SSE adds `evidence.coverage` and carries the same payload on `run.completed` (`status: partial`).
+- Integrated HOTFIX-08A candidate `2a8fbd1` (registered-schema argument normalisation for managed session attachment tools) without conflicting with the R2.1 design.
+- Tests: `tests/test_r21_unified_references.py` (9) — mixed Workspace PDF (`R2-BETA-WORKSPACE-731`) + Session Attachment PDF (`R2-BETA-ATTACHMENT-428`) in one answer, `partial` with reasons, simple chat with zero document searches, permission isolation regression.
+
 ## [1.3.0] - 2026-11-27 (main)
 ### Phase B — Runtime Parity, LangGraph Single Runtime & Legacy Retirement (`WO-05` B1~B3, `AM-05`, `AM-06`)
 - Added 14-scenario Runtime Parity suite (`tests/test_r1_3_runtime_parity.py`) and closed LangGraph parity defects: non-delta streaming `answer.delta` & `legacy_citations` emission, `COMPACT_CONTEXT` fallback `rejected_signatures` loop fix, `GatewayStreamError` normalization, cancelled early-return error guard, pseudo-tool markup stream block, and `SAFE_RESPOND` fallback reason preservation.

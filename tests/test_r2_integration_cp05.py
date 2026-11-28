@@ -73,7 +73,7 @@ async def _wait_terminal(client: AsyncClient, run_id: str, headers: Dict[str, st
         r = await client.get(f"/api/v1/agent/runs/{run_id}", headers=headers)
         assert r.status_code == 200, r.text
         body = r.json()
-        if body["status"] in ("completed", "failed", "cancelled"):
+        if body["status"] in ("completed", "failed", "cancelled", "partial"):
             return body
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError(f"Run {run_id} did not finish: {body}")

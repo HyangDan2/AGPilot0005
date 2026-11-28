@@ -270,3 +270,4 @@ and returns citations for exactly the blocks that fit.
 | AGTools wire behaviour (read/search/create/update/validate) | `AGPilot0006/tests/test_knowledge_*.py` |
 | Federated behaviour and degradation | `AGPilot0005/tests/test_r21_knowledge_federation.py` |
 | Consumer typing / citation display rules | `AGPilot0011/hd2ai-admin/tests/knowledge-client.test.mjs` |
+| Unified reference + evidence coverage (WO-R21-ADD-01) | `AGPilot0005/tests/test_r21_unified_references.py`, `docs/r21/UNIFIED_DOCUMENT_REFERENCE.md` |
