@@ -10,6 +10,43 @@ from app.tools.dispatcher import dispatcher
 from app.tools.registry import registry
 from app.adapters.document import document_owner_id, tool_token_budget
 from app.core.auth import current_run_workspace_binding
+from app.core.session_attachments import is_session_attachment
+
+
+def _attachment_tool_definitions(tools, refs: list[str]):
+    """Use the run's authorized attachment references in model-facing schemas."""
+    definitions = []
+    implicit_tools = set()
+    for tool in tools:
+        function = tool.function
+        properties = function.parameters.get("properties", {})
+        if not function.name.startswith("document.") or "doc_id" not in properties:
+            definitions.append(tool)
+            continue
+        properties = dict(properties)
+        parameters = {**function.parameters, "properties": properties}
+        if len(refs) == 1:
+            implicit_tools.add(function.name)
+            properties.pop("doc_id")
+            parameters["required"] = [key for key in parameters.get("required", []) if key != "doc_id"]
+        else:
+            properties["doc_id"] = {**properties["doc_id"], "enum": refs}
+        definitions.append(tool.model_copy(update={"function": function.model_copy(update={"parameters": parameters})}))
+    return definitions, implicit_tools
+
+
+def _bind_attachment_argument(call, attachment_id: str):
+    """Bind only omitted IDs. Explicit IDs still go through existing checks."""
+    raw = call.function.arguments
+    try:
+        arguments = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return call
+    if not isinstance(arguments, dict) or "doc_id" in arguments:
+        return call
+    arguments["doc_id"] = attachment_id
+    function = call.function.model_copy(update={"arguments": json.dumps(arguments, ensure_ascii=False)})
+    return call.model_copy(update={"function": function})
 
 async def model_node(
     state: AgentState,
@@ -77,6 +114,9 @@ async def model_node(
     first_document_step = bool(state.context_refs) and state.tool_call_count == 0
     if first_document_step:
         tools = [tool for tool in tools if tool.function.name == "document.get_outline"]
+    implicit_attachment_tools = set()
+    if state.workspace_binding is not None and any(is_session_attachment(ref) for ref in state.context_refs):
+        tools, implicit_attachment_tools = _attachment_tool_definitions(tools, state.context_refs)
     
     # 3. Call Client (with 1-shot reactive compaction recovery on context overflow)
     model_label = None
@@ -187,6 +227,13 @@ async def model_node(
         )
     if public_grounding and not content and not tool_calls:
         raise RuntimeError("Public document answer was empty")
+
+    if allow_tools and tool_calls and implicit_attachment_tools:
+        tool_calls = [
+            _bind_attachment_argument(call, state.context_refs[0])
+            if call.function.name in implicit_attachment_tools else call
+            for call in tool_calls
+        ]
     
     new_messages = list(state.messages)
     assistant_msg = GatewayMessage(
@@ -228,7 +275,8 @@ async def tool_node(
     new_traces = list(state.traces)
     new_messages = list(state.messages)
     citations = list(state.citations)
-    if validated_calls is None and state.context_refs and state.tool_call_count == 0:
+    if (validated_calls is None and state.context_refs and state.tool_call_count == 0
+            and not any(is_session_attachment(ref) for ref in state.context_refs)):
         for index, call in enumerate(calls):
             if call.function.name == "document.get_outline":
                 call.function.arguments = json.dumps({"doc_id": state.context_refs[min(index, len(state.context_refs) - 1)]})

@@ -1425,7 +1425,13 @@ async def test_session_attachment_workspace_and_parser_scope(monkeypatch, tmp_pa
     from app.adapters import document
     from app.tools.policy import tool_policy
 
-    gateway = ScriptedGateway([])
+    class CaptureDefinitions(ScriptedGateway):
+        async def execute(self, messages, tools=None, **kwargs):
+            if not self.calls:
+                self.first_tools = {tool.function.name: tool.function.parameters for tool in tools or []}
+            return await super().execute(messages, tools=tools, **kwargs)
+
+    gateway = CaptureDefinitions([])
     workspace, _ = _setup_r2_env(monkeypatch, tmp_path, gateway)
     monkeypatch.setenv("AGCORE_SESSION_ATTACHMENT_SERVICES", "hd2ai-beta")
     monkeypatch.setattr(settings, "AGTOOLS_TOKEN", "sandbox-parser-token")
@@ -1465,14 +1471,19 @@ async def test_session_attachment_workspace_and_parser_scope(monkeypatch, tmp_pa
     monkeypatch.setattr(document.document_adapter, "http", document.AGToolsHttpAdapter())
     original_allow = tool_policy.is_tool_allowed
     monkeypatch.setattr(tool_policy, "is_tool_allowed", lambda name, service: (
-        (True, None) if name == "document.search" else original_allow(name, service)
+        (True, None) if name in {"document.get_outline", "document.search"} else original_allow(name, service)
     ))
     gateway.script = [
+        {"tool_calls": [
+            ToolCall(id="first-attachment", function=FunctionCall(name="document.get_outline", arguments="{}")),
+            ToolCall(id="foreign-attachment", function=FunctionCall(
+                name="document.get_outline", arguments='{"doc_id":"att-foreign"}')),
+        ]},
         {"tool_calls": [
             ToolCall(id="workspace-1", function=FunctionCall(
                 name="workspace_read_file", arguments='{"path":"workspace.md"}')),
             ToolCall(id="attachment-1", function=FunctionCall(
-                name="document.search", arguments='{"doc_id":"att-doc-scoped","query":"fixture"}')),
+                name="document.search", arguments='{"query":"fixture"}')),
         ]},
         {"content": "both sources"},
     ]
@@ -1522,6 +1533,11 @@ async def test_session_attachment_workspace_and_parser_scope(monkeypatch, tmp_pa
         assert positive_feedback.status_code == 201, positive_feedback.text
         result = await client.get(status_url, headers=headers, params={"conversation_id": "one"})
         traces = {trace["tool_call_id"]: trace for trace in result.json()["traces"]}
+        assert traces["first-attachment"]["status"] == "completed", traces["first-attachment"].get("error_code")
+        assert traces["first-attachment"]["arguments"]["doc_id"] == attachment
+        assert traces["foreign-attachment"]["error_code"] == "document_not_referenced"
+        assert "doc_id" not in gateway.first_tools["document.get_outline"]["properties"]
+        assert not any("/documents/foreign/" in path for _, path, _ in calls)
         assert traces["workspace-1"]["status"] == "completed"
         assert traces["attachment-1"]["status"] == "completed"
         assert any(method == "POST" and path.endswith("/search") and key in uploads for method, path, key in calls)
