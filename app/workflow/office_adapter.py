@@ -22,16 +22,21 @@ import hashlib
 import json
 import re
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
     "OFFICE_CAPABILITIES",
+    "AGTOOLS_PROVIDED_CAPABILITIES",
     "OfficeAdapterError",
     "OfficeAdapterUnavailable",
     "OfficeHealth",
+    "OfficeAvailability",
     "OfficeResult",
+    "AdapterCallScope",
     "OfficeCapabilityAdapter",
     "MockOfficeAdapter",
     "RuntimeOfficeAdapter",
@@ -48,6 +53,12 @@ OFFICE_CAPABILITIES: Tuple[str, ...] = (
     "office.pptx.generate",
     "workspace.file.write",
 )
+
+#: Capabilities the AGTools runtime (AGPilot0006 `98113bc`, `app/r3_capabilities.py`
+#: ``SHARED_CAPABILITY_INTERFACE``) actually provides.  Everything else is served by the
+#: Mock adapter during pre-development only; a live runtime must report ``unavailable``
+#: for it instead of answering with fabricated data (FIX-08).
+AGTOOLS_PROVIDED_CAPABILITIES: frozenset = frozenset({"workspace.rag.search"})
 
 _PRODUCTION_ENVS = frozenset({"production", "prod", "live"})
 _SAFE_PATH = re.compile(r"^(?!/)(?!.*\.\.)[^\x00]{1,512}$")
@@ -86,6 +97,79 @@ class OfficeResult(BaseModel):
     untrusted: bool = False
 
 
+class OfficeAvailability(BaseModel):
+    """Whether a capability can really run here (FIX-08).
+
+    ``unavailable`` is an answer, not an error: the runtime reports it up instead of
+    returning a Mock result on a production path.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    capability: str
+    status: str = "available"
+    adapter: str = "mock"
+    detail: Optional[str] = None
+
+    @property
+    def available(self) -> bool:
+        return self.status == "available"
+
+
+@dataclass(frozen=True)
+class AdapterCallScope:
+    """Identity propagated to the R2.1 runtime on every capability call (FIX-08).
+
+    The credential is carried as a token that is only rendered into an ``Authorization``
+    header; it never appears in a trajectory, a log line or a repr.
+    """
+
+    tenant_id: str
+    owner_id: str
+    service_id: Optional[str] = None
+    access_token: Optional[str] = field(default=None, repr=False)
+    extra_headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_context(cls, context: Any, *, access_token: Optional[str] = None) -> Optional["AdapterCallScope"]:
+        if context is None:
+            return None
+        getter = getattr(context, "get", None)
+        def _read(key: str) -> Any:
+            if callable(getter):
+                return context.get(key)
+            return getattr(context, key, None)
+        tenant_id = _read("tenant_id")
+        owner_id = _read("owner_id")
+        if not tenant_id or not owner_id:
+            return None
+        return cls(
+            tenant_id=str(tenant_id),
+            owner_id=str(owner_id),
+            service_id=(str(_read("service_id")) if _read("service_id") else None),
+            access_token=access_token,
+        )
+
+    def headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {
+            "X-HD2Lab-Tenant": self.tenant_id,
+            "X-HD2Lab-User": self.owner_id,
+        }
+        if self.service_id:
+            headers["X-HD2Lab-Service"] = self.service_id
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        headers.update({str(k): str(v) for k, v in (self.extra_headers or {}).items()})
+        return headers
+
+
+#: Set for the duration of one ``invoke`` so the concrete call carries the caller's scope
+#: without changing every capability method signature.
+current_adapter_scope: ContextVar[Optional[AdapterCallScope]] = ContextVar(
+    "current_adapter_scope", default=None,
+)
+
+
 class OfficeCapabilityAdapter(ABC):
     """The five-capability interface shared by Mock and Runtime adapters."""
 
@@ -118,11 +202,28 @@ class OfficeCapabilityAdapter(ABC):
     ) -> OfficeResult: ...
 
     # -- generic dispatch --------------------------------------------------------------
-    async def invoke(self, capability: str, params: Mapping[str, Any]) -> OfficeResult:
-        """Call a capability by id — the form the workflow planner uses."""
+    async def invoke(
+        self,
+        capability: str,
+        params: Mapping[str, Any],
+        *,
+        call_scope: Optional[AdapterCallScope] = None,
+    ) -> OfficeResult:
+        """Call a capability by id — the form the workflow planner uses.
+
+        ``call_scope`` is the authenticated identity passed to the R2.1 runtime; an
+        adapter that cannot run the capability reports it as unavailable instead of
+        answering with a stand-in result.
+        """
         if capability not in self.capabilities:
             raise OfficeAdapterError("unknown_capability", capability)
+        availability = self.availability(capability)
+        if not availability.available:
+            raise OfficeAdapterUnavailable(
+                "capability_unavailable", f"{capability}: {availability.detail or availability.status}",
+            )
         payload = dict(params or {})
+        token = current_adapter_scope.set(call_scope)
         try:
             if capability == "workspace.rag.search":
                 return await self.workspace_rag_search(
@@ -142,7 +243,21 @@ class OfficeCapabilityAdapter(ABC):
             raise OfficeAdapterError("missing_parameter", str(exc)) from exc
         except TypeError as exc:
             raise OfficeAdapterError("invalid_parameters", str(exc)) from exc
+        finally:
+            current_adapter_scope.reset(token)
         raise OfficeAdapterError("unknown_capability", capability)
+
+    # -- availability ------------------------------------------------------------------
+    def availability(self, capability: Optional[str] = None) -> OfficeAvailability:
+        """Default: the adapter can serve every capability it declares."""
+        target = capability or "*"
+        return OfficeAvailability(capability=target, status="available", adapter=self.name)
+
+    def availability_report(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            capability: self.availability(capability).model_dump()
+            for capability in self.capabilities
+        }
 
     async def health(self) -> OfficeHealth:
         return OfficeHealth(adapter=self.name, status="ok", capabilities=self.capabilities)
@@ -158,10 +273,21 @@ class MockOfficeAdapter(OfficeCapabilityAdapter):
     name: ClassVar[str] = "mock"
     is_mock: ClassVar[bool] = True
 
-    def __init__(self, *, documents: Optional[Mapping[str, str]] = None) -> None:
+    def __init__(self, *, documents: Optional[Mapping[str, str]] = None, environment: Optional[str] = None) -> None:
         self.files: Dict[str, str] = dict(documents or {})
         self.calls: List[Dict[str, Any]] = []
         self.side_effects: List[str] = []
+        self.environment = (environment or "").strip().lower()
+
+    def availability(self, capability: Optional[str] = None) -> OfficeAvailability:
+        """The Mock adapter is a pre-development stand-in: never available in production."""
+        target = capability or "*"
+        if self.environment in _PRODUCTION_ENVS:
+            return OfficeAvailability(
+                capability=target, status="unavailable", adapter=self.name,
+                detail="mock_adapter_forbidden_in_production",
+            )
+        return OfficeAvailability(capability=target, status="available", adapter=self.name)
 
     # -- helpers -----------------------------------------------------------------------
     def _record(self, capability: str, params: Mapping[str, Any]) -> None:
@@ -355,6 +481,8 @@ class RuntimeOfficeAdapter(OfficeCapabilityAdapter):
         max_retries: int = 2,
         transport: Optional[HttpTransport] = None,
         auth_header: Optional[Callable[[], Mapping[str, str]]] = None,
+        token_provider: Optional[Callable[[], Optional[str]]] = None,
+        provided_capabilities: Optional[Sequence[str]] = None,
     ) -> None:
         base = (base_url or "").strip().rstrip("/")
         if not base.startswith(("http://", "https://")):
@@ -364,7 +492,40 @@ class RuntimeOfficeAdapter(OfficeCapabilityAdapter):
         self.max_retries = max(0, int(max_retries))
         self._transport = transport or self._http_transport
         self._auth_header = auth_header
+        self._token_provider = token_provider
         self.calls: List[Dict[str, Any]] = []
+        self.provided_capabilities: frozenset = frozenset(
+            provided_capabilities if provided_capabilities is not None else AGTOOLS_PROVIDED_CAPABILITIES
+        )
+
+    # -- availability ------------------------------------------------------------------
+    def availability(self, capability: Optional[str] = None) -> OfficeAvailability:
+        """Report the AGTools capability matrix (FIX-08): not-provided is *unavailable*.
+
+        AGPilot0006 `98113bc` provides document-level RAG only; spreadsheet analysis,
+        document comparison, deck generation and managed-workspace writes are ``not_provided``
+        by the R2.1 runtime.  Those capabilities are never silently answered by the Mock
+        adapter on a runtime path.
+        """
+        if capability is None:
+            return OfficeAvailability(capability="*", status="available", adapter=self.name)
+        if capability in self.provided_capabilities:
+            return OfficeAvailability(capability=capability, status="available", adapter=self.name)
+        return OfficeAvailability(
+            capability=capability, status="unavailable", adapter=self.name,
+            detail="capability_not_provided_by_runtime",
+        )
+
+    def _scope_headers(self) -> Dict[str, str]:
+        scope = current_adapter_scope.get()
+        if scope is None:
+            return {}
+        headers = scope.headers()
+        if self._token_provider is not None and "Authorization" not in headers:
+            token = self._token_provider()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        return headers
 
     # -- transport ---------------------------------------------------------------------
     @staticmethod
@@ -385,6 +546,9 @@ class RuntimeOfficeAdapter(OfficeCapabilityAdapter):
         headers = {"content-type": "application/json", "accept": "application/json"}
         if self._auth_header is not None:
             headers.update({str(k): str(v) for k, v in (self._auth_header() or {}).items()})
+        # FIX-08: the caller's verified scope travels with the request.  It is never
+        # derived from the step parameters, so a plan cannot widen its own authority.
+        headers.update(self._scope_headers())
         return headers
 
     async def _call(self, capability: str, payload: Mapping[str, Any]) -> OfficeResult:
@@ -497,15 +661,22 @@ def get_office_adapter(
     documents: Optional[Mapping[str, str]] = None,
     base_url: Optional[str] = None,
     transport: Optional[HttpTransport] = None,
+    token_provider: Optional[Callable[[], Optional[str]]] = None,
+    provided_capabilities: Optional[Sequence[str]] = None,
 ) -> OfficeCapabilityAdapter:
     """Factory used by the runtime wiring; mock is rejected in production."""
     normalized = (kind or "mock").strip().lower()
     if normalized == "mock":
-        adapter: OfficeCapabilityAdapter = MockOfficeAdapter(documents=documents)
+        adapter: OfficeCapabilityAdapter = MockOfficeAdapter(
+            documents=documents, environment=environment,
+        )
     elif normalized == "runtime":
         if not base_url:
             raise OfficeAdapterError("base_url_required")
-        adapter = RuntimeOfficeAdapter(base_url, transport=transport)
+        adapter = RuntimeOfficeAdapter(
+            base_url, transport=transport, token_provider=token_provider,
+            provided_capabilities=provided_capabilities,
+        )
     else:
         raise OfficeAdapterError("unknown_adapter", kind)
     assert_adapter_allowed(adapter, environment=environment)

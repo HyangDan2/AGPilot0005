@@ -46,6 +46,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.workflow.budget import BudgetExceeded, ContextBudgetManager
 from app.workflow.checkpoint import WorkflowCheckpoint, WorkflowCheckpointStore
 from app.workflow.hooks import HookEvent, HookValidationError
+from app.workflow.ledger import (
+    ExecutionLedger,
+    RunBusy,
+    RunExecutionGuard,
+    SIDE_EFFECT_STEPS,
+    StepLedgerRecord,
+)
 from app.workflow.mcp import (
     MCPApprovalRequired,
     MCPConfigError,
@@ -56,7 +63,9 @@ from app.workflow.mcp import (
     MCPUnavailable,
 )
 from app.workflow.office_adapter import (
+    AdapterCallScope,
     OfficeAdapterError,
+    OfficeAdapterUnavailable,
     OfficeCapabilityAdapter,
     OfficeResult,
 )
@@ -72,13 +81,16 @@ from app.workflow.planner import (
 )
 from app.workflow.safety import (
     ApprovalAuthority,
+    ApprovalBinding,
     ApprovalError,
     ApprovalToken,
     ExecutionContext,
     IdempotencyConflict,
     IdempotencyLedger,
     ScopeViolation,
+    approval_args_hash,
 )
+from app.workflow.scope import ToolAccessPolicy
 from app.workflow.trajectory import (
     ArtifactRecord,
     FailureRecord,
@@ -114,7 +126,19 @@ WORKFLOW_EVENT_TYPES: tuple = (
 )
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-_CHECKPOINT_STATUSES = frozenset({"pending", "running", "awaiting_approval", "completed", "failed", "cancelled"})
+_CHECKPOINT_STATUSES = frozenset(
+    {"pending", "running", "awaiting_approval", "recovery_required", "completed", "failed", "cancelled"}
+)
+#: Failure codes that mean "the call may or may not have happened": never auto-retried
+#: against a side effect (FIX-02).
+AMBIGUOUS_ERROR_CODES = frozenset(
+    {
+        "tool_timeout", "mcp_timeout", "mcp_http_unavailable", "mcp_transport_error",
+        "transport_error", "upstream_unavailable", "timeout", "mcp_stream_closed",
+    }
+)
+#: Parameter names used to describe *what* an approval is for (in that order).
+_APPROVAL_TARGET_PARAMS = ("path", "target_path", "id", "uri", "url", "name", "key", "recipient")
 _COMPARISON_RE = re.compile(r"^\s*(\$[^\s]+)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$")
 
 
@@ -198,6 +222,7 @@ class WorkflowRunResult(BaseModel):
     artifacts: List[Dict[str, Any]] = Field(default_factory=list)
     failures: List[Dict[str, Any]] = Field(default_factory=list)
     pending_approval: Optional[Dict[str, Any]] = None
+    recovery: Optional[Dict[str, Any]] = None
     error: Optional[Dict[str, Any]] = None
     token_usage: Dict[str, Any] = Field(default_factory=dict)
     duration_ms: float = 0.0
@@ -370,6 +395,7 @@ class _RunContext:
         self.route = "workflow"
         self.reason = ""
         self.error: Optional[Dict[str, Any]] = None
+        self.recovery: Optional[Dict[str, Any]] = None
         self.capabilities: List[str] = []
         self.started_at = time.perf_counter()
         self.budget = runtime.new_budget(request)
@@ -449,12 +475,25 @@ class _RunContext:
                 "route": self.route,
                 "reason": self.reason,
                 "capabilities": list(self.request.capabilities),
+                "pending_approval": self.trajectory.metadata.get("pending_approval"),
+                "recovery": self.recovery or self.trajectory.metadata.get("recovery"),
             },
         )
 
     async def save_checkpoint(self, *, status: Optional[str] = None, step_id: Optional[str] = None) -> None:
         existing = self.store.load_raw(self.run_id)
-        checkpoint = self._build_checkpoint(status=status, existing=existing)
+        resolved = status or self.status
+        # FIX-02 cancel/completion race: once a cancellation is persisted it wins, and a
+        # recovery hold can only be left by an explicit decision (never by a late task
+        # finishing on its own).
+        if existing is not None:
+            if existing.status == "cancelled" and resolved not in ("cancelled", "failed"):
+                self.status = "cancelled"
+                resolved = "cancelled"
+                self.error = self.error or {"code": "workflow_cancelled", "message": "run cancelled by caller"}
+            elif existing.status == "recovery_required" and resolved in ("running", "completed"):
+                resolved = "recovery_required"
+        checkpoint = self._build_checkpoint(status=resolved, existing=existing)
         self.store.save(checkpoint, trajectory=self.trajectory.to_dict())
         await self.emit_event(
             "workflow.checkpoint.saved",
@@ -564,12 +603,13 @@ class _RunContext:
                     plan = self._plan_from_explicit_steps(self.request.plan_steps)
                     decision_route, decision_reason = "workflow", "explicit_plan"
                 else:
-                    decision = self.planner.plan(self.request.planner_request())
+                    decision = await self.planner.aplan(self.request.planner_request())
                     decision_route, decision_reason = decision.route, decision.reason
                     plan = decision.plan
             except PlannerError as exc:
                 return await self._fail_phase("planner", exc.code, str(exc))
             self.route, self.reason = decision_route, decision_reason
+            self.trajectory.metadata["planner_source"] = getattr(self.planner, "last_plan_source", "deterministic")
             if decision_route == "direct_chat":
                 self.status = "direct_chat"
                 self.trajectory.metadata["route"] = "direct_chat"
@@ -680,13 +720,13 @@ class _RunContext:
             sequential = [step for step in ready if not step.parallel_group]
             if parallel:
                 outcome = await self._run_parallel(parallel)
-                if outcome in ("awaiting_approval", "failed", "cancelled"):
+                if outcome in ("awaiting_approval", "failed", "cancelled", "recovery_required"):
                     return outcome
                 if outcome == "replanned":
                     continue
             for step in sequential:
                 outcome = await self.run_step(step)
-                if outcome in ("awaiting_approval", "failed", "cancelled"):
+                if outcome in ("awaiting_approval", "failed", "cancelled", "recovery_required"):
                     return outcome
                 if outcome == "replanned":
                     break
@@ -704,7 +744,7 @@ class _RunContext:
                         cause_type=type(result).__name__, attempts=1, source="runtime",
                     )
                     return await self._finalize_failure(step, failure)
-                if result in ("awaiting_approval", "failed", "cancelled", "replanned"):
+                if result in ("awaiting_approval", "failed", "cancelled", "replanned", "recovery_required"):
                     return str(result)
         return "completed"
 
@@ -748,9 +788,6 @@ class _RunContext:
             )
             return "replayed"
 
-        if self._needs_approval(step) and not self.granted_approvals.get(step.step_id):
-            return await self._pause_for_approval(step)
-
         try:
             params = self._resolve_params(step)
         except BindingResolutionError as exc:
@@ -759,6 +796,11 @@ class _RunContext:
                 attempts=1, source="planner",
             )
             return await self._finalize_failure(step, failure)
+
+        # The approval gate binds the token to the exact step *and* its resolved arguments
+        # (FIX-06), so the parameters must be settled before the pause.
+        if self._needs_approval(step) and not self.granted_approvals.get(step.step_id):
+            return await self._pause_for_approval(step, params)
 
         try:
             self.budget.guard_step()
@@ -769,14 +811,50 @@ class _RunContext:
             )
             return await self._finalize_failure(step, failure)
 
+        # FIX-02: side effects are claimed in the durable ledger *before* they run, so a
+        # retry, a resume or a second worker can never repeat them.
+        side_effect = self._side_effect_of(step)
+        ledger_claimed = False
+        if side_effect in SIDE_EFFECT_STEPS:
+            claim = self.runtime.execution_ledger.claim(
+                self.run_id, step.step_id,
+                idempotency_key=idempotency_key, scope_key=self.context.scope_hash(),
+                side_effect=side_effect, attempt=1,
+            )
+            if not claim.granted:
+                if claim.status == "replay":
+                    self.outputs[step.key] = claim.replay_result
+                    if step.step_id not in self.completed_steps:
+                        self.completed_steps.append(step.step_id)
+                    self.trajectory.add_step(
+                        StepRecord(step_id=step.step_id, name=step.name, capability=step.capability,
+                                   status="replayed", output_key=step.key)
+                    )
+                    await self.save_checkpoint(step_id=step.step_id)
+                    return "replayed"
+                if claim.status == "recovery_required":
+                    return await self._enter_recovery(step, claim.record, reason=claim.detail)
+                failure = await self._register_failure(
+                    step, code="step_in_flight", message=claim.detail or "another attempt is running",
+                    cause_type="LedgerClaim", attempts=0, source="runtime",
+                )
+                return await self._finalize_failure(step, failure)
+            ledger_claimed = True
+            await self.emit_event(
+                "workflow.step.started",
+                {"step_id": step.step_id, "capability": step.capability, "name": step.name,
+                 "ledger": claim.status, "side_effect": side_effect},
+            )
+
         self.trajectory.add_step(
             StepRecord(step_id=step.step_id, name=step.name, capability=step.capability,
                        status="pending", output_key=step.key, started_at=_utcnow())
         )
-        await self.emit_event(
-            "workflow.step.started",
-            {"step_id": step.step_id, "capability": step.capability, "name": step.name},
-        )
+        if not ledger_claimed:
+            await self.emit_event(
+                "workflow.step.started",
+                {"step_id": step.step_id, "capability": step.capability, "name": step.name},
+            )
 
         attempts = max(0, int(step.max_retries)) + 1
         last_code, last_message, last_cause = "step_failed", "", ""
@@ -878,6 +956,18 @@ class _RunContext:
                 return "completed"
 
             if attempt < attempts and retryable:
+                if side_effect in SIDE_EFFECT_STEPS and last_code in AMBIGUOUS_ERROR_CODES:
+                    # The call was dispatched and its outcome is unknown: a retry could
+                    # duplicate the side effect, so the run holds for recovery (FIX-02).
+                    self.runtime.execution_ledger.mark_uncertain(
+                        self.run_id, step.step_id, f"{last_code}: {last_message}",
+                        idempotency_key=idempotency_key, scope_key=self.context.scope_hash(),
+                    )
+                    failure = await self._register_failure(
+                        step, code=last_code, message=last_message, cause_type=last_cause,
+                        attempts=attempt, source="adapter", duration_ms=duration,
+                    )
+                    return await self._enter_recovery(step, None, reason=last_code, failure=failure)
                 self.trajectory.add_retry(
                     RetryRecord(
                         step_id=step.step_id, capability=step.capability, attempt=attempt,
@@ -889,6 +979,17 @@ class _RunContext:
                 step, code=last_code, message=last_message, cause_type=last_cause,
                 attempts=attempt, source="adapter", duration_ms=duration,
             )
+            if side_effect in SIDE_EFFECT_STEPS:
+                if last_code in AMBIGUOUS_ERROR_CODES:
+                    self.runtime.execution_ledger.mark_uncertain(
+                        self.run_id, step.step_id, f"{last_code}: {last_message}",
+                        idempotency_key=idempotency_key, scope_key=self.context.scope_hash(),
+                    )
+                    return await self._enter_recovery(step, None, reason=last_code, failure=failure)
+                self.runtime.execution_ledger.fail(
+                    self.run_id, step.step_id, f"{last_code}: {last_message}",
+                    idempotency_key=idempotency_key, scope_key=self.context.scope_hash(),
+                )
             return await self._finalize_failure(step, failure)
 
         raise WorkflowRuntimeError("unreachable_step_loop", step.step_id)  # pragma: no cover
@@ -942,6 +1043,58 @@ class _RunContext:
         spec = self._spec_for(step)
         return bool(getattr(spec, "approval_required", False))
 
+    def _side_effect_of(self, step: PlanStep) -> str:
+        """Classify a step's side effect from the registry (never from the plan body)."""
+        spec = self._spec_for(step)
+        if spec is not None:
+            return str(getattr(spec, "side_effect", "write") or "write")
+        if step.capability.startswith("mcp."):
+            return "external"
+        if step.capability in ("workspace.rag.search", "office.xlsx.analyze", "office.docx.compare"):
+            return "read"
+        if step.capability == "office.pptx.generate":
+            return "write"
+        if step.capability == "workspace.file.write":
+            return "write"
+        # Unknown capability: assume it changes something and claim it.
+        return "write"
+
+    @staticmethod
+    def _approval_target(step: PlanStep, params: Mapping[str, Any]) -> Optional[str]:
+        for name in _APPROVAL_TARGET_PARAMS:
+            value = params.get(name)
+            if value not in (None, ""):
+                return f"{name}:{value}"[:200]
+        return None
+
+    async def _enter_recovery(
+        self,
+        step: PlanStep,
+        record: Optional[StepLedgerRecord],
+        *,
+        reason: str = "",
+        failure: Optional[FailureRecord] = None,
+    ) -> str:
+        """Hold the run: the previous attempt may have happened, so nothing is retried."""
+        self.status = "recovery_required"
+        self.recovery = {
+            "step_id": step.step_id,
+            "capability": step.capability,
+            "reason": reason or "unknown_outcome",
+            "ledger_status": getattr(record, "status", "uncertain") if record is not None else "uncertain",
+            "failure_code": (failure.code if failure is not None else reason),
+            "attempts": (failure.attempts if failure is not None else 0),
+        }
+        self.trajectory.metadata["recovery"] = dict(self.recovery)
+        self.error = {
+            "code": "recovery_required",
+            "message": f"step {step.step_id} ({step.capability}) outcome is unknown: {reason}",
+            "step_id": step.step_id,
+            "capability": step.capability,
+        }
+        await self.save_checkpoint(status="recovery_required", step_id=step.step_id)
+        return "recovery_required"
+
     def _spec_for(self, step: PlanStep) -> Any:
         if self.registry is None:
             return None
@@ -966,8 +1119,9 @@ class _RunContext:
 
         office = self.office
         if office is not None and capability in office.capabilities:
+            call_scope = AdapterCallScope.from_context(self.context)
             self.budget.guard_tool_call()
-            result = await office.invoke(capability, dict(params))
+            result = await office.invoke(capability, dict(params), call_scope=call_scope)
             if isinstance(result, OfficeResult) and not result.ok:
                 raise OfficeAdapterError("capability_failed", str(result.data)[:200])
             return (result.data if isinstance(result, OfficeResult) else result), "office", {}
@@ -991,6 +1145,9 @@ class _RunContext:
         spec = self._spec_for(step)
         if spec is None or self.registry is None:
             raise WorkflowRuntimeError("unknown_capability", capability)
+        # FIX-01: the AGCore tool policy decides whether *this service* may run the tool.
+        if self.runtime.tool_policy is not None:
+            self.runtime.tool_policy.authorize(spec, self.context)
         self.budget.guard_tool_call()
         granted = "read" if getattr(spec, "is_read_only", False) else "write"
         value = await self.registry.execute(
@@ -1011,14 +1168,25 @@ class _RunContext:
             self.ledger.complete(step.step_id, idempotency_key, value, context=self.context)
         except IdempotencyConflict:
             pass
+        if self._side_effect_of(step) in SIDE_EFFECT_STEPS:
+            self.runtime.execution_ledger.succeed(
+                self.run_id, step.step_id, value,
+                idempotency_key=idempotency_key, scope_key=self.context.scope_hash(),
+            )
         self.trajectory.close_step(step.step_id, status="completed", duration_ms=duration, attempt=attempt)
 
-    async def _pause_for_approval(self, step: PlanStep) -> str:
+    async def _pause_for_approval(self, step: PlanStep, params: Optional[Mapping[str, Any]] = None) -> str:
         self.pending_approval_id = f"apreq_{self.run_id}_{step.step_id}"
         self.status = "awaiting_approval"
+        args_hash = approval_args_hash(dict(params or {}))
+        target = self._approval_target(step, dict(params or {}))
         self.trajectory.metadata["pending_approval"] = {
-            "step_id": step.step_id, "capability": step.capability,
+            "step_id": step.step_id,
+            "capability": step.capability,
             "approval_id": self.pending_approval_id,
+            # FIX-06: what exactly the human is approving; the token is bound to these.
+            "target": target,
+            "args_hash": args_hash,
         }
         await self.dispatch_hook(
             HookEvent.ON_APPROVAL_REQUIRED,
@@ -1187,6 +1355,8 @@ class _RunContext:
         status = self.status
         if status == "awaiting_approval":
             self.trajectory.metadata["status_reason"] = "awaiting_human_approval"
+        elif status == "recovery_required":
+            self.trajectory.metadata["status_reason"] = "previous_attempt_outcome_unknown"
         await self.dispatch_hook(
             HookEvent.SESSION_END,
             {"run_id": self.run_id, "status": status, "completed_steps": list(self.completed_steps)},
@@ -1194,6 +1364,10 @@ class _RunContext:
         )
         self.trajectory.finish(status=status, latency_ms=self.elapsed_ms())
         await self.save_checkpoint(status="completed" if status == "direct_chat" else status)
+        if self.status == "cancelled" and status != "cancelled":
+            # A cancellation landed while this task was finishing; cancel wins (FIX-02).
+            status = "cancelled"
+            self.error = self.error or {"code": "workflow_cancelled", "message": "run cancelled by caller"}
         if status == "completed":
             await self.emit_event(
                 "workflow.completed",
@@ -1244,6 +1418,7 @@ class _RunContext:
             artifacts=[artifact.model_dump(mode="json") for artifact in self.artifacts],
             failures=list(self.failures),
             pending_approval=pending,
+            recovery=dict(self.recovery) if self.recovery else None,
             error=self.error,
             token_usage=self.trajectory.token_usage.model_dump(),
             duration_ms=round(self.elapsed_ms(), 3),
@@ -1269,6 +1444,9 @@ class WorkflowRuntime:
         store: Optional[WorkflowCheckpointStore] = None,
         approvals: Optional[ApprovalAuthority] = None,
         ledger: Optional[IdempotencyLedger] = None,
+        execution_ledger: Optional[ExecutionLedger] = None,
+        run_guard: Optional[RunExecutionGuard] = None,
+        tool_policy: Optional[ToolAccessPolicy] = None,
         planner: Optional[Planner] = None,
         max_steps: int = 10,
         max_retries: int = 2,
@@ -1286,6 +1464,11 @@ class WorkflowRuntime:
         self.store = store if store is not None else WorkflowCheckpointStore(backend="memory")
         # ``or`` would drop a valid but empty ledger/store because both define __len__.
         self.ledger = ledger if ledger is not None else IdempotencyLedger()
+        # FIX-02: durable, atomically claimed execution records for side-effecting steps.
+        self.execution_ledger = execution_ledger if execution_ledger is not None else ExecutionLedger()
+        self.run_guard = run_guard if run_guard is not None else RunExecutionGuard()
+        # FIX-01: optional AGCore tool policy gate for registry-backed capabilities.
+        self.tool_policy = tool_policy
         self.approvals = approvals if approvals is not None else ApprovalAuthority(uuid.uuid4().hex)
         self.planner = planner or Planner(
             skills=skills, registry=registry, rules=rules,
@@ -1433,6 +1616,7 @@ class WorkflowRuntime:
     ) -> WorkflowRunResult:
         self._validate_context(context)
         resolved_run_id = self._new_run_id(run_id or request.run_id)
+        lease = self._acquire_lease(resolved_run_id)
         self._cancel_events[resolved_run_id] = asyncio.Event()
         self._register_sink(resolved_run_id, emit)
         rc = _RunContext(self, run_id=resolved_run_id, request=request, context=context, emit=emit)
@@ -1440,6 +1624,7 @@ class WorkflowRuntime:
             return await self._execute(rc, entry="context_resolve")
         finally:
             self._sinks.pop(resolved_run_id, None)
+            self._release_lease(resolved_run_id, lease)
 
     async def resume(
         self,
@@ -1455,13 +1640,30 @@ class WorkflowRuntime:
             raise WorkflowRuntimeError("workflow_run_cancelled", run_id)
         if checkpoint.status == "completed":
             return self._stored_result(checkpoint)
+        if checkpoint.status == "recovery_required":
+            # FIX-02: an unknown-outcome side effect is never replayed automatically.
+            raise WorkflowRuntimeError(
+                "recovery_required",
+                f"{run_id}: resolve the uncertain step before resuming",
+            )
 
         if not (checkpoint.plan or {}).get("plan_id"):
             raise WorkflowRuntimeError("workflow_not_planned", run_id)
         plan = ExecutionPlan.model_validate(checkpoint.plan or {})
         granted: Dict[str, bool] = {}
         if checkpoint.pending_approval_id:
-            self.approvals.verify_user_approval(context, approval)
+            pending_step = self._pending_step_id(checkpoint, plan)
+            pending = (checkpoint.metadata or {}).get("pending_approval") or {}
+            # FIX-06: the token must match the run, the step, the capability *and* the
+            # exact arguments the pause recorded - not just "some valid approval".
+            expected = ApprovalBinding(
+                run_id=run_id,
+                step_id=pending.get("step_id") or pending_step,
+                capability=pending.get("capability"),
+                target=pending.get("target"),
+                args_hash=pending.get("args_hash"),
+            )
+            self.approvals.verify_user_approval(context, approval, expected=expected)
             token_approval_id = str(
                 getattr(approval, "approval_id", None)
                 or (approval.get("approval_id") if isinstance(approval, Mapping) else "")
@@ -1470,10 +1672,10 @@ class WorkflowRuntime:
                 raise ApprovalError(
                     "approval_mismatch", f"{token_approval_id} != {checkpoint.pending_approval_id}"
                 )
-            pending_step = self._pending_step_id(checkpoint, plan)
             if pending_step:
                 granted[pending_step] = True
 
+        lease = self._acquire_lease(run_id)
         self._cancel_events[run_id] = asyncio.Event()
         self._register_sink(run_id, emit)
         trajectory = WorkflowTrajectory.restore(self.store.load_trajectory(run_id), run_id=run_id)
@@ -1491,6 +1693,35 @@ class WorkflowRuntime:
             return await self._execute(rc, entry="execute_dag")
         finally:
             self._sinks.pop(run_id, None)
+            self._release_lease(run_id, lease)
+
+    # -- FIX-02 leases ------------------------------------------------------------------
+    def _acquire_lease(self, run_id: str) -> str:
+        try:
+            token = self.run_guard.acquire(run_id)
+        except RunBusy as exc:
+            raise WorkflowRuntimeError("run_in_progress", str(exc)) from exc
+        claim = getattr(self.store, "claim_run", None)
+        if claim is not None:
+            try:
+                claimed = bool(claim(run_id, holder=token))
+            except Exception:  # noqa: BLE001 - a store without leases must not block the run
+                claimed = True
+            if not claimed:
+                self.run_guard.release(run_id, token)
+                raise WorkflowRuntimeError("run_in_progress", f"{run_id}: lease held by another executor")
+        return token
+
+    def _release_lease(self, run_id: str, token: Optional[str]) -> None:
+        if not token:
+            return
+        release = getattr(self.store, "release_run", None)
+        if release is not None:
+            try:
+                release(run_id, token)
+            except Exception:  # noqa: BLE001
+                pass
+        self.run_guard.release(run_id, token)
 
     async def approve(
         self,
@@ -1505,12 +1736,84 @@ class WorkflowRuntime:
             raise WorkflowRuntimeError("approval_not_required", run_id)
         if checkpoint.status in ("completed", "cancelled", "failed"):
             raise WorkflowRuntimeError("workflow_run_terminal", f"{run_id}:{checkpoint.status}")
+        pending = (checkpoint.metadata or {}).get("pending_approval") or {}
+        pending_step_id = pending.get("step_id")
+        if not pending_step_id and checkpoint.plan:
+            try:
+                pending_step_id = self._pending_step_id(
+                    checkpoint, ExecutionPlan.model_validate(checkpoint.plan)
+                )
+            except Exception:  # noqa: BLE001 - a corrupt plan must not block the approval
+                pending_step_id = None
+        # FIX-06: the approver is the authenticated owner, and the token is bound to the
+        # exact run/step/capability/arguments recorded when the pause was written.
         return self.approvals.issue_user_approval(
             context,
             approved_by=(approved_by or context.owner_id),
             ttl_seconds=ttl_seconds,
             approval_id=checkpoint.pending_approval_id,
+            run_id=run_id,
+            step_id=pending_step_id,
+            capability=pending.get("capability"),
+            target=pending.get("target"),
+            args_hash=pending.get("args_hash"),
         )
+
+    async def resolve_recovery(
+        self,
+        run_id: str,
+        context: ExecutionContext,
+        *,
+        action: str,
+        resolved_by: Optional[str] = None,
+    ) -> WorkflowCheckpoint:
+        """Explicitly leave a ``recovery_required`` hold (FIX-02).
+
+        ``retry``     — the operator confirmed the side effect did not happen; the ledger
+                        record is released so the next resume may claim it again.
+        ``abandon``   — the operator accepts the ambiguity; the run is failed and stays
+                        failed (no side effect is repeated).
+        """
+        checkpoint = self.store.load(run_id, context=context)
+        if checkpoint.status != "recovery_required":
+            raise WorkflowRuntimeError("workflow_not_in_recovery", f"{run_id}:{checkpoint.status}")
+        recovery = (checkpoint.metadata or {}).get("recovery") or {}
+        step_id = recovery.get("step_id")
+        if action not in ("retry", "abandon"):
+            raise WorkflowRuntimeError("invalid_recovery_action", action, http_status=400)
+
+        if action == "retry":
+            if step_id:
+                record = self.execution_ledger.lookup(
+                    run_id, step_id, idempotency_key=f"{run_id}:{step_id}",
+                    scope_key=context.scope_hash(),
+                )
+                if record is not None and record.status == "uncertain":
+                    # Turn the ambiguous record into a recorded failure: the *operator*
+                    # decided nothing happened, so a retry may claim it again.
+                    self.execution_ledger.fail(
+                        run_id, step_id, "retry_confirmed_by_operator",
+                        idempotency_key=f"{run_id}:{step_id}", scope_key=context.scope_hash(),
+                    )
+            updated = self.store.compare_and_set_status(
+                run_id, expected=("recovery_required",), status="awaiting_approval" if checkpoint.pending_approval_id else "running",
+                metadata={"recovery": None, "recovery_resolved_by": resolved_by or context.owner_id,
+                          "recovery_action": action},
+                context=context,
+            )
+            if updated is None:
+                raise WorkflowRuntimeError("recovery_resolution_conflict", run_id)
+            return updated
+
+        updated = self.store.compare_and_set_status(
+            run_id, expected=("recovery_required",), status="failed",
+            clear_pending_approval=True,
+            metadata={"recovery_action": action, "recovery_resolved_by": resolved_by or context.owner_id},
+            context=context,
+        )
+        if updated is None:
+            raise WorkflowRuntimeError("recovery_resolution_conflict", run_id)
+        return updated
 
     async def cancel(self, run_id: str, context: ExecutionContext) -> WorkflowCheckpoint:
         checkpoint = self.store.load(run_id, context=context)
@@ -1521,7 +1824,21 @@ class WorkflowRuntime:
         event = self._cancel_events.get(run_id)
         if event is not None:
             event.set()
-        updated = self.store.set_status(run_id, "cancelled", clear_pending_approval=True, context=context)
+        # FIX-02: cancellation is an atomic compare-and-set, so a completion that lands in
+        # the same instant cannot overwrite it (and vice versa: cancel cannot overwrite an
+        # already completed run, which is refused above).
+        updated = self.store.compare_and_set_status(
+            run_id,
+            expected=("pending", "running", "awaiting_approval", "recovery_required"),
+            status="cancelled", clear_pending_approval=True, context=context,
+        )
+        if updated is None:
+            current = self.store.load(run_id, context=context)
+            if current.status == "completed":
+                raise WorkflowRuntimeError("workflow_run_completed", run_id)
+            if current.status == "cancelled":
+                return current
+            raise WorkflowRuntimeError("workflow_cancel_conflict", f"{run_id}:{current.status}")
         trajectory = WorkflowTrajectory.restore(self.store.load_trajectory(run_id), run_id=run_id)
         trajectory.finish(status="cancelled", latency_ms=trajectory.execution_latency_ms)
         self.store.save(updated, trajectory=trajectory.to_dict())

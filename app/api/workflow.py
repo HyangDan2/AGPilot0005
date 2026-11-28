@@ -27,12 +27,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import settings
-from app.core.auth import ExecutionScope, require_authenticated_caller
+from app.core.auth import ExecutionScope, require_admin_caller, require_authenticated_caller
 from app.schemas.events import SSEEvent
 from app.workflow import build_workflow_stack
 from app.workflow.checkpoint import WorkflowCheckpoint, WorkflowCheckpointStore, default_checkpoint_path
+from app.workflow.isolation import require_mcp_admin
+from app.workflow.ledger import default_ledger_path
 from app.workflow.mcp import MCPConfigError, MCPError, MCPRegistrationError, MCPServerConfig
-from app.workflow.office_adapter import OfficeAdapterError, get_office_adapter
+from app.workflow.office_adapter import OFFICE_CAPABILITIES, OfficeAdapterError, get_office_adapter
 from app.workflow.planner import PlannerError, PlannerRequest
 from app.workflow.runtime import (
     WorkflowRunRequest,
@@ -40,11 +42,14 @@ from app.workflow.runtime import (
     WorkflowRuntimeError,
 )
 from app.workflow.safety import ApprovalError, ExecutionContext, ScopeViolation
+from app.workflow.scope import ExecutionScopeAuthority, R2WorkspaceResolver, ToolAccessPolicy
+from app.workflow.transport import MCPTransportError
 
 __all__ = [
     "router",
     "WorkflowService",
     "get_workflow_service",
+    "peek_workflow_service",
     "reset_workflow_service",
     "set_workflow_service",
 ]
@@ -85,8 +90,16 @@ class ResumeBody(BaseModel):
 class ApproveBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    # Deprecated input: kept only so an old client does not break.  The approver is always
+    # the authenticated caller (FIX-06); a value that disagrees is refused.
     approved_by: Optional[str] = None
     ttl_seconds: int = 300
+
+
+class RecoveryBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    action: Literal["retry", "abandon"]
 
 
 class MCPServerBody(BaseModel):
@@ -101,6 +114,13 @@ class MCPServerBody(BaseModel):
     credential_ref: Optional[str] = None
     description: str = ""
     connect: bool = True
+    # -- FIX-07: server policy is declared by the administrator, not by the server
+    tool_policies: Dict[str, str] = Field(default_factory=dict)
+    policy_mode: Literal["advisory", "strict"] = "strict"
+    shared: bool = False
+    allowed_hosts: List[str] = Field(default_factory=list)
+    command_allowlist: List[str] = Field(default_factory=list)
+    allow_private_network: bool = False
 
 
 # --------------------------------------------------------------------------------------
@@ -138,13 +158,32 @@ class WorkflowService:
         checkpoint_path: Optional[str] = None,
         checkpoint_backend: str = "sqlite",
         workspace_root: Optional[str] = None,
+        scope_authority: Optional[ExecutionScopeAuthority] = None,
+        tool_policy: Optional[ToolAccessPolicy] = None,
+        ledger_path: Optional[str] = None,
+        ledger_backend: str = "sqlite",
+        gateway: Optional[Any] = None,
+        enable_llm_planner: Optional[bool] = None,
     ) -> None:
+        # FIX-01: server-side attribution for conversation/workspace (replaceable in tests).
+        self.scope_authority = scope_authority or ExecutionScopeAuthority(R2WorkspaceResolver())
+        self.tool_policy = tool_policy or ToolAccessPolicy()
+        self.last_scope_evidence: Dict[str, Any] = {}
         if runtime is not None:
             self.runtime = runtime
             self.office = runtime.office
+            # An injected runtime still gets the service's policy gates (FIX-01 / FIX-08).
+            if getattr(runtime, "tool_policy", None) is None:
+                runtime.tool_policy = self.tool_policy
             return
         self.office = _default_office_adapter() if office is _DEFAULT_OFFICE else office
-        stack = build_workflow_stack(workspace_root=workspace_root)
+        stack = build_workflow_stack(
+            workspace_root=workspace_root,
+            ledger_path=ledger_path or str(default_ledger_path()),
+            ledger_backend=ledger_backend,  # type: ignore[arg-type]
+            gateway=gateway,
+            enable_llm_planner=enable_llm_planner,
+        )
         store = WorkflowCheckpointStore(
             checkpoint_path or str(default_checkpoint_path()), backend=checkpoint_backend,  # type: ignore[arg-type]
         )
@@ -158,6 +197,10 @@ class WorkflowService:
             store=store,
             approvals=stack.safety["approvals"],
             ledger=stack.safety["idempotency"],
+            execution_ledger=stack.safety.get("execution_ledger"),
+            run_guard=stack.safety.get("run_guard"),
+            tool_policy=self.tool_policy,
+            planner=stack.planner,
             max_steps=stack.budget.max_step_budget,
             max_tool_calls=stack.budget.max_tool_calls,
             max_context_tokens=stack.budget.max_context_tokens,
@@ -165,20 +208,20 @@ class WorkflowService:
         )
 
     # -- scope helpers ----------------------------------------------------------------
-    @staticmethod
-    def execution_context(scope: ExecutionScope, request: WorkflowRunRequest) -> ExecutionContext:
-        context = request.context or {}
+    def execution_context(self, scope: ExecutionScope, request: WorkflowRunRequest) -> ExecutionContext:
+        """Build the run's execution context from the credential + server-side binding.
+
+        The body never contributes tenant/owner/role (FIX-01): an attempt to set them is
+        refused with ``body_scope_overrides_forbidden`` before anything executes.
+        """
         try:
-            return ExecutionContext(
-                tenant_id=scope.tenant_id,
-                owner_id=scope.owner_id,
-                service_id=scope.service_id or None,
-                session_id=_clean(context.get("session_id")),
-                conversation_id=_clean(context.get("conversation_id")),
-                workspace_id=_clean(context.get("workspace_id")),
-            )
+            resolved, _evidence = self.scope_authority.resolve(scope, request.context or {})
+        except ScopeViolation as exc:
+            raise _http(403, exc.code, str(exc)) from exc
         except ValueError as exc:
             raise _http(400, "invalid_scope", str(exc)) from exc
+        self.last_scope_evidence = dict(_evidence.as_dict())
+        return resolved
 
     def authorize_run(self, run_id: str, scope: ExecutionScope) -> WorkflowCheckpoint:
         checkpoint = self.runtime.store.load_raw(run_id)
@@ -196,27 +239,39 @@ class WorkflowService:
             raise _http(404, "workflow_run_not_found", f"no workflow run {run_id}")
         return checkpoint
 
-    @staticmethod
-    def run_context(scope: ExecutionScope, checkpoint: WorkflowCheckpoint) -> ExecutionContext:
-        """Rebuild the run's execution context and re-verify its scope (WP-10).
+    def run_context(self, scope: ExecutionScope, checkpoint: WorkflowCheckpoint) -> ExecutionContext:
+        """Rebuild the run's execution context and re-verify its scope (WP-10 / FIX-01).
 
-        The stored session/conversation/workspace dimensions are restored so
-        :func:`assert_scope_access` compares them, while tenant/owner/service come from
-        the authenticated credential.
+        Beyond comparing the stored dimensions, the workspace/conversation binding is
+        re-resolved against the *current* server-side state, so a revoked workspace or a
+        released conversation blocks the resume instead of inheriting an old decision.
         """
         stored = checkpoint.scope or {}
         admin_transfer = scope.is_admin and str(stored.get("tenant_id")) != str(scope.tenant_id)
+        identity = (
+            (str(stored.get("tenant_id")), str(stored.get("owner_id")), stored.get("service_id"))
+            if admin_transfer else None
+        )
         try:
-            return ExecutionContext(
-                tenant_id=str(stored.get("tenant_id")) if admin_transfer else scope.tenant_id,
-                owner_id=str(stored.get("owner_id")) if admin_transfer else scope.owner_id,
-                service_id=(stored.get("service_id") or scope.service_id) if admin_transfer else scope.service_id,
-                session_id=stored.get("session_id"),
-                conversation_id=stored.get("conversation_id"),
-                workspace_id=stored.get("workspace_id"),
-            )
+            resolved, _evidence = self.scope_authority.revalidate(scope, stored, identity=identity)
+        except ScopeViolation as exc:
+            raise _http(404, "workflow_run_not_found", str(exc)) from exc
         except ValueError as exc:
             raise _http(404, "workflow_run_not_found", str(exc)) from exc
+        return resolved
+
+    # -- capability catalogue (FIX-08) --------------------------------------------------
+    def office_availability(self) -> Dict[str, Dict[str, Any]]:
+        office = self.runtime.office
+        if office is None:
+            return {
+                capability: {
+                    "capability": capability, "status": "unavailable", "adapter": "none",
+                    "detail": "office_adapter_not_configured",
+                }
+                for capability in OFFICE_CAPABILITIES
+            }
+        return office.availability_report()
 
 
 def _clean(value: Any) -> Optional[str]:
@@ -236,6 +291,11 @@ def get_workflow_service() -> WorkflowService:
         with _SERVICE_LOCK:
             if _SERVICE is None:
                 _SERVICE = WorkflowService()
+    return _SERVICE
+
+
+def peek_workflow_service() -> Optional[WorkflowService]:
+    """The already-wired service, or ``None`` - never constructs one (FIX-04)."""
     return _SERVICE
 
 
@@ -261,6 +321,16 @@ router = APIRouter(
 
 def _service() -> WorkflowService:
     return get_workflow_service()
+
+
+#: Roles that may stand in for a human approval (mirrors the Canvas approval boundary).
+_INTERACTIVE_ROLES = frozenset({"user", "owner", "admin", "admiral"})
+
+
+def _is_interactive_principal(scope: ExecutionScope) -> bool:
+    if not getattr(scope, "authenticated", False):
+        return False
+    return str(scope.role or "").lower() in _INTERACTIVE_ROLES
 
 
 def _sse(payload: Dict[str, Any]) -> str:
@@ -293,7 +363,7 @@ async def plan_workflow(
         available_capabilities=tuple(body.available_capabilities),
     )
     try:
-        decision = service.runtime.planner.plan(request)
+        decision = await service.runtime.planner.aplan(request)
     except PlannerError as exc:
         raise _http(422, exc.code, str(exc)) from exc
     planner = service.runtime.planner
@@ -301,6 +371,8 @@ async def plan_workflow(
         status_code=200,
         content={
             **decision.explain(),
+            "planner_source": planner.last_plan_source,
+            "planner_error": planner.last_llm_error,
             "fast_path": {
                 "model_calls": planner.model_calls,
                 "skill_loads": planner.skill_loads,
@@ -326,7 +398,7 @@ async def create_run(
             raise _http(exc.http_status, exc.code, exc.detail) from exc
         except ScopeViolation as exc:
             raise _http(403, exc.code, str(exc)) from exc
-        status_code = 202 if result.status == "awaiting_approval" else 200
+        status_code = 202 if result.status in ("awaiting_approval", "recovery_required") else 200
         return JSONResponse(status_code=status_code, content=result.model_dump(mode="json"))
 
     async def event_stream():
@@ -401,18 +473,57 @@ async def resume_run(
     return JSONResponse(status_code=200, content=result.model_dump(mode="json"))
 
 
+@router.post("/runs/{run_id}/recovery")
+async def resolve_recovery(
+    run_id: str,
+    body: RecoveryBody,
+    scope: ExecutionScope = Depends(require_authenticated_caller),
+) -> JSONResponse:
+    """FIX-02: explicitly leave a ``recovery_required`` hold (an uncertain side effect)."""
+    service = _service()
+    checkpoint = service.authorize_run(run_id, scope)
+    context = service.run_context(scope, checkpoint)
+    try:
+        updated = await service.runtime.resolve_recovery(
+            run_id, context, action=body.action, resolved_by=scope.owner_id,
+        )
+    except ScopeViolation as exc:
+        raise _http(404, "workflow_run_not_found", str(exc)) from exc
+    except WorkflowRuntimeError as exc:
+        raise _http(exc.http_status, exc.code, exc.detail) from exc
+    return JSONResponse(
+        status_code=200,
+        content={
+            "run_id": run_id,
+            "checkpoint": updated.public_view(),
+            "next": (
+                "POST /agent/workflows/runs/{run_id}/resume"
+                if body.action == "retry" else "run is failed; no side effect was repeated"
+            ),
+        },
+    )
+
+
 @router.post("/runs/{run_id}/approve")
 async def approve_run(
     run_id: str,
     body: ApproveBody,
     scope: ExecutionScope = Depends(require_authenticated_caller),
 ) -> JSONResponse:
+    """Issue a one-time approval token bound to this run/step/arguments (FIX-06).
+
+    The approver is the authenticated caller.  A machine principal (``service``/``tool``/
+    ``system``) can never approve on a user's behalf, and a body that names a different
+    approver is refused instead of silently trusted.
+    """
     service = _service()
+    if not _is_interactive_principal(scope):
+        raise _http(403, "approval_requires_user_principal", f"role={scope.role}")
     checkpoint = service.authorize_run(run_id, scope)
     context = service.run_context(scope, checkpoint)
     try:
         token = await service.runtime.approve(
-            run_id, context, approved_by=body.approved_by, ttl_seconds=body.ttl_seconds,
+            run_id, context, approved_by=scope.owner_id, ttl_seconds=body.ttl_seconds,
         )
     except ApprovalError as exc:
         raise _http(403, exc.code, str(exc)) from exc
@@ -425,6 +536,7 @@ async def approve_run(
         content={
             "run_id": run_id,
             "approval": token.model_dump(mode="json"),
+            "approved_by_source": "authenticated_scope",
             "next": "POST /agent/workflows/runs/{run_id}/resume with {\"approval\": <token>}",
         },
     )
@@ -453,6 +565,11 @@ async def list_tools(
 ) -> JSONResponse:
     service = _service()
     runtime = service.runtime
+    context = None
+    try:
+        context = service.execution_context(scope, WorkflowRunRequest(context={}))
+    except HTTPException:
+        context = None
     specs = runtime.registry.list_specs() if runtime.registry is not None else []
     return JSONResponse(
         status_code=200,
@@ -470,7 +587,11 @@ async def list_tools(
                 for spec in specs
             ],
             "office_capabilities": list(runtime.office.capabilities) if runtime.office is not None else [],
-            "mcp": runtime.mcp.describe() if runtime.mcp is not None else {"servers": []},
+            # FIX-08: a capability the runtime cannot serve is reported as unavailable
+            # instead of being silently answered by a stand-in implementation.
+            "office_availability": service.office_availability(),
+            # FIX-07: only servers this caller may see are described, endpoints masked.
+            "mcp": runtime.mcp.describe(context) if runtime.mcp is not None else {"servers": []},
         },
     )
 
@@ -497,6 +618,8 @@ async def register_mcp_server(
     body: MCPServerBody,
     scope: ExecutionScope = Depends(require_authenticated_caller),
 ) -> JSONResponse:
+    """Register (and optionally connect) an MCP server — administrator only (FIX-07)."""
+    require_mcp_admin(scope)
     service = _service()
     runtime = service.runtime
     if runtime.mcp is None:
@@ -511,16 +634,31 @@ async def register_mcp_server(
             max_retries=body.max_retries,
             credential_ref=body.credential_ref,
             description=body.description,
+            # The server belongs to the registering administrator's scope unless shared.
+            tenant_id=None if body.shared else scope.tenant_id,
+            owner_id=None if body.shared else scope.owner_id,
+            service_id=None if body.shared else (scope.service_id or None),
+            shared=body.shared,
+            tool_policies=dict(body.tool_policies),
+            policy_mode=body.policy_mode,
+            allowed_hosts=tuple(body.allowed_hosts),
+            command_allowlist=tuple(body.command_allowlist),
+            allow_private_network=body.allow_private_network,
         )
         runtime.mcp.register_server(config)
     except MCPRegistrationError as exc:
         raise _http(409, "mcp_server_exists", str(exc)) from exc
     except MCPConfigError as exc:
         raise _http(400, "mcp_config_invalid", str(exc)) from exc
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         raise _http(400, "mcp_config_invalid", str(exc)) from exc
 
-    report: Dict[str, Any] = {"server_id": config.server_id, "state": runtime.mcp.state(config.server_id).value}
+    report: Dict[str, Any] = {
+        "server_id": config.server_id,
+        "state": runtime.mcp.state(config.server_id).value,
+        "policy_mode": config.policy_mode,
+        "access": config.access.as_dict(),
+    }
     if body.connect:
         try:
             await runtime.mcp.connect(config.server_id)
@@ -533,7 +671,48 @@ async def register_mcp_server(
                     "reasons": dict(discovery.reasons),
                 }
             )
-        except MCPError as exc:
+        except (MCPError, MCPTransportError) as exc:
             report.update({"state": runtime.mcp.state(config.server_id).value, "error": str(exc)})
             return JSONResponse(status_code=202, content=report)
     return JSONResponse(status_code=201, content=report)
+
+
+@router.get("/mcp/servers")
+async def list_mcp_servers(
+    scope: ExecutionScope = Depends(require_authenticated_caller),
+) -> JSONResponse:
+    """List the servers visible to this caller (their own + shared), endpoints masked."""
+    service = _service()
+    runtime = service.runtime
+    if runtime.mcp is None:
+        return JSONResponse(status_code=200, content={"servers": []})
+    try:
+        context = service.execution_context(scope, WorkflowRunRequest(context={}))
+    except HTTPException:
+        context = None
+    return JSONResponse(status_code=200, content=runtime.mcp.describe(context))
+
+
+@router.delete("/mcp/servers/{server_id}")
+async def delete_mcp_server(
+    server_id: str,
+    scope: ExecutionScope = Depends(require_authenticated_caller),
+) -> JSONResponse:
+    """Remove a server and close its transport — administrator only (FIX-07)."""
+    require_mcp_admin(scope)
+    service = _service()
+    runtime = service.runtime
+    if runtime.mcp is None:
+        raise _http(503, "mcp_unavailable", "MCP manager is not configured")
+    if server_id not in runtime.mcp.servers():
+        raise _http(404, "mcp_server_not_found", server_id)
+    await runtime.mcp.close(server_id)
+    specs = [
+        spec.qualified_name for spec in (runtime.registry.list_specs() if runtime.registry else [])
+        if spec.qualified_name.startswith(f"mcp.{server_id}.")
+    ]
+    if runtime.registry is not None:
+        for name in specs:
+            runtime.registry.unregister(name)
+    runtime.mcp.unregister_server(server_id)
+    return JSONResponse(status_code=200, content={"server_id": server_id, "removed_tools": specs})

@@ -58,6 +58,9 @@ from app.workflow.mcp import (
     MCPToolDenied,
     MCPToolResult,
     MCPUnavailable,
+    TOOL_POLICY_VALUES,
+    default_client_factory,
+    unavailable_client_factory,
 )
 from app.workflow.office_adapter import (
     MockOfficeAdapter,
@@ -89,6 +92,7 @@ from app.workflow.rules import (
 )
 from app.workflow.safety import (
     ApprovalAuthority,
+    ApprovalBinding,
     ApprovalError,
     ApprovalRecord,
     ApprovalToken,
@@ -99,17 +103,40 @@ from app.workflow.safety import (
     PromptInjectionError,
     PromptInjectionGuard,
     ScopeViolation,
+    approval_args_hash,
     assert_scope_access,
+)
+from app.workflow.ledger import (
+    ExecutionLedger,
+    LedgerClaim,
+    RunBusy,
+    RunExecutionGuard,
+    StepLedgerRecord,
+)
+from app.workflow.scope import (
+    ExecutionScopeAuthority,
+    R2WorkspaceResolver,
+    ScopeEvidence,
+    ToolAccessPolicy,
+)
+from app.workflow.transport import (
+    MCPTransportError,
+    MCPTransportTimeout,
+    StdioMCPClient,
+    StreamableHTTPMCPClient,
 )
 from app.workflow.planner import (
     BindingResolutionError,
     BindingResolver,
     ExecutionPlan,
+    LLMPlannerAdapter,
+    LLMPlannerError,
     PlanStep,
     Planner,
     PlannerDecision,
     PlannerError,
     PlannerRequest,
+    build_llm_planner,
     resolve_bindings,
     validate_plan_dag,
 )
@@ -153,9 +180,16 @@ from app.workflow.skills import (
 __all__ = [
     # safety
     "ExecutionContext", "assert_scope_access", "ScopeViolation",
-    "ApprovalToken", "ApprovalRecord", "ApprovalError", "ApprovalAuthority",
+    "ApprovalToken", "ApprovalBinding", "ApprovalRecord", "ApprovalError", "ApprovalAuthority",
+    "approval_args_hash",
     "PromptInjectionGuard", "PromptInjectionError",
     "IdempotencyLedger", "IdempotencyRecord", "IdempotencyConflict",
+    # ledger / concurrency (FIX-02)
+    "ExecutionLedger", "LedgerClaim", "StepLedgerRecord", "RunExecutionGuard", "RunBusy",
+    # scope authority (FIX-01)
+    "ExecutionScopeAuthority", "R2WorkspaceResolver", "ScopeEvidence", "ToolAccessPolicy",
+    # transport (FIX-03)
+    "StdioMCPClient", "StreamableHTTPMCPClient", "MCPTransportError", "MCPTransportTimeout",
     # registry
     "UnifiedToolSpec", "UnifiedToolRegistry", "ToolCollisionError",
     "DuplicateCapabilityError", "ToolNotFound",
@@ -173,7 +207,8 @@ __all__ = [
     "MCPServerConfig", "MCPClientManager", "MCPState", "MCPDiscoveryReport",
     "MCPToolResult", "MCPHealth", "MCPResource", "MCPPrompt", "CredentialStore",
     "MCPConfigError", "MCPUnavailable", "MCPToolDenied", "MCPApprovalRequired",
-    "MCPRegistrationError", "MCPError",
+    "MCPRegistrationError", "MCPError", "TOOL_POLICY_VALUES",
+    "default_client_factory", "unavailable_client_factory",
     # budget
     "ContextBudgetManager", "ContextSegment", "ContextKind", "BudgetPlan",
     "CompactionResult", "BudgetExceeded",
@@ -183,6 +218,7 @@ __all__ = [
     "OFFICE_CAPABILITIES", "get_office_adapter", "assert_adapter_allowed",
     # planner
     "Planner", "PlannerRequest", "PlannerDecision", "PlannerError",
+    "LLMPlannerAdapter", "LLMPlannerError", "build_llm_planner",
     "ExecutionPlan", "PlanStep", "BindingResolver", "BindingResolutionError",
     "resolve_bindings", "validate_plan_dag",
     # checkpoint
@@ -212,6 +248,7 @@ class WorkflowStack:
     safety: dict = field(default_factory=dict)
     mcp: Optional[MCPClientManager] = None
     office: Optional[OfficeCapabilityAdapter] = None
+    planner: Optional[Planner] = None
 
 
 def build_workflow_stack(
@@ -222,11 +259,18 @@ def build_workflow_stack(
     workspace_root: Optional[str] = None,
     office_adapter: Optional[OfficeCapabilityAdapter] = None,
     approval_secret: Optional[str] = None,
+    ledger_path: Optional[str] = None,
+    ledger_backend: str = "memory",
+    gateway: Optional[object] = None,
+    enable_llm_planner: Optional[bool] = None,
 ) -> WorkflowStack:
     """Construct the engines in dependency order (no network, no FastAPI).
 
     ``approval_secret`` defaults to a fresh random secret: approval tokens are only
     meaningful inside the process that issued them, never across restarts.
+    ``ledger_backend="sqlite"`` gives the FIX-02 execution ledger a durable store; the
+    default in-memory ledger is for tests.  The LLM planner (FIX-05) is only attached when
+    it is explicitly enabled, so the deterministic planner remains the default.
     """
     import secrets
 
@@ -244,8 +288,15 @@ def build_workflow_stack(
         "approvals": ApprovalAuthority(approval_secret or secrets.token_urlsafe(32)),
         "injection": PromptInjectionGuard(),
         "idempotency": IdempotencyLedger(),
+        "execution_ledger": ExecutionLedger(path=ledger_path, backend=ledger_backend),  # type: ignore[arg-type]
+        "run_guard": RunExecutionGuard(),
     }
     mcp = MCPClientManager(registry, injection_guard=safety["injection"])
+    llm = build_llm_planner(gateway, registry=registry, enabled=enable_llm_planner)
+    planner = Planner(
+        skills=skills, registry=registry, rules=rules, max_steps=max_step_budget,
+        max_estimated_tokens=max_context_tokens, llm=llm,
+    )
     return WorkflowStack(
         registry=registry,
         skills=skills,
@@ -255,4 +306,5 @@ def build_workflow_stack(
         safety=safety,
         mcp=mcp,
         office=office_adapter,
+        planner=planner,
     )

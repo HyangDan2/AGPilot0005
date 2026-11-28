@@ -27,8 +27,22 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Seque
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.workflow.isolation import (
+    MCPSecurityError,
+    MCPServerAccess,
+    assert_server_access,
+    mask_endpoint,
+    validate_command,
+    validate_endpoint,
+)
 from app.workflow.registry import UnifiedToolRegistry, UnifiedToolSpec
 from app.workflow.safety import ExecutionContext, PromptInjectionGuard
+from app.workflow.transport import (
+    MCPTransportError,
+    MCPTransportTimeout,
+    StdioMCPClient,
+    StreamableHTTPMCPClient,
+)
 
 __all__ = [
     "MCPTransport",
@@ -51,12 +65,20 @@ __all__ = [
     "CredentialStore",
     "MCPClientManager",
     "default_client_factory",
+    "unavailable_client_factory",
+    "TOOL_POLICY_VALUES",
 ]
 
 MCPTransport = str
 _SERVER_ID = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,47}$")
 _TOOL_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,95}$")
 _INLINE_SECRET = re.compile(r"(?:bearer\s+[A-Za-z0-9\-._~+/]{12,}|^sk-[A-Za-z0-9_\-]{8,}$|^ghp_[A-Za-z0-9]{16,}$)", re.I)
+
+#: Per-tool policy a server owner may declare at registration.  This declaration, not the
+#: server's own annotation, is what decides side effects and the approval gate (FIX-07).
+TOOL_POLICY_VALUES: Tuple[str, ...] = (
+    "read_only", "read", "write", "external", "destructive", "approval_required",
+)
 
 
 class MCPState(str, Enum):
@@ -105,6 +127,16 @@ class MCPServerConfig(BaseModel):
     max_retries: int = 2
     credential_ref: Optional[str] = None
     description: str = ""
+    # -- FIX-07: ownership, per-tool server policy and egress policy
+    tenant_id: Optional[str] = None
+    owner_id: Optional[str] = None
+    service_id: Optional[str] = None
+    shared: bool = False
+    tool_policies: Dict[str, str] = Field(default_factory=dict)
+    policy_mode: str = "advisory"
+    allowed_hosts: Tuple[str, ...] = ()
+    command_allowlist: Tuple[str, ...] = ()
+    allow_private_network: bool = False
 
     @field_validator("server_id")
     @classmethod
@@ -166,7 +198,41 @@ class MCPServerConfig(BaseModel):
             raise ValueError("mcp_http_url_required")
         if self.transport == "stdio" and target.startswith(("http://", "https://")):
             raise ValueError("mcp_stdio_command_required")
+        if self.policy_mode not in ("advisory", "strict"):
+            raise ValueError("invalid_mcp_policy_mode")
+        unknown = [name for name in self.tool_policies if self.tool_policies[name] not in TOOL_POLICY_VALUES]
+        if unknown:
+            raise ValueError(f"invalid_mcp_tool_policy: {','.join(sorted(unknown))}")
+        try:
+            if self.transport == "streamable_http":
+                validate_endpoint(target, allowed_hosts=self.allowed_hosts,
+                                  allow_private_network=self.allow_private_network)
+            else:
+                validate_command(target, allowlist=self.command_allowlist)
+        except MCPSecurityError as exc:
+            raise ValueError(exc.code) from exc
         return self
+
+    @property
+    def access(self) -> MCPServerAccess:
+        return MCPServerAccess(
+            tenant_id=self.tenant_id, owner_id=self.owner_id,
+            service_id=self.service_id, shared=self.shared,
+        )
+
+    def public_view(self) -> Dict[str, Any]:
+        """Registration view: endpoints and credentials are masked (FIX-07)."""
+        return {
+            "server_id": self.server_id,
+            "transport": self.transport,
+            "endpoint": mask_endpoint(self.command_or_url),
+            "allowed_tools": list(self.allowed_tools),
+            "credential_ref": self.credential_ref,
+            "description": self.description,
+            "policy_mode": self.policy_mode,
+            "tool_policies": dict(self.tool_policies),
+            "access": self.access.as_dict(),
+        }
 
 
 class MCPToolDefinition(BaseModel):
@@ -322,7 +388,25 @@ class _UnavailableClient:
         return None
 
 
-def default_client_factory(config: MCPServerConfig, _secret: Optional[str]) -> MCPClient:
+def default_client_factory(config: MCPServerConfig, secret: Optional[str]) -> MCPClient:
+    """Real MCP transport for the declared transport (FIX-03).
+
+    ``stdio`` starts the declared command; ``streamable_http`` POSTs JSON-RPC to the
+    declared endpoint.  The credential (``credential_ref``) is attached as a bearer header
+    and never appears in a log or a repr.
+    """
+    headers: Dict[str, str] = {}
+    if secret:
+        headers["authorization"] = f"Bearer {secret}"
+    if config.transport == "stdio":
+        return StdioMCPClient(config.command_or_url, timeout_seconds=config.timeout_seconds)
+    return StreamableHTTPMCPClient(
+        config.command_or_url, timeout_seconds=config.timeout_seconds, headers=headers,
+    )
+
+
+def unavailable_client_factory(config: MCPServerConfig, _secret: Optional[str]) -> MCPClient:
+    """Explicit 'no MCP runtime' factory (tests, and deployments that disable MCP)."""
     return _UnavailableClient(config)
 
 
@@ -391,8 +475,14 @@ class MCPClientManager:
             raise MCPRegistrationError("unknown_mcp_server", server_id)
         return config
 
-    def servers(self) -> List[str]:
-        return sorted(self._configs)
+    def servers(self, context: Optional[ExecutionContext] = None) -> List[str]:
+        return [
+            server_id for server_id, config in sorted(self._configs.items())
+            if context is None or config.access.matches(context)
+        ]
+
+    def servers_for(self, context: ExecutionContext) -> List[str]:
+        return self.servers(context)
 
     def _close_client(self, client: MCPClient) -> None:
         """Best-effort close (called from sync paths)."""
@@ -528,12 +618,49 @@ class MCPClientManager:
         )
 
     def _to_spec(self, server_id: str, definition: MCPToolDefinition, config: MCPServerConfig) -> UnifiedToolSpec:
+        """Translate a discovered tool into the unified catalogue.
+
+        FIX-07: the *server policy* is authoritative.  ``tool_policies`` (declared by the
+        administrator who registered the server) wins in both directions - it can tighten a
+        ``readOnlyHint`` tool into ``write``/approval-required, and it can relax a tool that
+        declares nothing.  Only when the policy says nothing does the advisory mode fall
+        back to the server's own annotations, and that fallback is recorded as
+        ``policy_source="annotation"``; ``strict`` mode never consults annotations at all.
+        """
+        declared = (config.tool_policies or {}).get(definition.name)
         annotations = definition.annotations or {}
-        destructive = bool(annotations.get("destructiveHint", False))
-        read_only = bool(annotations.get("readOnlyHint", False)) and not destructive
-        side_effect = "destructive" if destructive else ("read" if read_only else "external")
-        # Destructive MCP tools always pass through the human approval gate.
-        approval = destructive or bool(annotations.get("requiresApproval", False))
+        if declared:
+            policy_source = "server"
+        elif config.policy_mode == "strict":
+            policy_source = "strict_default"
+        else:
+            policy_source = "annotation"
+
+        if declared == "read_only" or declared == "read":
+            side_effect, permission, approval = "read", "read", False
+        elif declared == "external":
+            side_effect, permission, approval = "external", "write", False
+        elif declared == "write":
+            side_effect, permission, approval = "write", "write", True
+        elif declared == "destructive":
+            side_effect, permission, approval = "destructive", "write", True
+        elif declared == "approval_required":
+            side_effect, permission, approval = "external", "write", True
+        elif policy_source == "strict_default":
+            # No declaration and annotations are not trusted: a conservative external write
+            # that always passes the human approval gate.
+            side_effect, permission, approval = "external", "write", True
+        else:
+            destructive = bool(annotations.get("destructiveHint", False))
+            read_only = bool(annotations.get("readOnlyHint", False)) and not destructive
+            side_effect = "destructive" if destructive else ("read" if read_only else "external")
+            permission = "write" if destructive else ("read" if read_only else "write")
+            approval = destructive or bool(annotations.get("requiresApproval", False))
+
+        # Defense in depth: an annotation can never assert a destructive tool is safe, and
+        # nothing an MCP server says can grant ``admin`` authority.
+        if bool(annotations.get("destructiveHint", False)) and side_effect in ("read", "none"):
+            side_effect, permission, approval = "destructive", "write", True
         return UnifiedToolSpec(
             name=definition.name,
             namespace=f"mcp.{server_id}",
@@ -542,12 +669,13 @@ class MCPClientManager:
             input_schema=definition.input_schema or {"type": "object", "properties": {}},
             output_schema={"type": "object"},
             capability=f"mcp.{server_id}.{definition.name}",
-            permission="read" if read_only else "write",
-            side_effect=side_effect,
+            permission=permission,  # type: ignore[arg-type]
+            side_effect=side_effect,  # type: ignore[arg-type]
             timeout_seconds=config.timeout_seconds,
             error_contract={"type": "object", "error_codes": ["mcp_error", "mcp_timeout", "mcp_denied"]},
             approval_required=approval,
             source="mcp",
+            tags=(f"policy_source:{policy_source}",),
         )
 
     async def discover_resources(self, server_id: str) -> List[MCPResource]:
@@ -650,6 +778,7 @@ class MCPClientManager:
     ) -> MCPToolResult:
         config = self.config(server_id)
         allowlist = {name.strip() for name in config.allowed_tools if name.strip()}
+        assert_server_access(config.access, context, server_id=server_id)
         if tool_name not in allowlist:
             raise MCPToolDenied("mcp_tool_not_allowlisted", f"{server_id}:{tool_name}")
         qualified = f"mcp.{server_id}.{tool_name}"
@@ -676,16 +805,22 @@ class MCPClientManager:
         )
 
     # -- diagnostics -------------------------------------------------------------------
-    def describe(self) -> Dict[str, Any]:
+    def describe(self, context: Optional[ExecutionContext] = None) -> Dict[str, Any]:
         servers = []
         for server_id, config in sorted(self._configs.items()):
+            if context is not None and not config.access.matches(context):
+                continue
             servers.append({
                 "server_id": server_id,
                 "transport": config.transport,
                 "state": self.state(server_id).value,
+                "endpoint": mask_endpoint(config.command_or_url),
                 "allowed_tools": list(config.allowed_tools),
                 "credential_ref": config.credential_ref,
                 "credential_configured": self.credentials.has(config.credential_ref),
                 "registered_tools": len(self._tools.get(server_id, ())),
+                "policy_mode": config.policy_mode,
+                "tool_policies": dict(config.tool_policies),
+                "access": config.access.as_dict(),
             })
         return {"servers": servers, "credentials": self.credentials.describe()}

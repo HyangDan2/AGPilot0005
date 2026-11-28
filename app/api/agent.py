@@ -23,6 +23,7 @@ from app.runtime.tasks.bootstrap import services
 from app.tracing.store import get_trajectory_logger
 import json
 import re
+import time
 
 router = APIRouter(prefix="/agent", tags=["Agent"])
 
@@ -37,6 +38,43 @@ class RunFeedbackRequest(BaseModel):
     reward_signal: Optional[float] = Field(default=None, ge=-1.0, le=1.0)
     decision_id: Optional[str] = None
     trajectory_id: Optional[str] = None
+
+
+async def _create_workflow_run(req: AgentRunRequest, scope):
+    """Execute the request on the shared R3 workflow runtime (FIX-04).
+
+    Identity comes from the authenticated scope; the body only contributes the message, the
+    capabilities it wants and its context.  Status is mapped into the agent status
+    vocabulary so the existing client contract keeps working.
+    """
+    from app.api.workflow import get_workflow_service
+    from app.workflow.omni import AGENT_STATUS_MAP, OmniRuntimeBridge
+    from app.workflow.runtime import WorkflowRuntimeError
+    from app.workflow.safety import ApprovalError, ScopeViolation
+
+    bridge = OmniRuntimeBridge(get_workflow_service())
+    try:
+        result = await bridge.start_from_agent_request(req, scope)
+    except ScopeViolation as exc:
+        raise HTTPException(403, exc.code) from exc
+    except ApprovalError as exc:
+        raise HTTPException(403, exc.code) from exc
+    except WorkflowRuntimeError as exc:
+        raise HTTPException(exc.http_status, exc.code) from exc
+    status = AGENT_STATUS_MAP.get(result.status, "running")
+    payload = {
+        "run_id": result.run_id,
+        "agent_id": req.agent_id,
+        "session_id": req.session_id,
+        "status": status,
+        "executor": "workflow",
+        "workflow_status": result.status,
+        "created_at": time.time(),
+        "workflow": result.model_dump(mode="json"),
+    }
+    if result.status == "awaiting_approval":
+        payload["approval_endpoint"] = f"/api/v1/agent/workflows/runs/{result.run_id}/approve"
+    return JSONResponse(status_code=202 if status in ("queued", "running", "paused", "needs_input") else 200, content=payload)
 
 
 def durable_job(run_id):
@@ -88,8 +126,11 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
         req = req.model_copy(update={"session_id": req.conversation_id})
     if mode == "workspace" and not workspace_active:
         raise HTTPException(422, "workspace_id_required")
-    if workspace_active and mode not in (None, "workspace"):
+    if workspace_active and mode not in (None, "workspace", "workflow"):
         raise HTTPException(422, "workspace_execution_mode_required")
+    if mode == "workflow":
+        # FIX-04: the R3 graph is a capability of this same runtime, not a second one.
+        return await _create_workflow_run(req, scope)
     if mode == "document_analysis":
         if not has_document_refs:
             raise HTTPException(422, "document_references_required")
@@ -133,6 +174,15 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
     if workspace_active:
         # Keep the Workspace executor and admit only conversation-scoped attachments.
         req = req.model_copy(update={"context_refs": managed_attachments, "analysis_refs": []})
+    # FIX-04: the ordinary Omni path shares the R3 hook registry, so an installation's
+    # session_start hook (audit/redaction/kill switch) applies to chat as well.  Fail-open:
+    # a chat must never fail because a hook did, and nothing is constructed when R3 is not
+    # wired into this process.
+    from app.workflow.omni import get_omni_bridge
+
+    bridge = get_omni_bridge()
+    if bridge is not None:
+        await bridge.dispatch_session_start(req, scope)
     try:
         session = await runner.create_run(req, service_id=service_id, owner_id=owner, caller_scope=scope)
     except DocumentReferenceError as exc:
@@ -170,6 +220,8 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
 async def get_agent_run(run_id: str, request: Request):
     """Retrieves current run status, final answer, and execution traces."""
     scope = require_authenticated_caller(request)
+    if run_id.startswith("wfrun_"):
+        return _workflow_run_response(run_id, request, scope)
     job_id = durable_job(run_id)
     if job_id:
         manager = services(request.app)
@@ -211,6 +263,39 @@ async def get_agent_run(run_id: str, request: Request):
         finished_at=session.finished_at,
         error=state.error,
     )
+
+def _workflow_run_response(run_id: str, request: Request, scope) -> AgentRunResponse:
+    """FIX-04: surface an R3 workflow run through the agent status contract."""
+    from app.api.workflow import get_workflow_service
+    from app.workflow.omni import AGENT_STATUS_MAP
+
+    service = get_workflow_service()
+    checkpoint = service.authorize_run(run_id, scope)          # 404 for other owners
+    context = service.run_context(scope, checkpoint)           # re-verifies scope + binding
+    payload = service.runtime.get(run_id, context=context)
+    trajectory = payload.get("trajectory") or {}
+    checkpoint_view = payload.get("checkpoint") or {}
+    status = AGENT_STATUS_MAP.get(str(checkpoint_view.get("status")), "running")
+    return AgentRunResponse(
+        run_id=run_id,
+        agent_id="workflow",
+        status=status,
+        answer=json.dumps(
+            {"workflow_status": checkpoint_view.get("status"),
+             "plan_id": checkpoint_view.get("plan_id"),
+             "completed_steps": checkpoint_view.get("completed_steps")},
+            ensure_ascii=False,
+        ),
+        usage={
+            "steps": len(checkpoint_view.get("completed_steps") or []),
+            "plan_version": checkpoint_view.get("plan_version"),
+            "replans": checkpoint_view.get("replans"),
+        },
+        created_at=checkpoint.created_at.timestamp(),
+        error=({"code": str(trajectory.get("status_reason") or ""), "message": str(trajectory.get("status_reason") or "")}
+               if checkpoint_view.get("status") in ("failed", "recovery_required") else None),
+    )
+
 
 @router.get("/runs/{run_id}/events")
 async def get_agent_events(run_id: str, request: Request):
@@ -413,6 +498,8 @@ async def list_agents():
                 "name": "General Assistant Agent",
                 "description": "다양한 도구를 활용할 수 있는 범용 에이전트",
                 "allowed_tools": [t.name for t in tools],
+                # FIX-04: the R3 workflow graph is exposed as a capability of this agent.
+                "capabilities": ["workflow.run"],
             }
         ]
     }

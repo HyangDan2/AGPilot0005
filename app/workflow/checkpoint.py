@@ -40,7 +40,9 @@ __all__ = [
     "default_checkpoint_path",
 ]
 
-CheckpointStatus = Literal["pending", "running", "awaiting_approval", "completed", "failed", "cancelled"]
+CheckpointStatus = Literal[
+    "pending", "running", "awaiting_approval", "recovery_required", "completed", "failed", "cancelled",
+]
 CheckpointBackend = Literal["sqlite", "file", "memory"]
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -95,6 +97,11 @@ class WorkflowCheckpoint(BaseModel):
     @property
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL_STATUSES
+
+    @property
+    def needs_recovery(self) -> bool:
+        """FIX-02: the previous attempt's outcome is unknown; no automatic retry."""
+        return self.status == "recovery_required"
 
     def with_progress(
         self,
@@ -223,6 +230,16 @@ class WorkflowCheckpointStore:
             "CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_scope "
             "ON workflow_checkpoints (tenant_id, owner_id, status)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workflow_run_leases (
+                run_id      TEXT PRIMARY KEY,
+                holder      TEXT NOT NULL,
+                acquired_at REAL NOT NULL,
+                expires_at  REAL NOT NULL
+            )
+            """
+        )
         conn.commit()
         self._conn = conn
 
@@ -345,6 +362,121 @@ class WorkflowCheckpointStore:
 
     def exists(self, run_id: str) -> bool:
         return self._read(run_id) is not None
+
+    # -- FIX-02: durable run lease & atomic status transitions --------------------------
+    def claim_run(
+        self,
+        run_id: str,
+        *,
+        holder: str,
+        lease_seconds: float = 900.0,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Atomically take the execution lease for ``run_id`` (one executor at a time)."""
+        import time as _time
+
+        stamp = float(now if now is not None else _time.time())
+        expires = stamp + max(1.0, float(lease_seconds))
+        with self._lock:
+            if self.backend != "sqlite" or self._conn is None:
+                leases = getattr(self, "_leases", None)
+                if leases is None:
+                    leases = {}
+                    self.__dict__["_leases"] = leases
+                current = leases.get(run_id)
+                if current is not None and current[1] > stamp and current[0] != holder:
+                    return False
+                leases[run_id] = (holder, expires)
+                return True
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT holder, expires_at FROM workflow_run_leases WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if row is not None and float(row[1]) > stamp and str(row[0]) != holder:
+                    conn.rollback()
+                    return False
+                conn.execute(
+                    """
+                    INSERT INTO workflow_run_leases (run_id, holder, acquired_at, expires_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(run_id) DO UPDATE SET
+                        holder=excluded.holder,
+                        acquired_at=excluded.acquired_at,
+                        expires_at=excluded.expires_at
+                    """,
+                    (run_id, holder, stamp, expires),
+                )
+            except BaseException:
+                with __import__("contextlib").suppress(Exception):
+                    conn.rollback()
+                raise
+            conn.commit()
+            return True
+
+    def release_run(self, run_id: str, holder: str) -> None:
+        with self._lock:
+            if self.backend != "sqlite" or self._conn is None:
+                leases = getattr(self, "_leases", None) or {}
+                current = leases.get(run_id)
+                if current is not None and current[0] == holder:
+                    leases.pop(run_id, None)
+                return
+            self._conn.execute(
+                "DELETE FROM workflow_run_leases WHERE run_id = ? AND holder = ?", (run_id, holder)
+            )
+            self._conn.commit()
+
+    def compare_and_set_status(
+        self,
+        run_id: str,
+        *,
+        expected: Sequence[str],
+        status: CheckpointStatus,
+        pending_approval_id: Optional[str] = None,
+        clear_pending_approval: bool = False,
+        context: Optional[ExecutionContext] = None,
+        failures: Optional[Sequence[Dict[str, Any]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[WorkflowCheckpoint]:
+        """Transition status only if the stored status is still one of ``expected``.
+
+        Returns ``None`` when another writer (typically a cancellation) already moved the
+        run out of ``expected`` - the caller must then honour the stored state instead of
+        overwriting it (FIX-02 cancel/completion race).
+        """
+        checkpoint = self.load(run_id, context=context)
+        if checkpoint.status not in set(expected):
+            return None
+        updated = checkpoint.with_progress(
+            status=status,
+            pending_approval_id=pending_approval_id,
+            clear_pending_approval=clear_pending_approval,
+            failures=failures,
+            metadata=metadata,
+        )
+        with self._lock:
+            if self.backend == "sqlite" and self._conn is not None:
+                conn = self._conn
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT status FROM workflow_checkpoints WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if row is None or str(row[0]) not in set(expected):
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE workflow_checkpoints SET status = ?, updated_at = ?, payload = ? WHERE run_id = ?",
+                    (updated.status, updated.updated_at.isoformat(), _encode(updated.model_dump(mode="json")), run_id),
+                )
+                conn.commit()
+                return updated
+            current = self.load_raw(run_id)
+            if current is None or current.status not in set(expected):
+                return None
+            self._write(updated, self.load_trajectory(run_id))
+            return updated
 
     def record_step(
         self,

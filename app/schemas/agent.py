@@ -21,8 +21,11 @@ class AgentRunRequest(BaseModel):
     analysis_refs: List[str] = Field(default_factory=list, max_length=10)
     workspace_id: Optional[str] = None
     bind_workspace: bool = False
-    execution_mode: Optional[Literal["chat", "workspace", "document_analysis"]] = None
+    execution_mode: Optional[Literal["chat", "workspace", "document_analysis", "workflow"]] = None
     approvals: List[str] = Field(default_factory=list, max_length=32)
+    # -- FIX-04: R3 workflow capability entered through the ordinary agent endpoint
+    capabilities: List[str] = Field(default_factory=list, max_length=32)
+    workflow: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("approvals")
     @classmethod

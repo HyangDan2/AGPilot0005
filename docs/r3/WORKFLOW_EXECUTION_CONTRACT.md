@@ -2,7 +2,7 @@
 
 > **대상 저장소**: AGPilot0005 (AGCore) · 브랜치 `feat/r3-workflow-extensibility`
 > **선행 커밋**: `552df4b` (WP-03~WP-08, WP-10 엔진) · **본 작업**: WP-01/02/09 + Runtime/API/Acceptance/Docs
-> **버전**: R3-PREDEV v1.0 (2026-11-28)
+> **버전**: R3-PREDEV v1.1 (2026-11-28) — §17 Runtime·안전성 교정(FIX-01~08) 반영
 > **범위**: Planner, Execution Plan, Skill, Rules, Hook, MCP, Unified Tool Registry, Checkpoint/Resume,
 > Trajectory, REST/SSE API, Acceptance A~H, R2.1 및 Codex 통합 요구사항.
 > **Lean Engineering v1.1 준수**: `app/runtime/langgraph_r1.py`, `app/workspace/*`, `app/canvas/*`는 무수정.
@@ -29,7 +29,9 @@
 | **`app/api/workflow.py`** | **`/agent/workflows/*` REST + SSE** | 신규 |
 | **`app/schemas/events.py`** | `EventType`에 `workflow.*` 9종 additive 추가 | 10줄 추가 |
 | **`app/main.py`** | `workflow_router` 등록 | 2줄 추가 |
-| **`tests/test_r3_workflow_acceptance.py`** | **Acceptance A~H + API 스모크 (39 tests)** | 신규 |
+| **`tests/test_r3_workflow_acceptance.py`** | **Acceptance A~H + API 스모크 (40 tests)** | 신규 |
+| **`tests/test_r3_fix01_hardening.py`** | **FIX-01~08 하드닝 검증 (57 tests)** | §17 (FIX WO) |
+| **`app/workflow/{scope,ledger,transport,isolation,omni}.py`** | **FIX-01/02/03/07/04 신규 엔진** | §17 |
 
 ---
 
@@ -659,14 +661,19 @@ Base: `/api/v1/agent/workflows` (Nginx 관리자 프록시: `/admin/agcore/api/v
 | `max_tool_calls` | 24 / 런 | `ContextBudgetManager` |
 | `max_context_tokens` | 12 000 | 동일 |
 | 승인 토큰 TTL | 300s | `ApprovalAuthority(default_ttl_seconds=300)` |
+| 실행 Ledger | SQLite `data/workflow_ledger.db` (`memory`=테스트) | `ExecutionLedger` (§17.2) |
+| 실행권 lease | 900s | `RunExecutionGuard` / `checkpoint.claim_run` |
+| MCP tool 정책 | API 등록 시 `policy_mode="strict"` | `app/api/workflow.py` (§17.7) |
 | 훅 타임아웃 | 5s (훅별 0~120s) | `HookDefinition` |
 | MCP 타임아웃/재시도 | 15s / 2 | `MCPServerConfig` |
 
 ---
 
-## 16. 남은 작업 (R3 후속)
+## 16. 남은 작업 (R3 후속) — §17에서 대부분 해소
 
-1. **LLM 자동 플래닝**: `Planner(model=...)` 훅만 존재. 모델 호출 시 `model_calls` 카운터로 fast-path 보장 유지 필요.
+> §17(FIX-01~08)에서 1·3·4·5 항목이 구현되었다. 현행 미완 목록은 §17.11을 정본으로 한다.
+
+1. **LLM 자동 플래닝**: ~~`Planner(model=...)` 훅만 존재~~ → `LLMPlannerAdapter` + `Planner.aplan` 구현(§17.5).
 2. **AGPolicy 학습 파이프라인**: `learning_payload()` 소비자(배치 러너/보상 정의) 미구현.
 3. **R2.1 실 어댑터**: `RuntimeOfficeAdapter` 엔드포인트 확정(AGPilot0006 19종 매핑 대조) + production 전환.
 4. **admin cross-tenant 열람 정책**: 현재 `is_admin + can_access_tenant` 예외만 존재. 감사 로그 요구사항 확정 필요.
@@ -675,3 +682,263 @@ Base: `/api/v1/agent/workflows` (Nginx 관리자 프록시: `/admin/agcore/api/v
 7. **`hd2ai-shared` 타입 1:1 대조**: §11.2 ↔ `workflow-contract.ts`.
 8. **선행 회귀 1건**: `test_add_02_durable_analysis_real_orchestrator_create_resume_and_no_legacy_fallback`
    (`552df4b`부터 실패, `bootstrap.py:41`) — R3 범위 밖이지만 별도 수정 필요.
+
+---
+
+# 17. Runtime Integration & Safety Hardening (WO-R3-PREDEV-FIX-01)
+
+> **본 작업**: FIX-01~08 · **기준 HEAD**: `854afbc` → 본 WO 커밋
+> **불변 조건**: 기존 156건 R3 PASS 유지, 기존 구현 전면 재작성 없음, 신규 경쟁 Runtime 없음,
+> R2.1(`app/runtime/langgraph_r1.py`, `app/workspace/*`, `app/canvas/*`) 무수정.
+> 아래 계약은 **§1~§16을 대체하지 않고 좁힌다**. 상충 시 본 장이 우선한다.
+
+## 17.0 신규/변경 파일
+
+| 파일 | 성격 | 내용 |
+|---|---|---|
+| `app/workflow/scope.py` | 신규 | FIX-01 `ExecutionScopeAuthority`, `ScopeEvidence`, `R2WorkspaceResolver`, `ToolAccessPolicy` |
+| `app/workflow/ledger.py` | 신규 | FIX-02 `ExecutionLedger`(SQLite/memory), `StepLedgerRecord`, `RunExecutionGuard` |
+| `app/workflow/transport.py` | 신규 | FIX-03 `StdioMCPClient`, `StreamableHTTPMCPClient`, JSON-RPC 세션/에러 |
+| `app/workflow/isolation.py` | 신규 | FIX-07 `validate_endpoint`, `validate_command`, `MCPServerAccess`, `require_mcp_admin`, `mask_endpoint` |
+| `app/workflow/omni.py` | 신규 | FIX-04 `OmniRuntimeBridge` (workflow를 Omni의 capability로) |
+| `app/workflow/planner.py` | 수정 | FIX-05 `LLMPlannerAdapter`, `Planner.route()/aplan()` |
+| `app/workflow/safety.py` | 수정 | FIX-06 `ApprovalBinding`, `approval_args_hash`, 토큰 바인딩·nonce 소비 |
+| `app/workflow/checkpoint.py` | 수정 | FIX-02 `recovery_required` 상태, `claim_run`/`release_run`, `compare_and_set_status` |
+| `app/workflow/runtime.py` | 수정 | Ledger claim, recovery hold, cancel race, approval binding, tool policy, office scope |
+| `app/workflow/mcp.py` | 수정 | 실 transport 기본화, `tool_policies`/`policy_mode`/scope/isolation |
+| `app/workflow/office_adapter.py` | 수정 | FIX-08 `AdapterCallScope`, `availability()`, AGTools 제공 매트릭스 |
+| `app/workflow/__init__.py` | 수정 | 신규 심볼 export, `build_workflow_stack(ledger_*, gateway, enable_llm_planner)` |
+| `app/api/workflow.py` | 수정 | scope authority 적용, admin MCP 관리, `/recovery`, approver 정본화, availability 노출 |
+| `app/api/agent.py` | 수정 | FIX-04 workflow 진입·wfrun 조회·공통 세션 훅 |
+| `app/schemas/agent.py` | 수정 | `execution_mode="workflow"`, `capabilities`, `workflow` (additive) |
+| `tests/test_r3_fix01_hardening.py` | 신규 | FIX-01~08 필수 테스트 57건 |
+| `tests/fixtures/mcp_stdio_server.py` · `mcp_http_server.py` | 신규 | 실제 로컬 MCP 서버(stdio/streamable-http) |
+
+## 17.1 FIX-01 실행 스코프 (P0)
+
+**권한 정본은 자격증명과 서버측 바인딩뿐이다.**
+
+| 입력 | 처리 |
+|---|---|
+| Body `tenant_id`/`owner_id`/`role`/`scope`/`is_admin`/`authenticated`/`auth_source`/`allowed_*` | **거부** — `403 body_scope_overrides_forbidden` (값 비교 없음: 정본으로 신뢰하지 않는다) |
+| Body `conversation_id`/`workspace_id`/`session_id` | `ExecutionScopeAuthority`가 **서버측 바인딩으로 재해석** |
+| tenant/owner/service | `require_authenticated_caller`의 `ExecutionScope` |
+
+`R2WorkspaceResolver`의 규칙:
+
+1. 대화가 서버측에서 워크스페이스에 바인딩되어 있고 Body가 다른 `workspace_id`를 주장하면
+   `conversation_workspace_mismatch`(403).
+2. Body가 워크스페이스를 비우고 바인딩이 있으면 **바인딩 값 채택**(Body가 아니라 서버가 정한다).
+3. 워크스페이스 엔진이 켜져 있으면 `WorkspaceManager.ensure_open(workspace_id, scope)`로 소유권·오픈 상태를
+   확인하고 서비스 불일치/미존재는 `workspace_not_accessible`(403).
+4. 워크스페이스 엔진이 꺼져 있으면(레지스트리 없음) `workspace_verified=False`로 **기록만** 하고 통과 —
+   검증된 접근으로 위장하지 않는다.
+
+**Resume 재검증**: `WorkflowService.run_context()`는 저장된 스코프를 현재 자격증명·현재 바인딩으로
+`revalidate()`한다. 워크스페이스 권한이 회수되었거나 대화 바인딩이 사라졌으면 `404 workflow_run_not_found`
+(존재 여부를 노출하지 않는 기존 규칙 유지)로 차단하고 어떤 단계도 실행하지 않는다.
+
+**Tool 권한 정책**: registry 기반 capability는 실행 직전 `ToolAccessPolicy`가
+`app/tools/policy.py`(`is_tool_allowed(qualified_name, service_id)`)로 서비스 허용 여부를 확인한다.
+거부 시 `tool_not_permitted_for_service`로 실패하며 handler는 호출되지 않는다(office/MCP 어댑터는 각자의
+스코프 규칙을 따른다).
+
+## 17.2 FIX-02 멱등성·동시성 (P0)
+
+### 실행 Ledger (`app/workflow/ledger.py`)
+
+기본 백엔드 SQLite(`data/workflow_ledger.db`, `AGCORE_R3_LEDGER_DB` 재정의, 테스트는 `memory`).
+키는 `(run_id, step_id, idempotency_key, scope_key)`이며 `scope_key = ExecutionContext.scope_hash()`다.
+
+| 기존 상태 | `claim()` 결과 | 실행 여부 |
+|---|---|---|
+| 없음 | `claimed` | 실행 |
+| `claimed` (동일 토큰) | `claimed` | 재진입 허용 |
+| `claimed` (다른 토큰, lease 유효) | `in_flight` | **차단** (`step_in_flight` 실패) |
+| `claimed` (lease 만료) | `stale_claim_recovered` | 실행(시도 +1) |
+| `succeeded` | `replay` (+결과) | **재실행 없이 결과 재사용** |
+| `failed` | `claimed` | 재시도 허용 |
+| `uncertain` | `recovery_required` | **자동 재실행 금지** |
+
+`write`/`external`/`destructive` side effect 단계만 claim 대상이며, 성공 시 `succeed`, 명확한 실패 시
+`fail`, 결과 불명(`tool_timeout`, `mcp_timeout`, `mcp_http_unavailable`, `transport_error`,
+`upstream_unavailable`, `timeout`, `mcp_stream_closed`)이면 `mark_uncertain` 후 실행 전체를
+`recovery_required`로 전환한다.
+
+### `recovery_required`
+
+- 상태: `pending → running → (recovery_required) → running | failed | cancelled`
+- `resume`은 **거부**한다(`409 recovery_required`).
+- `POST /agent/workflows/runs/{run_id}/recovery` + `{action}`:
+  - `retry`: 관리자가 "부작용이 발생하지 않았다"고 확인 → uncertain 기록을 `failed`로 내려 재시도 허용,
+    상태를 `running`(승인 대기 중이면 `awaiting_approval`)으로 되돌린다.
+  - `abandon`: 모호성을 수용 → `failed` (부작용을 다시 실행하지 않는다).
+- 응답 `WorkflowRunResult.recovery = {step_id, capability, reason, ledger_status, failure_code, attempts}`.
+
+### 실행권(Lease)
+
+- `RunExecutionGuard`(프로세스 내) + `WorkflowCheckpointStore.claim_run/release_run`(SQLite 원자적).
+- 동일 `run_id`의 동시 `start`/`resume`은 한쪽만 실행되고 다른 쪽은 `409 run_in_progress`.
+
+### 취소/완료 경합
+
+- `cancel()`은 `compare_and_set_status(expected=(pending, running, awaiting_approval, recovery_required))`.
+- `save_checkpoint()`는 저장된 상태가 `cancelled`이면 완료/running으로 덮어쓰지 않는다(**취소 우선**).
+- `report()`는 최종 저장 후 `cancelled`를 재확인하고 `workflow.cancelled`만 발행한다.
+- 이미 `completed`인 run의 취소는 `409 workflow_run_completed`.
+
+## 17.3 FIX-03 실제 MCP Transport (P1)
+
+`app/workflow/transport.py` — `mcp` SDK 없이 JSON-RPC 2.0을 직접 구현한다.
+
+### stdio
+- `asyncio.create_subprocess_exec`(shlex 분해) → stdin/stdout newline-delimited JSON-RPC.
+- 순서: `initialize` → `notifications/initialized` → `tools/list` → `tools/call` / `resources/*` / `prompts/*`.
+- id 불일치(서버 알림·지연 응답)는 무시하고 계속 읽는다.
+- 종료: stdin close → `terminate()` → 3초 내 미종료 시 `kill()`, stderr는 bounded deque로 소비.
+
+### Streamable HTTP
+- `httpx.AsyncClient` POST JSON-RPC, `Accept: application/json, text/event-stream`.
+- 응답이 `text/event-stream`이면 `data:` 프레임을 파싱해 id 일치 결과를 사용.
+- `initialize` 응답의 `Mcp-Session-Id`를 저장하고 이후 모든 요청에 `mcp-session-id` +
+  `mcp-protocol-version` 헤더로 전송. 종료 시 `DELETE` 후 클라이언트 close.
+
+### 오류·격리
+- `MCPTransportError`(code) / `MCPTransportTimeout`(=`mcp_timeout`, 결과 불명) — 실행 Ledger의
+  uncertain 판정과 직접 연결된다.
+- Mock/가짜 client는 `unavailable_client_factory`(테스트 전용)와 주입된 `client_factory`로만 사용한다.
+  `default_client_factory`는 항상 실제 transport를 만든다.
+
+## 17.4 FIX-04 Omni Runtime 통합 (P1)
+
+- `POST /api/v1/agent/runs` + `execution_mode="workflow"` → `OmniRuntimeBridge.start_from_agent_request`
+  → **동일한** R3 런타임(동일 registry/skills/rules/hooks/mcp)에서 실행. 경쟁 Runtime 없음.
+- 요청 추가 필드(additive): `capabilities: string[]`(필수, 없으면 `422 workflow_capabilities_required`),
+  `workflow: object`(`workspace_id`, `conversation_id`, `params`, `plan_steps`, `budget` 등).
+- 응답: `{run_id, agent_id, status, executor:"workflow", workflow_status, workflow:{...}}`,
+  상태 매핑 `awaiting_approval→paused`, `recovery_required→needs_input`.
+- 조회: `GET /api/v1/agent/runs/{wfrun_*}` (스코프·바인딩 재검증 후 `AgentRunResponse`).
+- 일반 Omni 경로도 공통 훅을 쓴다: `session_start`를 공유 `HookRegistry`로 fail-open 디스패치.
+  R3가 배선되지 않은 프로세스에서는 bridge가 `None`이라 아무 것도 생성하지 않는다(기존 채팅 경로 불변).
+- `GET /agent/agents`는 `capabilities: ["workflow.run"]`을 함께 광고한다.
+
+## 17.5 FIX-05 LLM Planner (P1)
+
+- `Planner.route(request)` — 모델 호출 없이 `direct_chat`/`workflow`를 먼저 결정한다(**fast-path 구조 보장**).
+- `Planner.aplan(request)` — workflow 라우트에서만 `LLMPlannerAdapter`를 호출하고 `model_calls += 1`.
+  `direct_chat`은 gateway를 호출하지 않는다(테스트로 gateway 호출 0건 검증).
+- `LLMPlannerAdapter`: capability 카탈로그(+`input_schema`·side_effect·approval)와 플랜 JSON Schema를
+  프롬프트로 전달, `response_format={"type":"json_object"}`.
+- 모델 출력 검증(결정적 Planner와 동일 기준): capability 화이트리스트(`llm_plan_capability_denied`),
+  단계 수(`llm_plan_over_budget`), DAG/사이클(`llm_plan_invalid_dag`), 토큰 예산(`llm_plan_token_budget`).
+  하나라도 위반하면 **결정적 Planner로 폴백**하고 `last_plan_source="deterministic_fallback"`,
+  `last_llm_error={code, detail}`을 남긴다.
+- 플래너 프롬프트에는 `token|secret|password|api_key|authorization|credential` 키를 제거한 컨텍스트만 전달.
+- 활성화: `AGCORE_R3_LLM_PLANNER=on`(+ 기본 `app.gateway.client.gateway_client`) 또는
+  `build_workflow_stack(gateway=..., enable_llm_planner=True)`.
+
+## 17.6 FIX-06 승인 보안 (P1)
+
+`ApprovalToken`에 다음 필드가 추가되고 **HMAC 서명 대상**(`canonical_payload`)에 포함된다:
+`run_id, step_id, capability, target, args_hash`.
+
+- `args_hash = approval_args_hash(resolved_params)` (정렬 JSON의 sha256) — 일시정지 시점의 확정 인자.
+- `verify_user_approval(context, token, expected=ApprovalBinding(...))`:
+  - 바인딩을 가진 토큰은 `expected` 없이 검증 불가(`approval_binding_required`).
+  - 필드 불일치 `approval_binding_mismatch`(어느 필드인지 detail에 표기).
+  - 서명 위조 `invalid_signature`, 만료 `expired_approval`, 모델 발급 `model_generated_approval`.
+  - 성공 시 nonce 소비 → 같은 승인 재사용은 `approval_replayed`.
+- `POST /approve`의 승인자는 **인증된 사용자**(`scope.owner_id`)이며 Body의 `approved_by`는 무시된다
+  (응답 `approved_by_source="authenticated_scope"`). `role ∈ {service, tool, ai, assistant, automation, system, guest}`
+  는 `403 approval_requires_user_principal`.
+- `pending_approval` 응답에 `target`/`args_hash`가 포함되고, `approve`가 발급한 토큰이 그 값에 묶인다.
+- 기존 상위 승인 정책(`app/canvas/approval.py`)은 그대로 유지되며 본 경로는 이를 우회하지 않는다.
+
+## 17.7 FIX-07 MCP·도구 격리 (P1)
+
+| 경계 | 규칙 |
+|---|---|
+| 관리 권한 | `require_mcp_admin` — `role ∈ {admin, admiral}`. 예외는 **비운영 환경의 `dev_local`(로컬 운영자 자격)** 뿐이며 `credential_scope`/`trusted_proxy`는 항상 admin 역할 필요. `POST/DELETE /mcp/servers`에 적용 |
+| 소유 범위 | `MCPServerConfig(tenant_id, owner_id, service_id, shared)`. `servers(context)`/`describe(context)`는 보이는 것만, `call_tool`은 `mcp_server_not_accessible`로 차단 |
+| 자격증명 | `credential_ref`만 보관, `describe()`는 `mask_endpoint`(userinfo·`token|key|secret|password|sig=` 값 마스킹) |
+| Endpoint | `http`/`https`만, loopback/사설/링크로컬/메타데이터 IP 차단, `allowed_hosts` 옵션, `allow_private_network` 명시 시 예외 |
+| 명령 | 신뢰 실행기 allowlist(`python`, `node`, `uvx` …) + 셸 메타문자(`; & | \` $ < > \`) 금지 |
+| Annotation | **서버 정책이 정본**. `tool_policies`가 선언되면 annotation과 무관하게 그 값 사용. `policy_mode="strict"`(API 기본)에서 미선언 도구는 `external`/`write`/`approval_required=True`. `policy_mode="advisory"`(엔진 직접 배선, 하위호환)만 annotation을 참조하며 `tags=("policy_source:annotation",)`로 표시. annotation으로 admin 권한·destructive 완화는 불가 |
+
+## 17.8 FIX-08 R2.1 Adapter 계약 (P1)
+
+AGPilot0006 `98113bc`의 `SHARED_CAPABILITY_INTERFACE`와 동기화했다.
+
+| capability | R2.1 상태 | R3 처리 |
+|---|---|---|
+| `workspace.rag.search` | provided (`document.search`) | `RuntimeOfficeAdapter` 호출 (`/api/v1/search`) |
+| `office.xlsx.analyze` | not_provided | `availability().status="unavailable"` → 실행 시 `capability_unavailable` (Mock 결과 대체 금지) |
+| `office.docx.compare` | not_provided | 동일 |
+| `office.pptx.generate` | not_provided | 동일 |
+| `workspace.file.write` | not_provided | 동일 |
+
+- `AGTOOLS_PROVIDED_CAPABILITIES = {"workspace.rag.search"}` (테스트로 고정).
+- 스코프/인증 전달: `AdapterCallScope(tenant_id, owner_id, service_id, access_token)` →
+  `X-HD2Lab-Tenant` / `X-HD2Lab-User` / `X-HD2Lab-Service` / `Authorization: Bearer <token>`.
+  토큰은 `token_provider`(callable)로만 주입되며 `repr`/trajectory/로그에 남지 않는다.
+  `X-Access-Scope: admin`은 R3가 스스로 만들지 않는다(호출 주체 스코프 그대로 전달).
+- `/tools` 응답에 `office_availability` 추가, `WorkflowRuntime`은 office 호출 전 `availability`를 확인한다.
+- Production에서 Mock 어댑터는 `unavailable`(`mock_adapter_forbidden_in_production`).
+- R2.1 저장소는 읽기만 했다(수정 없음).
+
+## 17.9 API 계약 변경 요약
+
+| Method | Path | 변경 |
+|---|---|---|
+| POST | `/agent/workflows/runs` | `recovery_required`는 `202`, Body 권한 필드/바인딩 위반은 `403`, 동시 실행은 `409 run_in_progress` |
+| POST | `/agent/workflows/runs/{id}/approve` | 승인자=인증 주체, 토큰이 run/step/capability/args에 바인딩 |
+| POST | `/agent/workflows/runs/{id}/resume` | 바인딩 불일치 `403`, recovery hold `409 recovery_required` |
+| POST | `/agent/workflows/runs/{id}/recovery` | **신규** `{action: retry|abandon}` |
+| GET | `/agent/workflows/tools` | `office_availability`, 스코프 필터된 `mcp` |
+| GET/POST/DELETE | `/agent/workflows/mcp/servers[/{id}]` | GET 신규(스코프 필터), POST/DELETE 관리자 전용, `tool_policies`/`policy_mode`/`allowed_hosts`/`command_allowlist` 추가 |
+| POST | `/agent/runs` | `execution_mode="workflow"` → R3 실행, `capabilities`/`workflow` 필드 추가 |
+| GET | `/agent/runs/{wfrun_*}` | R3 런을 `AgentRunResponse`로 조회 |
+
+오류 봉투(`{detail:{code,message,retryable,context}}`)와 `workflow.*` SSE 9종은 **변경 없음**.
+`recovery_required`는 새 이벤트를 만들지 않고 `workflow.checkpoint.saved`의 `checkpoint_status`와
+`WorkflowRunResult.status/recovery`로 노출한다(게이트웨이 계약 §13.4와 호환).
+
+## 17.10 검증 증빙
+
+```
+$ /workspace/.venv-r2canvas/bin/python -m pytest tests/test_r3_engines.py tests/test_r3_workflow_acceptance.py -q
+156 passed
+
+$ /workspace/.venv-r2canvas/bin/python -m pytest tests/test_r3_fix01_hardening.py -q
+57 passed
+
+$ /workspace/.venv-r2canvas/bin/python -m pytest -q
+636 passed, 1 failed
+# 유일한 실패: test_r1_2_final_addendum.py::test_add_02_durable_analysis_real_orchestrator_create_resume_and_no_legacy_fallback
+#  → 552df4b부터 존재하던 선행 결함(bootstrap.py:41 `_DummyNoop.create`), R3 범위 밖
+```
+
+시나리오 ↔ 테스트 클래스:
+
+| Acceptance | 테스트 |
+|---|---|
+| 1. 권한 없는 Workspace/Session 차단 | `TestFix01ExecutionScope` (5) + `TestFix01ToolPolicyIntegration` (2) |
+| 2. 동시 Resume/장애 복구 중복 방지 | `TestFix02IdempotencyAndConcurrency` (9) |
+| 3. 실제 로컬 stdio/HTTP MCP 연결·호출 | `TestFix03RealMcpTransport` (5) |
+| 4. 기존 Omni Agent에서 Workflow 진입 + 공통 훅 | `TestFix04OmniIntegration` (5) |
+| 5. LLM Planner 구조화 DAG / 일반 Chat 무호출 | `TestFix05LlmPlanner` (7) |
+| 6. 승인 토큰 바인딩·1회성·승인자 정본 | `TestFix06ApprovalSecurity` (8) |
+| 7. MCP 격리·SSRF·정책 우선 | `TestFix07McpToolIsolation` (7) |
+| 8. R2.1 Adapter `unavailable`/스코프 전달 | `TestFix08R21AdapterContract` (5) |
+| 기존 R2 보존 | `TestR2Preservation` (3) |
+
+## 17.11 남은 통합 항목 (정직한 미완)
+
+1. **R2.1 실 라우트 개통**: `office.*` 4종은 여전히 `unavailable`이다. AGPilot0006이 parser/writer
+   엔드포인트를 제공하면 `RuntimeOfficeAdapter.ENDPOINTS`와 `provided_capabilities`만 갱신하면 된다.
+2. **`workspace.rag.search` 실 스코프**: AGTools는 문서 단위 검색만 제공하므로 워크스페이스 단위 RAG는
+   여전히 Mock 또는 별도 서비스가 담당한다.
+3. **승인 UI 연동**: `pending_approval.target/args_hash`를 프런트 승인 화면에 표시하는 작업은
+   AGPilot0011 소관이다(본 저장소는 계약만 고정).
+4. **다중 프로세스 fan-out**: 실행권은 SQLite lease로 막지만, 실제 다중 워커 큐/디스패처는 범위 밖이다.
+5. **감사 로그**: recovery retry/abandon 결정은 checkpoint metadata에 기록되나, 별도 감사 저장소 연동은 미구현.

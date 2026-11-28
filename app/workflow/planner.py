@@ -1,4 +1,4 @@
-"""WP-01 R3 Planner — routing decision, execution plan and DAG contract.
+"""WP-01 / FIX-05 R3 Planner — routing decision, execution plan and DAG contract.
 
 The planner is the only component that decides *whether* a request becomes a workflow.
 Two routes exist and they are not interchangeable:
@@ -28,6 +28,7 @@ Design notes
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
@@ -42,6 +43,8 @@ __all__ = [
     "PlannerRequest",
     "PlannerDecision",
     "Planner",
+    "LLMPlannerAdapter",
+    "LLMPlannerError",
     "resolve_bindings",
     "validate_plan_dag",
 ]
@@ -66,6 +69,14 @@ class BindingResolutionError(PlannerError):
     def __init__(self, reference: str, detail: str = "") -> None:
         self.reference = reference
         super().__init__("binding_unresolved", f"{reference}{': ' + detail if detail else ''}")
+
+
+class LLMPlannerError(PlannerError):
+    """A model-produced plan was malformed, over budget or outside the granted capabilities."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.detail = detail
+        super().__init__(code, detail)
 
 
 # --------------------------------------------------------------------------------------
@@ -667,8 +678,10 @@ class Planner:
         max_replans: int = 1,
         max_estimated_tokens: int = 12_000,
         token_estimator: Optional[Any] = None,
+        llm: Optional["LLMPlannerAdapter"] = None,
     ) -> None:
         self.model = model
+        self.llm = llm
         self.skills = skills
         self.registry = registry
         self.rules = rules
@@ -684,27 +697,82 @@ class Planner:
         self.plans_built = 0
         self.replans_built = 0
         self.last_reason = ""
+        #: Where the last plan came from: ``deterministic`` | ``llm`` | ``deterministic_fallback``.
+        self.last_plan_source = "deterministic"
+        self.last_llm_error: Optional[Dict[str, str]] = None
+        self.llm_failures = 0
 
     # -- routing ----------------------------------------------------------------------
-    def plan(self, request: PlannerRequest) -> PlannerDecision:
+    def route(self, request: PlannerRequest) -> Tuple[str, str]:
+        """Decide ``direct_chat`` vs ``workflow`` *without* any model call or skill load.
+
+        This is the single place the fast-path guarantee rests on: both :meth:`plan` and
+        :meth:`aplan` ask :meth:`route` first, and a ``direct_chat`` answer returns before
+        the model-assisted planner is ever constructed.
+        """
         mode = request.execution_mode
         capabilities = tuple(request.available_capabilities)
-
         if mode == "direct":
-            return self._direct("explicit_direct_mode")
-
+            return "direct_chat", "explicit_direct_mode"
         if mode == "auto":
             if not capabilities:
-                return self._direct("fast_path_no_capability_required")
+                return "direct_chat", "fast_path_no_capability_required"
             if not self._looks_like_work(request):
-                return self._direct("fast_path_simple_query")
-
+                return "direct_chat", "fast_path_simple_query"
         if not capabilities:
             raise PlannerError("no_available_capability", "workflow mode requires at least one capability")
+        return "workflow", ("workflow_planned" if mode == "workflow" else "workflow_capability_signal")
 
+    def plan(self, request: PlannerRequest) -> PlannerDecision:
+        """Deterministic plan (no model call).  Used directly and as the LLM fallback."""
+        route, reason = self.route(request)
+        if route == "direct_chat":
+            return self._direct(reason)
         plan = self.build_plan(request)
-        self.last_reason = "workflow_planned" if mode == "workflow" else "workflow_capability_signal"
+        self.last_reason = reason
+        self.last_plan_source = "deterministic"
         return PlannerDecision(route="workflow", reason=self.last_reason, plan=plan)
+
+    async def aplan(self, request: PlannerRequest) -> PlannerDecision:
+        """Awaitable planning entry point used by the runtime and the ``/plan`` API.
+
+        FIX-05: when an :class:`LLMPlannerAdapter` is configured, the *workflow* route is
+        planned by the model; the ``direct_chat`` route is decided before that and returns
+        with ``model_calls`` unchanged.  A model plan that is malformed, over budget or
+        outside the granted capabilities falls back to the deterministic planner, so a bad
+        model answer can never fail a run that the rules could plan.
+        """
+        route, reason = self.route(request)
+        if route == "direct_chat":
+            return self._direct(reason)
+        if self.llm is None:
+            return self.plan(request)
+        if getattr(self.llm, "registry", None) is None and self.registry is not None:
+            # Give the adapter the same catalogue the rules planner sees (tool schemas).
+            self.llm.registry = self.registry
+
+        budget = request.budget or {}
+        max_steps = int(budget.get("max_steps", self.max_steps))
+        max_retries = int(budget.get("max_retries", self.max_retries))
+        self.model_calls += 1
+        try:
+            plan = await self.llm.aplan(
+                request,
+                available_capabilities=tuple(request.available_capabilities),
+                max_steps=max_steps,
+                max_retries=max_retries,
+                token_limit=int(budget.get("max_estimated_tokens", self.max_estimated_tokens)),
+                token_estimator=self._count_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001 - any model problem degrades to the rules
+            self.llm_failures += 1
+            self.last_llm_error = {"code": _llm_error_code(exc), "detail": str(exc)[:300]}
+            decision = self.plan(request)
+            self.last_plan_source = "deterministic_fallback"
+            return decision
+        self.last_reason = reason
+        self.last_plan_source = "llm"
+        return PlannerDecision(route="workflow", reason="llm_planned", plan=plan)
 
     def _direct(self, reason: str) -> PlannerDecision:
         self.last_reason = reason
@@ -860,3 +928,314 @@ class Planner:
         )
         self.replans_built += 1
         return replanned
+
+
+# --------------------------------------------------------------------------------------
+# FIX-05 — LLM planner adapter (AI Gateway)
+# --------------------------------------------------------------------------------------
+_PLAN_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["goal", "steps"],
+    "properties": {
+        "goal": {"type": "string"},
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["step_id", "capability"],
+                "properties": {
+                    "step_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]{0,63}$"},
+                    "name": {"type": "string"},
+                    "capability": {"type": "string"},
+                    "tool_name": {"type": ["string", "null"]},
+                    "skill_name": {"type": ["string", "null"]},
+                    "depends_on": {"type": "array", "items": {"type": "string"}},
+                    "parallel_group": {"type": ["string", "null"]},
+                    "input_bindings": {"type": "object"},
+                    "output_key": {"type": ["string", "null"]},
+                    "approval_required": {"type": "boolean"},
+                    "max_retries": {"type": "integer", "minimum": 0, "maximum": 10},
+                    "timeout_seconds": {"type": "number"},
+                    "condition": {"type": ["string", "null"]},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": False,
+}
+
+_LLM_SYSTEM_PROMPT = (
+    "You are the R3 workflow planner for AGCore. Return ONE JSON object and nothing else.\n"
+    "Rules:\n"
+    "- Only use capabilities from the provided catalogue; never invent a capability.\n"
+    "- Build a DAG: `depends_on` may only reference earlier step ids, no cycles.\n"
+    f"- At most {{max_steps}} steps.\n"
+    "- Pass data between steps with the binding language: $request.<field>, $context.<path>, "
+    "$scope.<field>, $outputs.<output_key>[.path], $steps.<step_id>[.path], $rules.<key>.\n"
+    "- Set approval_required=true for anything destructive or externally visible.\n"
+    "- Output must match this JSON schema: {schema}"
+)
+
+
+def _llm_error_code(exc: BaseException) -> str:
+    if isinstance(exc, PlannerError):
+        return exc.code
+    return f"llm_{type(exc).__name__.lower()}"
+
+
+class LLMPlannerAdapter:
+    """Gateway-backed planner that produces a structured :class:`ExecutionPlan`.
+
+    The adapter is deliberately thin: the gateway client (``app/gateway/client.py``) does
+    the transport, this class owns the prompt, the JSON contract and the *same* validation
+    the deterministic planner applies (capability grant, step budget, DAG validity).  A
+    model plan therefore cannot smuggle in a capability the caller was not granted, an
+    approval-free destructive step, or a cyclic graph.
+    """
+
+    def __init__(
+        self,
+        gateway: Any,
+        *,
+        max_tokens: int = 1_600,
+        temperature: float = 0.0,
+        timeout_seconds: float = 30.0,
+        route: Optional[str] = None,
+        registry: Optional[Any] = None,
+    ) -> None:
+        self.gateway = gateway
+        self.max_tokens = int(max_tokens)
+        self.temperature = float(temperature)
+        self.timeout_seconds = float(timeout_seconds)
+        self.route = route
+        self.registry = registry
+        self.calls = 0
+        self.last_error: Optional[str] = None
+
+    # -- capability catalogue -----------------------------------------------------------
+    def capability_catalogue(self, capabilities: Sequence[str]) -> List[Dict[str, Any]]:
+        """Describe the granted capabilities (and their schemas) in one compact block."""
+        catalogue: List[Dict[str, Any]] = []
+        specs = {}
+        if self.registry is not None:
+            try:
+                specs = {spec.capability: spec for spec in self.registry.list_specs()}
+            except Exception:  # noqa: BLE001 - the catalogue is advisory
+                specs = {}
+        for capability in capabilities:
+            spec = specs.get(capability)
+            entry: Dict[str, Any] = {"capability": capability}
+            if spec is not None:
+                entry.update({
+                    "tool": spec.qualified_name,
+                    "description": spec.description[:300],
+                    "input_schema": spec.input_schema,
+                    "side_effect": spec.side_effect,
+                    "approval_required": spec.approval_required,
+                })
+            catalogue.append(entry)
+        return catalogue
+
+    def build_messages(
+        self,
+        request: PlannerRequest,
+        *,
+        available_capabilities: Sequence[str],
+        max_steps: int,
+    ) -> List[Any]:
+        from app.schemas.gateway import GatewayMessage
+
+        system = _LLM_SYSTEM_PROMPT.format(
+            max_steps=max_steps, schema=json.dumps(_PLAN_JSON_SCHEMA, ensure_ascii=False),
+        )
+        user_payload = {
+            "query": request.query,
+            "capabilities": self.capability_catalogue(available_capabilities),
+            "context": _llm_safe_context(request.context),
+        }
+        return [
+            GatewayMessage(role="system", content=system),
+            GatewayMessage(role="user", content=json.dumps(user_payload, ensure_ascii=False, default=str)),
+        ]
+
+    # -- planning -----------------------------------------------------------------------
+    async def aplan(
+        self,
+        request: PlannerRequest,
+        *,
+        available_capabilities: Sequence[str],
+        max_steps: int,
+        max_retries: int,
+        token_limit: int,
+        token_estimator: Optional[Any] = None,
+    ) -> ExecutionPlan:
+        messages = self.build_messages(
+            request, available_capabilities=available_capabilities, max_steps=max_steps,
+        )
+        kwargs: Dict[str, Any] = {
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "timeout_seconds": self.timeout_seconds,
+            "response_format": {"type": "json_object"},
+        }
+        self.calls += 1
+        try:
+            reply = await self.gateway.complete(**kwargs)
+        except TypeError:
+            # Minimal gateway doubles may not accept every optional keyword.
+            reply = await self.gateway.complete(messages=messages)
+        except Exception as exc:  # noqa: BLE001 - transport problems become a planner error
+            self.last_error = f"{type(exc).__name__}: {exc}"[:300]
+            raise LLMPlannerError("llm_planner_unavailable", self.last_error) from exc
+
+        content = getattr(reply, "content", reply)
+        return self.parse_plan(
+            content,
+            request=request,
+            available_capabilities=available_capabilities,
+            max_steps=max_steps,
+            max_retries=max_retries,
+            token_limit=token_limit,
+            token_estimator=token_estimator,
+        )
+
+    # -- parsing ------------------------------------------------------------------------
+    @staticmethod
+    def _extract_json(content: Any) -> Dict[str, Any]:
+        if isinstance(content, Mapping):
+            return dict(content)
+        if not isinstance(content, str) or not content.strip():
+            raise LLMPlannerError("llm_plan_empty", "no content")
+        text = content.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            start, end = text.find("{"), text.rfind("}")
+            if start < 0 or end <= start:
+                raise LLMPlannerError("llm_plan_not_json", text[:200])
+            parsed = json.loads(text[start:end + 1])
+        if not isinstance(parsed, Mapping):
+            raise LLMPlannerError("llm_plan_not_object", type(parsed).__name__)
+        return dict(parsed)
+
+    def parse_plan(
+        self,
+        content: Any,
+        *,
+        request: PlannerRequest,
+        available_capabilities: Sequence[str],
+        max_steps: int,
+        max_retries: int,
+        token_limit: int,
+        token_estimator: Optional[Any] = None,
+    ) -> ExecutionPlan:
+        payload = self._extract_json(content)
+        raw_steps = payload.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise LLMPlannerError("llm_plan_without_steps", "steps must be a non-empty array")
+        if len(raw_steps) > int(max_steps):
+            raise LLMPlannerError("llm_plan_over_budget", f"steps={len(raw_steps)} max_steps={max_steps}")
+
+        granted = set(str(capability) for capability in available_capabilities)
+        steps: List[PlanStep] = []
+        for index, raw in enumerate(raw_steps, start=1):
+            if not isinstance(raw, Mapping):
+                raise LLMPlannerError("llm_plan_step_invalid", f"step#{index}")
+            capability = str(raw.get("capability") or "").strip()
+            if capability not in granted:
+                raise LLMPlannerError(
+                    "llm_plan_capability_denied", f"{capability or '<none>'} not granted",
+                )
+            try:
+                steps.append(PlanStep(
+                    step_id=str(raw.get("step_id") or f"s{index}"),
+                    name=str(raw.get("name") or capability),
+                    capability=capability,
+                    tool_name=raw.get("tool_name"),
+                    skill_name=raw.get("skill_name"),
+                    depends_on=tuple(str(item) for item in (raw.get("depends_on") or ())),
+                    parallel_group=raw.get("parallel_group"),
+                    input_bindings=dict(raw.get("input_bindings") or {}),
+                    output_key=raw.get("output_key"),
+                    approval_required=bool(raw.get("approval_required", False)),
+                    max_retries=int(raw.get("max_retries", 0) or 0),
+                    timeout_seconds=float(raw.get("timeout_seconds", 30) or 30),
+                    condition=raw.get("condition"),
+                ))
+            except Exception as exc:  # noqa: BLE001 - any schema problem rejects the plan
+                raise LLMPlannerError("llm_plan_step_invalid", f"step#{index}: {type(exc).__name__}: {exc}") from exc
+
+        try:
+            validate_plan_dag(steps, max_steps=int(max_steps))
+            plan = ExecutionPlan(
+                plan_id=f"plan_{uuid.uuid4().hex[:16]}",
+                goal=str(payload.get("goal") or request.query or "workflow")[:280],
+                steps=tuple(steps),
+                max_steps=int(max_steps),
+                max_retries=int(max_retries),
+                replan_on_failure=bool((request.budget or {}).get("replan_on_failure", True)),
+                notes=("source=llm_planner",),
+            )
+        except PlannerError as exc:
+            # The deterministic planner's own DAG/budget codes are reported as one model-plan
+            # failure so the fallback path is unambiguous.
+            raise LLMPlannerError("llm_plan_invalid_dag", f"{exc.code}: {exc.detail}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise LLMPlannerError("llm_plan_invalid_dag", f"{type(exc).__name__}: {exc}") from exc
+
+        estimator = token_estimator or (lambda text: max(1, (len(text) + 3) // 4))
+        estimated = int(estimator(json.dumps([step.model_dump(mode="json") for step in steps], ensure_ascii=False)))
+        if estimated > int(token_limit):
+            raise LLMPlannerError("llm_plan_token_budget", f"estimated={estimated} limit={token_limit}")
+        return plan.model_copy(update={"estimated_tokens": estimated})
+
+
+_SECRET_CONTEXT_KEYS = ("token", "secret", "password", "api_key", "authorization", "credential")
+
+
+def _llm_safe_context(context: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Never hand a credential to the planner model."""
+    cleaned: Dict[str, Any] = {}
+    for key, value in (context or {}).items():
+        if any(marker in str(key).lower() for marker in _SECRET_CONTEXT_KEYS):
+            continue
+        if isinstance(value, Mapping):
+            cleaned[str(key)] = _llm_safe_context(value)
+        elif isinstance(value, (list, tuple)):
+            cleaned[str(key)] = [
+                _llm_safe_context(item) if isinstance(item, Mapping) else item for item in value
+            ]
+        else:
+            cleaned[str(key)] = value
+    return cleaned
+
+
+def build_llm_planner(
+    gateway: Optional[Any] = None,
+    *,
+    registry: Optional[Any] = None,
+    route: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> Optional[LLMPlannerAdapter]:
+    """Construct the LLM planner when it is configured (``AGCORE_R3_LLM_PLANNER``).
+
+    ``enabled=None`` reads the environment (``on|true|1``).  Without a gateway the adapter is
+    ``None`` and the deterministic planner stays authoritative.
+    """
+    if enabled is None:
+        enabled = (os.environ.get("AGCORE_R3_LLM_PLANNER") or "").strip().lower() in ("on", "true", "1", "yes")
+    if not enabled:
+        return None
+    if gateway is None:
+        try:
+            from app.gateway.client import gateway_client
+
+            gateway = gateway_client
+        except Exception:  # noqa: BLE001 - planner stays deterministic when the gateway is unavailable
+            return None
+    return LLMPlannerAdapter(gateway, registry=registry, route=route)

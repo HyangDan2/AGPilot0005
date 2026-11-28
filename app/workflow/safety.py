@@ -39,9 +39,11 @@ __all__ = [
     "ScopeViolation",
     "assert_scope_access",
     "ApprovalToken",
+    "ApprovalBinding",
     "ApprovalRecord",
     "ApprovalError",
     "ApprovalAuthority",
+    "approval_args_hash",
     "InjectionScan",
     "TaggedContent",
     "PromptInjectionError",
@@ -204,6 +206,61 @@ def assert_scope_access(
 ApprovalSource = Literal["user", "model", "system"]
 
 
+def approval_args_hash(arguments: Optional[Mapping[str, Any]]) -> str:
+    """Stable digest of the exact arguments an approval was granted for (FIX-06).
+
+    The digest covers the resolved step parameters, so an approval for
+    ``{"path": "reports/a.md"}`` can never be replayed for ``reports/b.md`` or for a
+    different amount/number.  Values are canonicalised as sorted JSON.
+    """
+    payload = json.dumps(arguments or {}, sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class ApprovalBinding(BaseModel):
+    """The exact action an approval token is bound to (FIX-06).
+
+    ``run_id`` + ``step_id`` + ``capability`` + ``target`` + ``args_hash`` are covered by
+    the token signature, so a token cannot be moved to another run, step, capability or
+    argument set - not even by a party that can read the token.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: Optional[str] = None
+    step_id: Optional[str] = None
+    capability: Optional[str] = None
+    target: Optional[str] = None
+    args_hash: Optional[str] = None
+
+    @property
+    def is_bound(self) -> bool:
+        return any(
+            value is not None
+            for value in (self.run_id, self.step_id, self.capability, self.target, self.args_hash)
+        )
+
+    def mismatched(self, other: "ApprovalBinding") -> List[str]:
+        """Fields the caller expects that the token does not carry (or carries differently)."""
+        fields: List[str] = []
+        for field in ("run_id", "step_id", "capability", "target", "args_hash"):
+            expected = getattr(other, field)
+            if expected is None:
+                continue
+            if getattr(self, field) != expected:
+                fields.append(field)
+        return fields
+
+    def model_dump_binding(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "step_id": self.step_id,
+            "capability": self.capability,
+            "target": self.target,
+            "args_hash": self.args_hash,
+        }
+
+
 class ApprovalToken(BaseModel):
     """Signed proof that a specific action was approved inside a specific scope."""
 
@@ -218,6 +275,12 @@ class ApprovalToken(BaseModel):
     expires_at: datetime
     nonce: Optional[str] = None
     signature: Optional[str] = None
+    # -- FIX-06: the token is bound to the exact run/step/capability/arguments it approves
+    run_id: Optional[str] = None
+    step_id: Optional[str] = None
+    capability: Optional[str] = None
+    target: Optional[str] = None
+    args_hash: Optional[str] = None
 
     @field_validator("approval_id", "scope_hash")
     @classmethod
@@ -229,6 +292,16 @@ class ApprovalToken(BaseModel):
     def is_expired(self, now: Optional[datetime] = None) -> bool:
         return (now or _utcnow()) >= self.expires_at
 
+    @property
+    def binding(self) -> ApprovalBinding:
+        return ApprovalBinding(
+            run_id=self.run_id,
+            step_id=self.step_id,
+            capability=self.capability,
+            target=self.target,
+            args_hash=self.args_hash,
+        )
+
     def canonical_payload(self) -> str:
         payload = {
             "approval_id": self.approval_id,
@@ -239,6 +312,11 @@ class ApprovalToken(BaseModel):
             "issued_at": self.issued_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
             "nonce": self.nonce,
+            "run_id": self.run_id,
+            "step_id": self.step_id,
+            "capability": self.capability,
+            "target": self.target,
+            "args_hash": self.args_hash,
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -253,6 +331,11 @@ class ApprovalRecord(BaseModel):
     approved_by: Optional[str] = None
     approved_at: datetime
     expires_at: datetime
+    run_id: Optional[str] = None
+    step_id: Optional[str] = None
+    capability: Optional[str] = None
+    target: Optional[str] = None
+    args_hash: Optional[str] = None
 
 
 class ApprovalError(PermissionError):
@@ -283,6 +366,11 @@ class ApprovalAuthority:
             raise ValueError("approval_secret_required")
         self._secret = secret
         self.default_ttl_seconds = max(1, int(default_ttl_seconds))
+        # FIX-06: consumed nonces (one-time approval).  Bounded so a long-lived process
+        # cannot grow without limit; the oldest entries fall out first.
+        self._consumed_nonces: Dict[str, None] = {}
+        self._max_consumed_nonces = 8192
+        self._nonce_lock = threading.RLock()
 
     # -- issuance ---------------------------------------------------------------------
     def issue_user_approval(
@@ -292,6 +380,11 @@ class ApprovalAuthority:
         approved_by: str,
         ttl_seconds: Optional[int] = None,
         approval_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        capability: Optional[str] = None,
+        target: Optional[str] = None,
+        args_hash: Optional[str] = None,
     ) -> ApprovalToken:
         if not approved_by or not approved_by.strip():
             raise ApprovalError("approver_required")
@@ -302,6 +395,13 @@ class ApprovalAuthority:
             approval_source="user",
             ttl_seconds=ttl_seconds,
             approval_id=approval_id,
+            binding=ApprovalBinding(
+                run_id=run_id,
+                step_id=step_id,
+                capability=capability,
+                target=target,
+                args_hash=args_hash,
+            ),
         )
 
     def issue_model_approval(
@@ -319,6 +419,7 @@ class ApprovalAuthority:
             approval_source="model",
             ttl_seconds=ttl_seconds,
             approval_id=approval_id,
+            binding=ApprovalBinding(),
         )
 
     def _issue(
@@ -330,6 +431,7 @@ class ApprovalAuthority:
         approval_source: ApprovalSource,
         ttl_seconds: Optional[int],
         approval_id: Optional[str],
+        binding: ApprovalBinding,
     ) -> ApprovalToken:
         now = _utcnow()
         ttl = self.default_ttl_seconds if ttl_seconds is None else int(ttl_seconds)
@@ -344,6 +446,7 @@ class ApprovalAuthority:
             issued_at=now,
             expires_at=now + timedelta(seconds=ttl),
             nonce=uuid.uuid4().hex,
+            **binding.model_dump_binding(),
         )
         return unsigned.model_copy(update={"signature": self._sign(unsigned)})
 
@@ -362,8 +465,17 @@ class ApprovalAuthority:
         token: Optional[Any],
         *,
         now: Optional[datetime] = None,
+        expected: Optional[ApprovalBinding] = None,
+        consume: bool = True,
     ) -> ApprovalRecord:
-        """Return an :class:`ApprovalRecord` or raise :class:`ApprovalError`."""
+        """Return an :class:`ApprovalRecord` or raise :class:`ApprovalError`.
+
+        ``expected`` is the action the caller is about to perform.  A token that carries a
+        binding must match it field by field, and a binding-carrying token can never be
+        verified without one (that would let a caller strip the context it was issued
+        for).  Successful verification consumes the token's nonce, so the same approval can
+        never authorise a second execution.
+        """
         if token is None:
             raise ApprovalError("approval_required")
         if isinstance(token, Mapping):
@@ -384,11 +496,26 @@ class ApprovalAuthority:
         if not hmac.compare_digest(expected_scope, token.scope_hash):
             raise ApprovalError("scope_mismatch")
 
+        # FIX-06: action binding.  Checked before expiry so a replayed token reports the
+        # real reason, and before the nonce is consumed so a rejected token stays unusable.
+        token_binding = token.binding
+        if token_binding.is_bound:
+            if expected is None:
+                raise ApprovalError("approval_binding_required")
+            mismatched = token_binding.mismatched(expected)
+            if mismatched:
+                raise ApprovalError("approval_binding_mismatch", ",".join(mismatched))
+        elif expected is not None and expected.is_bound:
+            raise ApprovalError("approval_binding_required", "token_is_unbound")
+
         current = now or _utcnow()
         if current >= token.expires_at:
             raise ApprovalError("expired_approval")
         if token.issued_at > current + timedelta(seconds=60):
             raise ApprovalError("not_yet_valid")
+
+        if consume and token.nonce:
+            self._consume_nonce(token.nonce)
 
         return ApprovalRecord(
             approval_id=token.approval_id,
@@ -396,7 +523,26 @@ class ApprovalAuthority:
             approved_by=token.approved_by,
             approved_at=token.issued_at,
             expires_at=token.expires_at,
+            run_id=token.run_id,
+            step_id=token.step_id,
+            capability=token.capability,
+            target=token.target,
+            args_hash=token.args_hash,
         )
+
+    def _consume_nonce(self, nonce: str) -> None:
+        with self._nonce_lock:
+            if nonce in self._consumed_nonces:
+                raise ApprovalError("approval_replayed", "nonce_already_consumed")
+            self._consumed_nonces[nonce] = None
+            while len(self._consumed_nonces) > self._max_consumed_nonces:
+                self._consumed_nonces.pop(next(iter(self._consumed_nonces)), None)
+
+    def is_consumed(self, nonce: Optional[str]) -> bool:
+        if not nonce:
+            return False
+        with self._nonce_lock:
+            return nonce in self._consumed_nonces
 
 
 # --------------------------------------------------------------------------------------
