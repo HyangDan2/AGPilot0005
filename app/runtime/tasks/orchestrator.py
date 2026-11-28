@@ -3,6 +3,8 @@ import asyncio
 import hashlib
 import re
 import uuid
+from app.core.auth import current_run_conversation_id
+from app.core.session_attachments import is_session_attachment
 from .domain import AccessContext, Task, BudgetLedger, Evidence, Draft, Verification, BudgetExceeded
 from .ports import ScopedDocuments
 from .services import estimate
@@ -46,6 +48,10 @@ class TaskOrchestrator:
         for ref in task.analysis_refs:
             previous = self.repository.load(ref)
             if previous is None or not previous.owned_by(access):
+                raise ValueError('analysis_reference_unavailable')
+            if any(is_session_attachment(doc) for doc in (*refs, *previous.document_ids)) and (
+                not task.session_id or task.session_id != previous.session_id
+            ):
                 raise ValueError('analysis_reference_unavailable')
             if refs and not set(previous.document_ids).issubset(refs):
                 continue
@@ -117,8 +123,12 @@ class TaskOrchestrator:
         self.progress.event(task, 'tool', label, item_id=call_id)
         scoped = ScopedDocuments(self.documents, AccessContext(owner=task.owner_id, service=task.service_id))
         remaining = task.budget.deadline - self.clock()
-        async with asyncio.timeout(min(30, remaining)):
-            result = await scoped.call(name, *args)
+        conversation_token = current_run_conversation_id.set(task.session_id)
+        try:
+            async with asyncio.timeout(min(30, remaining)):
+                result = await scoped.call(name, *args)
+        finally:
+            current_run_conversation_id.reset(conversation_token)
         if result.get('error'): raise ValueError('document_' + str(result.get('code', 'read_failed')))
         self.progress.event(task, 'tool', label, status='done', item_id=call_id, duration_ms=round((self.clock()-started)*1000))
         return result

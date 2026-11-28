@@ -1415,3 +1415,148 @@ async def test_r2_beta_hotfix_04_edit_output_sanitization_and_capabilities_verif
         assert "```" not in p2["replacement_text"]
         assert "수정 내역" not in p2["replacement_text"]
         assert "전통적인 서신" not in p2["replacement_text"]
+
+
+@pytest.mark.asyncio
+async def test_session_attachment_workspace_and_parser_scope(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import httpx
+    from app.adapters import document
+    from app.tools.policy import tool_policy
+
+    gateway = ScriptedGateway([])
+    workspace, _ = _setup_r2_env(monkeypatch, tmp_path, gateway)
+    monkeypatch.setenv("AGCORE_SESSION_ATTACHMENT_SERVICES", "hd2ai-beta")
+    monkeypatch.setattr(settings, "AGTOOLS_TOKEN", "sandbox-parser-token")
+    monkeypatch.setattr(settings, "ALLOW_MOCK_FALLBACK", False)
+    headers = _proxy_headers(service="hd2ai-beta")
+    scope = _scope(service="hd2ai-beta")
+    folder = workspace.manager.new_workspace(scope, "mixed-folder")
+    workspace.manager.write_file(folder.workspace_id, scope, WorkspaceWriteRequest(
+        path="workspace.md", content="workspace-only-fixture", create_parents=True,
+    ))
+
+    uploads = set()
+    calls = []
+
+    def agtools(request):
+        tenant = request.headers["X-Tenant-Id"]
+        assert request.headers.get("X-Access-Scope") == "private"
+        key = (tenant, request.headers["X-Owner-Id"])
+        calls.append((request.method, request.url.path, key))
+        if request.method == "POST" and request.url.path.endswith("/documents"):
+            assert b"%PDF" in request.content
+            uploads.add(key)
+            return httpx.Response(202, json={"document_id": "doc-scoped", "status": "queued"})
+        if key not in uploads:
+            return httpx.Response(404, json={"detail": "not found"})
+        if request.url.path.endswith("/outline"):
+            return httpx.Response(200, json={"status": "completed", "filename": "fixture.pdf", "sections": []})
+        if request.url.path.endswith("/text"):
+            return httpx.Response(200, json={"text": "attachment-only-fixture", "internal_path": "private"})
+        if request.url.path.endswith("/search"):
+            return httpx.Response(200, json={"total_matches": 1, "results": [{"snippet": "attachment-only-fixture"}]})
+        return httpx.Response(200, json={"status": "completed", "page_count": 1})
+
+    monkeypatch.setattr(document, "httpx", SimpleNamespace(
+        AsyncClient=lambda **kwargs: AsyncClient(transport=httpx.MockTransport(agtools), **kwargs),
+    ))
+    monkeypatch.setattr(document.document_adapter, "http", document.AGToolsHttpAdapter())
+    original_allow = tool_policy.is_tool_allowed
+    monkeypatch.setattr(tool_policy, "is_tool_allowed", lambda name, service: (
+        (True, None) if name == "document.search" else original_allow(name, service)
+    ))
+    gateway.script = [
+        {"tool_calls": [
+            ToolCall(id="workspace-1", function=FunctionCall(
+                name="workspace_read_file", arguments='{"path":"workspace.md"}')),
+            ToolCall(id="attachment-1", function=FunctionCall(
+                name="document.search", arguments='{"doc_id":"att-doc-scoped","query":"fixture"}')),
+        ]},
+        {"content": "both sources"},
+    ]
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        prefix = "/api/v1/conversations"
+        for name, workspace_id in (("one", folder.workspace_id), ("two", folder.workspace_id), ("general", None)):
+            response = await client.put(f"{prefix}/{name}/workspace", headers=headers, json={"workspace_id": workspace_id})
+            assert response.status_code == 200, response.text
+        pdf = {"file": ("fixture.pdf", b"%PDF-synthetic", "application/pdf")}
+        response = await client.post(f"{prefix}/one/attachments", headers=headers, files=pdf)
+        assert response.status_code == 202, response.text
+        attachment = response.json()["document_id"]
+        assert attachment == "att-doc-scoped"
+        assert (await client.post(f"{prefix}/missing/attachments", headers=headers, files=pdf)).status_code == 404
+        for name in ("two", "general"):
+            assert (await client.get(f"{prefix}/{name}/attachments/{attachment}/status", headers=headers)).status_code == 404
+        other_user = _proxy_headers(user="bob", service="hd2ai-beta")
+        assert (await client.get(f"{prefix}/one/attachments/{attachment}/status", headers=other_user)).status_code == 404
+        assert (await client.post(f"{prefix}/one/attachments", headers=_proxy_headers(), files=pdf)).status_code == 403
+        response = await client.get(f"{prefix}/one/attachments/{attachment}/text", headers=headers)
+        assert response.json() == {"document_id": attachment, "text": "attachment-only-fixture"}
+        response = await client.post("/api/v1/agent/runs", headers=headers, json={
+            "message": "check", "conversation_id": "one", "session_id": "two", "context_refs": [attachment],
+        })
+        assert response.status_code == 409
+        response = await client.post("/api/v1/agent/runs", headers=headers, json={
+            "message": "check", "conversation_id": "two", "context_refs": [attachment],
+        })
+        assert response.status_code == 422
+        response = await client.post("/api/v1/agent/runs", headers=headers, json={
+            "message": "Use both sources", "conversation_id": "one", "context_refs": [attachment], "stream": True,
+        })
+        assert response.status_code == 200
+        events = _parse_sse(response.text)
+        assert any(event["event"] == "run.completed" for event in events), response.text
+        status_url = "/api/v1/agent/runs/" + events[0]["data"]["run_id"]
+        assert (await client.get(status_url, headers=headers)).status_code == 404
+        assert (await client.get(status_url, headers=headers, params={"conversation_id": "two"})).status_code == 404
+        assert (await client.get(status_url + "/trajectory", headers=headers)).status_code == 404
+        for session in ("two", None):
+            response = await client.post(status_url + "/feedback", headers=headers,
+                params={"conversation_id": session} if session else {}, json={"feedback_type": "thumbs_up"})
+            assert response.status_code == 404
+        positive_feedback = await client.post(status_url + "/feedback", headers=headers,
+            params={"conversation_id": "one"}, json={"feedback_type": "thumbs_up"})
+        assert positive_feedback.status_code == 201, positive_feedback.text
+        result = await client.get(status_url, headers=headers, params={"conversation_id": "one"})
+        traces = {trace["tool_call_id"]: trace for trace in result.json()["traces"]}
+        assert traces["workspace-1"]["status"] == "completed"
+        assert traces["attachment-1"]["status"] == "completed"
+        assert any(method == "POST" and path.endswith("/search") and key in uploads for method, path, key in calls)
+
+        monkeypatch.setenv("AGCORE_DURABLE_ANALYSIS_SERVICES", "hd2ai-beta")
+        from app.runtime.tasks.bootstrap import AnalysisServices
+
+        created = []
+
+        async def create(owner, service, message, refs, history, prior, session, effort):
+            created.append((owner, service, refs, session))
+            return {"job_id": "ana_" + "a" * 32, "status": "queued"}
+
+        previous = {"owner_id": "tenant-a::alice", "service_id": "hd2ai-beta",
+                    "session_id": "general", "document_ids": [attachment], "schema_version": 2}
+        management = AnalysisServices(None, SimpleNamespace(create=create), SimpleNamespace(read=lambda _: previous))
+        monkeypatch.setattr(app.state, "analysis_services", management, raising=False)
+        payload = {"message": "Read PDF", "conversation_id": "general",
+                   "execution_mode": "document_analysis", "context_refs": [attachment]}
+        assert (await client.post("/api/v1/agent/runs", headers=headers, json=payload)).status_code == 422
+        assert not created
+        assert (await client.post(f"{prefix}/general/attachments", headers=headers, files=pdf)).status_code == 202
+        assert (await client.post("/api/v1/agent/runs", headers=headers, json=payload)).status_code == 202
+        assert created == [("tenant-a::alice", "hd2ai-beta", [attachment], "general")]
+        assert (await client.get("/api/v1/agent/analyses/ana_" + "a" * 32, headers=headers,
+                                 params={"conversation_id": "two"})).status_code == 404
+        with pytest.raises(ValueError, match="analysis_reference_unavailable"):
+            await management.create(
+                "alice", "hd2ai-beta", "Continue", [], analysis_refs=["ana_" + "a" * 32],
+                session_id="two", tenant_id="tenant-a",
+            )
+        previous["document_ids"] = ["legacy-doc"]
+        legacy_resume = await client.post("/api/v1/agent/runs", headers=headers, json={
+            "message": "Use my prior legacy analysis", "analysis_refs": ["ana_" + "a" * 32],
+            "conversation_id": "legacy-unbound",
+        })
+        assert legacy_resume.status_code == 202, legacy_resume.text
+        assert created[-1] == ("tenant-a::alice", "hd2ai-beta", ["legacy-doc"], None)

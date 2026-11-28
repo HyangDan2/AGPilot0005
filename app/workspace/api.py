@@ -12,6 +12,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.core.auth import ExecutionScope, resolve_caller_scope
+from app.core.http_uploads import parse_multipart_upload
 from app.workspace.contracts import (
     ArtifactReferenceInput,
     ContextRequest,
@@ -107,33 +108,6 @@ def _ensure_index_ready(runtime: WorkspaceRuntime, workspace_id: str) -> None:
         raise WorkspaceFailure(WorkspaceErrorCode.INDEX_NOT_READY, "workspace has no indexed content yet")
 
 
-def _parse_multipart_upload(content_type: str, body: bytes) -> tuple[str, Optional[str], bytes, Dict[str, str]]:
-    """Stdlib multipart/form-data parser avoiding external python-multipart dependency."""
-    from email.parser import BytesParser
-    from email.policy import default as email_default
-
-    raw_msg = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
-    msg = BytesParser(policy=email_default).parsebytes(raw_msg)
-    if not msg.is_multipart():
-        raise HTTPException(status_code=400, detail={"code": "invalid_request", "message": "multipart/form-data required"})
-
-    filename = "upload.bin"
-    file_mime: Optional[str] = None
-    file_bytes: Optional[bytes] = None
-    fields: Dict[str, str] = {}
-    for part in msg.iter_parts():
-        field_name = part.get_param("name", header="content-disposition")
-        part_filename = part.get_filename()
-        payload = part.get_payload(decode=True) or b""
-        if field_name == "file" or part_filename is not None:
-            filename = part_filename or filename
-            file_mime = part.get_content_type()
-            file_bytes = payload
-        elif field_name:
-            fields[str(field_name)] = payload.decode("utf-8", errors="replace")
-    if file_bytes is None:
-        raise HTTPException(status_code=422, detail={"code": "invalid_request", "message": "missing multipart file field"})
-    return filename, file_mime, file_bytes, fields
 
 
 # ----------------------------------------------------------------------------- workspaces
@@ -383,7 +357,7 @@ async def upload_file(
     runtime.manager.get_workspace(workspace_id, scope)  # access check before reading the body
     content_type = request.headers.get("content-type") or ""
     body = await request.body()
-    filename, file_mime, file_bytes, fields = _parse_multipart_upload(content_type, body)
+    filename, file_mime, file_bytes, fields = parse_multipart_upload(content_type, body)
     parent_id = fields.get("parent_id") or None
     overwrite = str(fields.get("overwrite", "false")).strip().lower() in {"1", "true", "yes", "on"}
     raw_expected = fields.get("expected_revision")

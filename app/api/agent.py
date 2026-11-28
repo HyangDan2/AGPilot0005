@@ -4,14 +4,18 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Literal, Optional
 from starlette.concurrency import run_in_threadpool
+from app.adapters.document import document_adapter
 from app.api.conversations import resolve_run_binding
+from app.api.document_analysis import require_analysis_session
 from app.config import is_durable_analysis_enabled_for_service
 from app.core.auth import (
     current_execution_scope,
+    current_run_conversation_id,
     require_authenticated_caller,
     scoped_analysis_owner,
 )
 from app.runtime.event_bus import EventReplayExpiredError
+from app.core.session_attachments import ATTACHMENT_RUN_PREFIX, attachments_enabled, is_session_attachment
 from app.runtime.runner import runner, DocumentReferenceError
 from app.schemas.agent import AgentRunRequest, AgentRunResponse
 from app.tools.registry import registry
@@ -38,6 +42,22 @@ class RunFeedbackRequest(BaseModel):
 def durable_job(run_id):
     return 'ana_' + run_id[4:] if re.fullmatch(r'run-[a-f0-9]{32}', run_id) else None
 
+
+def require_run_session(session, request: Request) -> None:
+    state = session.state
+    if any(is_session_attachment(ref) for ref in state.context_refs) and (
+        not state.conversation_id or request.query_params.get("conversation_id") != state.conversation_id
+    ):
+        raise HTTPException(404, "SESSION_NOT_FOUND")
+
+
+def require_attachment_telemetry_session(run_id: str, request: Request) -> None:
+    if run_id.startswith(ATTACHMENT_RUN_PREFIX):
+        session = runner.get_session(run_id)
+        if session is None:
+            raise HTTPException(404, "SESSION_NOT_FOUND")
+        require_run_session(session, request)
+
 @router.post("/runs")
 async def create_agent_run(req: AgentRunRequest, request: Request):
     """Initiates an agent run session with verified Caller ExecutionScope (FIX-201 / FIX-202)."""
@@ -53,6 +73,19 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
     workspace_active = bool((req.workspace_id or "").strip())
     has_document_refs = bool(req.context_refs or req.analysis_refs)
     analysis_enabled = is_durable_analysis_enabled_for_service(service_id)
+    managed_attachments = [ref for ref in req.context_refs if is_session_attachment(ref)]
+    managed_history = None
+    if analysis_enabled and req.analysis_refs and not workspace_active:
+        detect = getattr(services(request.app), "references_attachments", None)
+        managed_history = detect and detect(req.analysis_refs, owner, service_id, scope.tenant_id)
+    if managed_attachments or managed_history:
+        if not attachments_enabled(service_id):
+            raise HTTPException(403, "session_attachments_disabled")
+        if not req.bind_workspace or not req.conversation_id:
+            raise HTTPException(422, "attachment_conversation_required")
+        if req.session_id is not None and req.session_id != req.conversation_id:
+            raise HTTPException(409, "attachment_conversation_conflict")
+        req = req.model_copy(update={"session_id": req.conversation_id})
     if mode == "workspace" and not workspace_active:
         raise HTTPException(422, "workspace_id_required")
     if workspace_active and mode not in (None, "workspace"):
@@ -68,7 +101,12 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
     )
     if use_analysis:
         tok = current_execution_scope.set(scope)
+        conversation_token = current_run_conversation_id.set(req.conversation_id)
         try:
+            for ref in managed_attachments:
+                outline = await document_adapter.get_outline(ref)
+                if outline.get("error") or outline.get("status") != "completed":
+                    raise HTTPException(422, "attachment_unavailable_or_pending")
             job = await services(request.app).create(
                 owner,
                 service_id,
@@ -83,6 +121,7 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         finally:
+            current_run_conversation_id.reset(conversation_token)
             current_execution_scope.reset(tok)
         run_id = 'run-' + job['job_id'][4:]
         if req.stream:
@@ -92,9 +131,8 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
             return StreamingResponse(deferred(), media_type='text/event-stream', headers={'Cache-Control':'no-store','X-Accel-Buffering':'no'})
         return JSONResponse({'run_id': run_id, **job}, status_code=202)
     if workspace_active:
-        # A workspace can remain active while unrelated session attachments are present.
-        # Keep only the selected context so stale attachments cannot redirect or block it.
-        req = req.model_copy(update={"context_refs": [], "analysis_refs": []})
+        # Keep the Workspace executor and admit only conversation-scoped attachments.
+        req = req.model_copy(update={"context_refs": managed_attachments, "analysis_refs": []})
     try:
         session = await runner.create_run(req, service_id=service_id, owner_id=owner, caller_scope=scope)
     except DocumentReferenceError as exc:
@@ -134,7 +172,9 @@ async def get_agent_run(run_id: str, request: Request):
     scope = require_authenticated_caller(request)
     job_id = durable_job(run_id)
     if job_id:
-        job = services(request.app).get(job_id, scope.owner_id, scope.service_id, tenant_id=scope.tenant_id)
+        manager = services(request.app)
+        require_analysis_session(manager, job_id, request)
+        job = manager.get(job_id, scope.owner_id, scope.service_id, tenant_id=scope.tenant_id)
         if job is None: raise HTTPException(404, 'Run not found')
         return AgentRunResponse(run_id=run_id, agent_id='general-agent', status=job['status'], answer=job['answer'], model_label=job.get('model_label'),
             usage={'job_id':job_id,'model_calls':job['model_calls'],'document_calls':job.get('document_calls',0)},
@@ -152,6 +192,7 @@ async def get_agent_run(run_id: str, request: Request):
     if not session:
         raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
         
+    require_run_session(session, request)
     state = session.state
     return AgentRunResponse(
         run_id=state.run_id,
@@ -177,7 +218,9 @@ async def get_agent_events(run_id: str, request: Request):
     scope = require_authenticated_caller(request)
     job_id = durable_job(run_id)
     if job_id:
-        job = services(request.app).get(job_id, scope.owner_id, scope.service_id, tenant_id=scope.tenant_id)
+        manager = services(request.app)
+        require_analysis_session(manager, job_id, request)
+        job = manager.get(job_id, scope.owner_id, scope.service_id, tenant_id=scope.tenant_id)
         if job is None: raise HTTPException(404, 'Run not found')
         async def snapshot():
             yield 'event: run.deferred\ndata: ' + json.dumps({'run_id':run_id,'job_id':job_id,'status':job['status']}) + '\n\n'
@@ -195,6 +238,7 @@ async def get_agent_events(run_id: str, request: Request):
     if not session:
         raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
 
+    require_run_session(session, request)
     last_event_id = request.headers.get("Last-Event-ID") or request.query_params.get("last_event_id")
     # HF-05: Atomically validate cursor + snapshot replay + register subscriber BEFORE StreamingResponse!
     try:
@@ -222,7 +266,9 @@ async def cancel_agent_run(run_id: str, request: Request):
     scope = require_authenticated_caller(request)
     job_id = durable_job(run_id)
     if job_id:
-        job = services(request.app).cancel(job_id, scope.owner_id, scope.service_id, tenant_id=scope.tenant_id)
+        manager = services(request.app)
+        require_analysis_session(manager, job_id, request)
+        job = manager.cancel(job_id, scope.owner_id, scope.service_id, tenant_id=scope.tenant_id)
         if job is None: raise HTTPException(404, 'Run not found')
         return {'run_id':run_id,'status':job['status']}
     session, lookup_err = runner.lookup_session(
@@ -237,6 +283,7 @@ async def cancel_agent_run(run_id: str, request: Request):
         return JSONResponse(status_code=410, content={"error_code": "SESSION_EXPIRED", "detail": "Session has expired."})
     if not session:
         raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
+    require_run_session(session, request)
     success = await runner.cancel_run(run_id)
     if not success:
         raise HTTPException(status_code=400, detail="Cannot cancel run (already finished or not found).")
@@ -249,6 +296,7 @@ async def submit_run_feedback(run_id: str, body: RunFeedbackRequest, request: Re
     scope = require_authenticated_caller(request)
     if not re.fullmatch(r"run-[A-Za-z0-9_-]{4,64}", run_id):
         raise HTTPException(status_code=422, detail="invalid_run_id")
+    require_attachment_telemetry_session(run_id, request)
 
     tlogger = get_trajectory_logger()
     meta = tlogger.store.get_run_metadata(run_id)
@@ -334,6 +382,7 @@ async def get_run_trajectory(run_id: str, request: Request):
     scope = require_authenticated_caller(request)
     if not re.fullmatch(r"run-[A-Za-z0-9_-]{4,64}", run_id):
         raise HTTPException(status_code=422, detail="invalid_run_id")
+    require_attachment_telemetry_session(run_id, request)
 
     tlogger = get_trajectory_logger()
     meta = tlogger.store.get_run_metadata(run_id)

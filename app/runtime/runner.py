@@ -15,6 +15,7 @@ from app.schemas.agent import AgentRunRequest, AgentRunResponse, ToolExecutionTr
 from app.schemas.events import SSEEvent
 from app.schemas.gateway import GatewayMessage
 from app.adapters.document import document_adapter, document_owner_id
+from app.core.session_attachments import ATTACHMENT_RUN_PREFIX, is_session_attachment
 from app.runtime.event_bus import RunEventBus
 from app.runtime.fence import HardDeadline, TerminalStateFence
 
@@ -199,6 +200,7 @@ class AgentRunner:
             tenant_id = "public_tenant" if service_id == "hd2ai-public" else settings.AGTOOLS_TENANT
             is_authenticated = True
 
+        prefix = ATTACHMENT_RUN_PREFIX if any(is_session_attachment(ref) for ref in req.context_refs) else "run-"
         # HF-06: Atomic synchronous admission check & placeholder reservation inside lock (ZERO await inside lock!)
         async with self._lock:
             self.evict_expired_sessions()
@@ -208,7 +210,7 @@ class AgentRunner:
             )
             if active_count >= self.max_active_runs:
                 raise RuntimeError("active_run_limit_exceeded")
-            run_id = f"run-{uuid.uuid4().hex[:16]}"
+            run_id = f"{prefix}{uuid.uuid4().hex[:16]}"
             self._reserved_run_ids.add(run_id)
 
         committed = False
@@ -221,10 +223,11 @@ class AgentRunner:
                 raise DocumentReferenceError("Too many public document references")
 
             # HF-02: Propagate verified ExecutionScope into Document Reference pre-validation (OUTSIDE lock!)
-            from app.core.auth import current_execution_scope
+            from app.core.auth import current_execution_scope, current_run_conversation_id
 
             owner_token = document_owner_id.set(owner_id)
             scope_token = current_execution_scope.set(caller_scope) if caller_scope is not None else None
+            conversation_token = current_run_conversation_id.set(req.conversation_id)
             titles = {}
             try:
                 for ref in refs:
@@ -233,6 +236,7 @@ class AgentRunner:
                         raise DocumentReferenceError(f"Document '{ref}' is unavailable or not yet parsed")
                     titles[ref] = outline.get('document_name') or '첨부 문서'
             finally:
+                current_run_conversation_id.reset(conversation_token)
                 if scope_token is not None:
                     current_execution_scope.reset(scope_token)
                 document_owner_id.reset(owner_token)

@@ -1,6 +1,7 @@
 """Composition root. Existing HTTP/Gateway/filesystem adapters are reused."""
 import time
 from app.config import is_durable_analysis_enabled_for_service
+from app.core.session_attachments import is_session_attachment
 from .ports import JsonTaskRepository
 from .orchestrator import TaskOrchestrator
 from .services import ModelInvoker, RequestPlanner, AnswerWriter, AnswerVerifier, ApiEvidenceSelector
@@ -45,6 +46,10 @@ class AnalysisServices:
             if not raw or raw.get('owner_id') != scoped_owner or raw.get('service_id') != service:
                 raise ValueError('analysis_reference_unavailable')
             previous_docs = raw.get('document_ids', [])
+            if any(is_session_attachment(doc) for doc in (*refs, *previous_docs)) and (
+                not session_id or raw.get('session_id') != session_id
+            ):
+                raise ValueError('analysis_reference_unavailable')
             if refs and not set(previous_docs).issubset(refs): continue
             if raw.get('schema_version') == 2: modern.append(job_id)
             refs = list(dict.fromkeys(refs + previous_docs))
@@ -53,6 +58,21 @@ class AnalysisServices:
     def _manager(self, job_id):
         raw = self.store.read(job_id)
         return self.orchestrator if raw and raw.get('schema_version') == 2 else self.legacy
+
+    def session_allowed(self, job_id, conversation_id):
+        raw = self.store.read(job_id)
+        if not raw or not any(is_session_attachment(doc) for doc in raw.get('document_ids', [])):
+            return True
+        return bool(conversation_id and raw.get('session_id') == conversation_id)
+
+    def references_attachments(self, job_ids, owner, service, tenant_id):
+        effective_owner = self._effective_owner(owner, tenant_id)
+        for job_id in job_ids:
+            raw = self.store.read(job_id)
+            if raw and raw.get('owner_id') == effective_owner and raw.get('service_id') == service:
+                if any(is_session_attachment(doc) for doc in raw.get('document_ids', [])):
+                    return True
+        return False
 
     def get(self, job_id, owner, service, tenant_id=None):
         return self._manager(job_id).get(job_id, self._effective_owner(owner, tenant_id), service)

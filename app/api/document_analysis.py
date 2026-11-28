@@ -15,6 +15,7 @@ from app.core.auth import (
 )
 from app.runtime.tasks.bootstrap import services
 from app.runtime.tasks.domain import BudgetExceeded
+from app.core.session_attachments import is_session_attachment
 
 router = APIRouter(prefix="/agent/analyses", tags=["Document Analysis"], dependencies=[Depends(require_authenticated_caller)])
 
@@ -40,9 +41,17 @@ def _accepts_tenant(fn) -> bool:
     )
 
 
+def require_analysis_session(manager, job_id: str, request: Request) -> None:
+    check = getattr(manager, "session_allowed", None)
+    if check and not check(job_id, request.query_params.get("conversation_id")):
+        raise HTTPException(404, "Analysis not found")
+
+
 @router.post("", status_code=202)
 async def create_analysis(body: AnalysisRequest, request: Request):
     scope, owner, service = _identity(request)
+    if any(is_session_attachment(ref) for ref in body.context_refs):
+        raise HTTPException(422, "attachment_conversation_required")
     tok = current_execution_scope.set(scope)
     try:
         mgr = services(request.app)
@@ -60,6 +69,7 @@ async def create_analysis(body: AnalysisRequest, request: Request):
 async def get_analysis(job_id: str, request: Request):
     scope, owner, service = _identity(request)
     manager = services(request.app)
+    require_analysis_session(manager, job_id, request)
     get_kwargs = {"tenant_id": scope.tenant_id} if _accepts_tenant(manager.get) else {}
     try:
         result = manager.get(job_id, owner, service, **get_kwargs)
@@ -97,6 +107,7 @@ async def resume_analysis(job_id: str, request: Request):
     tok = current_execution_scope.set(scope)
     try:
         mgr = services(request.app)
+        require_analysis_session(mgr, job_id, request)
         kwargs = {"tenant_id": scope.tenant_id} if _accepts_tenant(mgr.resume) else {}
         result = mgr.resume(job_id, owner, service, **kwargs)
     except BudgetExceeded as exc:
@@ -115,6 +126,7 @@ async def cancel_analysis(job_id: str, request: Request):
     scope, owner, service = _identity(request)
     try:
         mgr = services(request.app)
+        require_analysis_session(mgr, job_id, request)
         kwargs = {"tenant_id": scope.tenant_id} if _accepts_tenant(mgr.cancel) else {}
         result = mgr.cancel(job_id, owner, service, **kwargs)
     except ValueError:

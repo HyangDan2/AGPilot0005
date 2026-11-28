@@ -237,8 +237,9 @@ class AGToolsHttpAdapter(DocumentAdapter):
         self.token = token or settings.AGTOOLS_TOKEN
         self.timeout = timeout or settings.AGTOOLS_TIMEOUT_SECONDS
 
-    def _headers(self) -> Dict[str, str]:
-        from app.core.auth import current_execution_scope, is_agtools_token_valid
+    def _headers(self, *, attachment: bool = False) -> Dict[str, str]:
+        from app.core.auth import current_execution_scope, current_run_conversation_id, is_agtools_token_valid
+        from app.core.session_attachments import attachment_tenant
 
         if not settings.AGTOOLS_ENABLED:
             raise RuntimeError("agtools_disabled")
@@ -247,6 +248,10 @@ class AGToolsHttpAdapter(DocumentAdapter):
         scope = current_execution_scope.get()
         resolved_owner = scope.owner_id if scope is not None else document_owner_id.get()
         resolved_tenant = scope.tenant_id if scope is not None else settings.AGTOOLS_TENANT
+        if attachment:
+            if scope is None:
+                raise ValueError("attachment_scope_required")
+            resolved_tenant = attachment_tenant(scope, current_run_conversation_id.get())
         headers = {
             "Accept": "application/json",
             "User-Agent": "HD2Lab-AGCore/1.1",
@@ -254,12 +259,33 @@ class AGToolsHttpAdapter(DocumentAdapter):
             "X-Owner-Id": resolved_owner,
             "X-Tenant-Id": resolved_tenant,
         }
+        if attachment:
+            headers["X-Access-Scope"] = "private"
         return headers
 
-    async def get_outline(self, doc_id: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/documents/{doc_id}/outline"
+    def _document_target(self, doc_id: str, suffix: str) -> tuple[str, dict[str, str]]:
+        from app.core.session_attachments import is_session_attachment, raw_attachment_id
+
+        attachment = is_session_attachment(doc_id)
+        upstream_id = raw_attachment_id(doc_id) if attachment else doc_id
+        return f"{self.base_url}/documents/{upstream_id}/{suffix}", self._headers(attachment=attachment)
+
+    async def upload_attachment(self, filename: str, file: bytes, content_type: str) -> httpx.Response:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(url, headers=self._headers())
+            return await client.post(
+                f"{self.base_url}/documents", headers=self._headers(attachment=True),
+                files={"file": (filename, file, content_type)},
+            )
+
+    async def read_attachment(self, document_id: str, view: str) -> httpx.Response:
+        url, headers = self._document_target(document_id, view)
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            return await client.get(url, headers=headers)
+
+    async def get_outline(self, doc_id: str) -> Dict[str, Any]:
+        url, headers = self._document_target(doc_id, "outline")
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(url, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
                 return {
@@ -273,9 +299,9 @@ class AGToolsHttpAdapter(DocumentAdapter):
             return {"error": True, "code": f"http_{resp.status_code}", "message": resp.text}
 
     async def read_section(self, doc_id: str, section_id: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/documents/{doc_id}/sections/{section_id}"
+        url, headers = self._document_target(doc_id, f"sections/{section_id}")
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(url, headers=self._headers())
+            resp = await client.get(url, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
                 content = data.get("content") or ""
@@ -302,13 +328,13 @@ class AGToolsHttpAdapter(DocumentAdapter):
             return {"error": True, "code": f"http_{resp.status_code}", "message": resp.text}
 
     async def search(self, doc_id: str, query: str, limit: int = 5) -> Dict[str, Any]:
-        url = f"{self.base_url}/documents/{doc_id}/search"
+        url, headers = self._document_target(doc_id, "search")
         payload: Dict[str, Any] = {"query": query, "limit": limit}
         budget = tool_token_budget.get()
         if budget is not None and budget > 0:
             payload["token_budget"] = int(budget)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(url, json=payload, headers=self._headers())
+            resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
                 return {
@@ -322,9 +348,9 @@ class AGToolsHttpAdapter(DocumentAdapter):
             return {"error": True, "code": f"http_{resp.status_code}", "message": resp.text}
 
     async def read_chunk(self, doc_id: str, chunk_id: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/documents/{doc_id}/chunks/{chunk_id}"
+        url, headers = self._document_target(doc_id, f"chunks/{chunk_id}")
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(url, headers=self._headers())
+            resp = await client.get(url, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
                 return {
@@ -341,20 +367,20 @@ class AGToolsHttpAdapter(DocumentAdapter):
             return {"error": True, "code": f"http_{resp.status_code}", "message": resp.text}
 
     async def list_chunks(self, doc_id: str, cursor: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
-        url = f"{self.base_url}/documents/{doc_id}/chunks"
+        url, headers = self._document_target(doc_id, "chunks")
         params = {"limit": limit}
         if cursor:
             params["cursor"] = cursor
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(url, params=params, headers=self._headers())
+            resp = await client.get(url, params=params, headers=headers)
             if resp.status_code == 200:
                 return resp.json()
             return {"error": True, "code": f"http_{resp.status_code}"}
 
     async def get_figure_info(self, doc_id: str, figure_id: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/documents/{doc_id}/figures/{figure_id}"
+        url, headers = self._document_target(doc_id, f"figures/{figure_id}")
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(url, headers=self._headers())
+            resp = await client.get(url, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
                 asset_id = data.get("asset_id")
