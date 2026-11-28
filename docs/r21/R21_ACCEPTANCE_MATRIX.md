@@ -32,6 +32,13 @@ cd AGPilot0010 && python3 -m pytest tests/test_capabilities.py -q
 cd AGPilot0011/hd2ai-admin && node --test tests/knowledge-client.test.mjs
 ```
 
+## 저장소 간 실제 HTTP 스모크
+
+두 저장소의 테스트는 서로를 import할 수 없으므로, 샌드박스에서 AGTools를 실제 uvicorn으로
+기동하고 AGCore `AgtoolsProvider`로 호출하는 스모크를 별도로 수행했다
+(`/workspace/artifacts/r21/verify_cross_service.py`, 12개 체크 ALL PASS): manifest 계약,
+DOCX/PDF `read-inline`, 업로드, 하이브리드 검색(degrade·citation), validate.
+
 ## 이번 선행개발에서 검증하지 않은 것
 
 - 실제 모델에 이미지를 보내는 Gateway→Provider 호출 (capability 선택·바인딩까지만 검증)
