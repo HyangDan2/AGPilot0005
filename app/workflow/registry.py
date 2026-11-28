@@ -166,7 +166,10 @@ class UnifiedToolSpec(BaseModel):
     def _consistent_policy(self) -> "UnifiedToolSpec":
         if self.side_effect == "none" and self.permission == "read":
             return self
-        if self.side_effect in ("write", "external", "destructive") and self.permission == "read":
+        # ``external`` + ``read`` is deliberately allowed: a read-only outbound call (web
+        # search, remote lookup) crosses the service boundary but persists nothing, so it
+        # does not need write authority.  Only state-changing side effects do.
+        if self.side_effect in ("write", "destructive") and self.permission == "read":
             raise ValueError("writable_side_effect_requires_write_permission")
         if self.side_effect == "destructive" and not self.approval_required:
             raise ValueError("destructive_tools_require_user_approval")
@@ -178,6 +181,7 @@ class UnifiedToolSpec(BaseModel):
 
     @property
     def is_read_only(self) -> bool:
+        """True only when the tool neither persists nor leaves the process boundary."""
         return self.side_effect in ("none", "read") and self.permission == "read"
 
     def schema_payload(self) -> Dict[str, Any]:

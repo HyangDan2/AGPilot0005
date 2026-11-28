@@ -12,6 +12,10 @@ own, and :func:`build_workflow_stack` wires a default set for an acceptance run.
     mcp         WP-06  MCP client lifecycle, tool normalisation, credential isolation
     budget      WP-08  context-window allocation, compaction and execution limits
     office_adapter     R2.1/AGTools capability interface (Mock and Runtime)
+    planner     WP-01  direct-chat fast path, execution plan DAG, conditional replanning
+    checkpoint  WP-02  durable run state, scope re-verified resume
+    trajectory  WP-09  structured, secret-masked run record
+    runtime     WP-02  LangGraph execution graph (plan -> DAG -> hooks -> report)
 """
 from __future__ import annotations
 
@@ -97,6 +101,44 @@ from app.workflow.safety import (
     ScopeViolation,
     assert_scope_access,
 )
+from app.workflow.planner import (
+    BindingResolutionError,
+    BindingResolver,
+    ExecutionPlan,
+    PlanStep,
+    Planner,
+    PlannerDecision,
+    PlannerError,
+    PlannerRequest,
+    resolve_bindings,
+    validate_plan_dag,
+)
+from app.workflow.checkpoint import (
+    CheckpointError,
+    WorkflowCheckpoint,
+    WorkflowCheckpointStore,
+    default_checkpoint_path,
+)
+from app.workflow.trajectory import (
+    ArtifactRecord,
+    FailureRecord,
+    MCPExecutionRecord,
+    ReplanRecord,
+    RetryRecord,
+    SkillSelectionRecord,
+    StepRecord,
+    TokenUsage,
+    ToolCallRecord,
+    WorkflowTrajectory,
+)
+from app.workflow.runtime import (
+    WORKFLOW_EVENT_TYPES,
+    WorkflowRunRequest,
+    WorkflowRunResult,
+    WorkflowRuntime,
+    WorkflowRuntimeError,
+    get_compiled_workflow_graph,
+)
 from app.workflow.skills import (
     BUILTIN_SKILL_NAMES,
     LoadedSkill,
@@ -139,6 +181,20 @@ __all__ = [
     "OfficeCapabilityAdapter", "MockOfficeAdapter", "RuntimeOfficeAdapter",
     "OfficeResult", "OfficeAdapterError", "OfficeAdapterUnavailable",
     "OFFICE_CAPABILITIES", "get_office_adapter", "assert_adapter_allowed",
+    # planner
+    "Planner", "PlannerRequest", "PlannerDecision", "PlannerError",
+    "ExecutionPlan", "PlanStep", "BindingResolver", "BindingResolutionError",
+    "resolve_bindings", "validate_plan_dag",
+    # checkpoint
+    "WorkflowCheckpoint", "WorkflowCheckpointStore", "CheckpointError",
+    "default_checkpoint_path",
+    # trajectory
+    "WorkflowTrajectory", "StepRecord", "ToolCallRecord", "SkillSelectionRecord",
+    "RetryRecord", "ReplanRecord", "FailureRecord", "ArtifactRecord",
+    "MCPExecutionRecord", "TokenUsage",
+    # runtime
+    "WorkflowRuntime", "WorkflowRunRequest", "WorkflowRunResult", "WorkflowRuntimeError",
+    "WORKFLOW_EVENT_TYPES", "get_compiled_workflow_graph",
     # wiring
     "WorkflowStack", "build_workflow_stack",
 ]

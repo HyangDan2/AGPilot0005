@@ -25,6 +25,16 @@ EventType = Literal[
     "artifact.edit.applied",
     "artifact.edit.rejected",
     "artifact.error",
+    # R3 Workflow events (additive; WO-R3-PREDEV WP-02/WP-09)
+    "workflow.started",
+    "workflow.plan.created",
+    "workflow.step.started",
+    "workflow.step.completed",
+    "workflow.approval.required",
+    "workflow.checkpoint.saved",
+    "workflow.completed",
+    "workflow.failed",
+    "workflow.cancelled",
 ]
 
 class SSEEvent(BaseModel):
