@@ -10,6 +10,12 @@ answers; the R3 graph is *one capability* of that same runtime:
   ``execution_mode="workflow"`` into an R3 ``WorkflowRunRequest`` executing on the shared
   stack (one registry, one skill engine, one rules engine, one hook registry, one MCP
   manager) - no new graph, no copied policy.
+* :meth:`OmniRuntimeBridge.shared_services` exposes that same stack to an **ordinary** Omni
+  run (FIX-02 P1): the shared Tool Registry / MCP tool catalogue, the matching Skills and
+  the effective Rules are handed to ``AgentRunner.create_run`` as context (so a chat run
+  knows the same skills/rules/tools exist), and the common Hooks fire on the chat path too
+  (``session_start`` / ``session_end`` / ``on_error``).  Nothing is constructed when R3 is
+  not wired, so the plain chat fast path stays call-free.
 * :meth:`OmniRuntimeBridge.dispatch_session_start` runs the *common* lifecycle hooks on the
   ordinary Omni path too, so an installation that adds a hook (audit, redaction, kill
   switch) gets it on chat as well as on workflows.
@@ -20,7 +26,8 @@ plain chat request behaves exactly as before.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import inspect
+from typing import Any, Dict, List, Mapping, Optional
 
 from app.workflow.hooks import HookEvent
 from app.workflow.runtime import WorkflowRunRequest, WorkflowRunResult, WorkflowRuntimeError
@@ -28,6 +35,7 @@ from app.workflow.runtime import WorkflowRunRequest, WorkflowRunResult, Workflow
 __all__ = [
     "WORKFLOW_CAPABILITY_ID",
     "OmniRuntimeBridge",
+    "OmniSharedServices",
     "get_omni_bridge",
     "AGENT_STATUS_MAP",
 ]
@@ -45,6 +53,58 @@ AGENT_STATUS_MAP: Dict[str, str] = {
     "cancelled": "cancelled",
     "direct_chat": "completed",
 }
+
+
+class OmniSharedServices:
+    """The common R3 services an ordinary Omni run may read and must honour (FIX-02 P1).
+
+    ``context`` is a plain dict (``capabilities`` / ``skills`` / ``rules`` / ``mcp`` /
+    ``registry`` / ``hooks``) so the agent runner can turn it into system guidance without
+    importing the workflow package; ``dispatch`` forwards lifecycle hooks (fail-open, a chat
+    never fails because a hook did).
+    """
+
+    def __init__(self, *, context: Mapping[str, Any], hooks: Any = None) -> None:
+        self.context: Dict[str, Any] = dict(context or {})
+        self._hooks = hooks
+
+    @property
+    def capabilities(self) -> List[str]:
+        return [str(item) for item in (self.context.get("capabilities") or ())]
+
+    def as_dict(self) -> Dict[str, Any]:
+        return dict(self.context)
+
+    async def dispatch(self, event: Any, payload: Mapping[str, Any]) -> None:
+        if self._hooks is None:
+            return
+        try:
+            result = self._hooks.dispatch(event, dict(payload), granted_permission="admin")
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 - observational hook on the chat path: fail open
+            return
+
+    def guidance_lines(self) -> List[str]:
+        """System-prompt lines describing what the shared stack offers (empty if nothing)."""
+        lines: List[str] = []
+        skills = self.context.get("skills") or []
+        if skills:
+            rendered = ", ".join(str(item.get("name")) for item in skills[:8] if isinstance(item, Mapping))
+            if rendered:
+                lines.append(f"[공통 스킬] 사용 가능한 스킬: {rendered}")
+        rules = self.context.get("rules") or {}
+        if isinstance(rules, Mapping) and rules:
+            rendered_rules = ", ".join(f"{key}={value}" for key, value in list(rules.items())[:8])
+            lines.append(f"[공통 규칙] 적용 중인 규칙: {rendered_rules}")
+        capabilities = self.capabilities
+        if capabilities:
+            lines.append(
+                "[공통 도구 카탈로그] 워크플로 실행에서 사용 가능한 capability: "
+                + ", ".join(capabilities[:24])
+                + " (필요하면 execution_mode=workflow 로 위임하세요.)"
+            )
+        return lines
 
 
 class OmniRuntimeBridge:
@@ -86,6 +146,21 @@ class OmniRuntimeBridge:
                 "office_availability": self.service.office_availability(),
             },
         }
+
+    @staticmethod
+    def _match_skills(skills: Any, message: str) -> List[Any]:
+        """Skills relevant to a chat message (whole message first, then its words)."""
+        needle = (message or "").strip()
+        if not needle:
+            return []
+        matched = skills.discover_skills(query=needle)
+        if matched:
+            return matched
+        for token in [item for item in needle.split() if len(item) >= 3][:6]:
+            matched = skills.discover_skills(query=token)
+            if matched:
+                return matched
+        return []
 
     def available_capabilities(self) -> List[str]:
         runtime = self.runtime
@@ -143,6 +218,63 @@ class OmniRuntimeBridge:
         return await self.runtime.start(request, context)
 
     # -- shared hooks -------------------------------------------------------------------
+    def shared_services(self, agent_request: Any, scope: Any) -> Optional[OmniSharedServices]:
+        """FIX-02 P1: expose the common registry / skills / rules / MCP to a chat run.
+
+        Only *reading* the shared stack happens here (no model call, no tool execution), so a
+        plain chat stays a single model turn.  Returns ``None`` when no shared stack exists.
+        """
+        runtime = getattr(self, "runtime", None)
+        if runtime is None:
+            return None
+        context: Dict[str, Any] = {}
+        try:
+            context["capabilities"] = self.available_capabilities()
+        except Exception:  # noqa: BLE001 - a broken catalogue must not break chat
+            context["capabilities"] = []
+        try:
+            skills = runtime.skills
+            if skills is not None:
+                summaries = self._match_skills(skills, getattr(agent_request, "message", None) or "")
+                context["skills"] = [
+                    {"name": item.name, "description": getattr(item, "description", "")}
+                    for item in summaries
+                ]
+        except Exception:  # noqa: BLE001
+            context["skills"] = []
+        try:
+            rules_request = WorkflowRunRequest(
+                query=getattr(agent_request, "message", "") or "",
+                execution_mode="workflow",
+                capabilities=tuple(getattr(agent_request, "capabilities", None) or ()),
+                context=dict(getattr(agent_request, "workflow", None) or {}),
+            )
+            resolution = runtime.build_rules_engine(rules_request).resolve()
+            context["rules"] = dict(resolution.effective)
+        except Exception:  # noqa: BLE001 - rules are advisory on the chat path
+            context["rules"] = {}
+        try:
+            mcp_tools = [
+                spec.qualified_name for spec in runtime.registry.list_specs(source="mcp")
+            ] if runtime.registry is not None else []
+        except Exception:  # noqa: BLE001
+            mcp_tools = []
+        context["mcp"] = {
+            "servers": list(runtime.mcp.servers()) if runtime.mcp is not None else [],
+            "tools": mcp_tools,
+        }
+        try:
+            context["registry"] = runtime.registry.describe() if runtime.registry is not None else {}
+        except Exception:  # noqa: BLE001
+            context["registry"] = {}
+        try:
+            context["hooks"] = len((runtime.hooks.describe() if runtime.hooks is not None else {}).get("events", {}))
+        except Exception:  # noqa: BLE001
+            context["hooks"] = 0
+        if not any(context.get(key) for key in ("capabilities", "skills", "rules", "mcp")):
+            return None
+        return OmniSharedServices(context=context, hooks=runtime.hooks)
+
     async def dispatch_session_start(self, agent_request: Any, scope: Any) -> None:
         """Run ``session_start`` on the common hook registry (fail-open for a plain chat)."""
         hooks = self.runtime.hooks

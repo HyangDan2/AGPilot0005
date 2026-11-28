@@ -1,5 +1,6 @@
 """Agent Runner with Lifecycle, SSE Event Streaming, and Cancellation."""
 import asyncio
+import inspect
 from app.tools.registry import registry
 from app.tools.adapters import ContextAdapter
 from app.gateway.client import GatewayStreamError
@@ -23,13 +24,15 @@ class DocumentReferenceError(ValueError):
     pass
 
 class AgentRunSession:
-    def __init__(self, state: AgentState):
+    def __init__(self, state: AgentState, *, shared_services: Optional[Any] = None):
         self.state = state
         self.event_bus = RunEventBus(run_id=state.run_id)
         self.fence = TerminalStateFence()
         self.task: Optional[asyncio.Task] = None
         self.created_at = time.time()
         self.finished_at: Optional[float] = None
+        #: FIX-02 P1: the shared R3 stack (skills/rules/hooks/MCP) for this run, if wired.
+        self.shared_services = shared_services
 
     async def emit(self, event_name: str, data: Dict[str, Any]):
         if event_name in ("run.completed", "run.failed", "run.cancelled"):
@@ -185,6 +188,7 @@ class AgentRunner:
         custom_client: Optional[Any] = None,
         owner_id: str = "default_user",
         caller_scope: Optional[Any] = None,
+        shared_services: Optional[Any] = None,
     ) -> AgentRunSession:
         # FIX-202 & CR-02: Fail-closed authentication check & immutable ExecutionScope propagation
         if caller_scope is not None:
@@ -243,6 +247,14 @@ class AgentRunner:
 
             active_tool_names = [t.name for t in registry.list_tools(service=service_id)]
             messages = [GatewayMessage(role="system", content=ContextAdapter.build_system_message(active_tool_names))]
+            # FIX-02 P1: the ordinary Omni path sees the same Skills / Rules / Tool Registry /
+            # MCP catalogue as the workflow path.  Pure context (no tool execution, no model
+            # call), so a plain chat remains one turn; absent wiring adds nothing at all.
+            shared_context = dict(getattr(shared_services, "context", {}) or {})
+            if shared_services is not None:
+                guidance = getattr(shared_services, "guidance_lines", None)
+                for line in (guidance() if callable(guidance) else []):
+                    messages.append(GatewayMessage(role="system", content=line))
             workspace_id: Optional[str] = (req.workspace_id or "").strip() or None
             if workspace_id is not None:
                 from app.config import is_workspace_enabled, is_workspace_enabled_for_service
@@ -313,6 +325,7 @@ class AgentRunner:
                 context_refs=refs,
                 workspace_id=workspace_id,
                 workspace_bound=req.bind_workspace,
+                shared_context=shared_context,
                 approvals=list(req.approvals or ()),
                 document_titles=titles,
                 messages=messages,
@@ -323,7 +336,7 @@ class AgentRunner:
                 status="queued",
                 custom_client=custom_client,
             )
-            session = AgentRunSession(initial_state)
+            session = AgentRunSession(initial_state, shared_services=shared_services)
             async with self._lock:
                 self.sessions[run_id] = session
                 self._reserved_run_ids.discard(run_id)
@@ -349,6 +362,21 @@ class AgentRunner:
             session.finished_at = time.time()
             await session.emit("run.cancelled", {"message": "User requested cancellation"})
         return True
+
+    async def _dispatch_shared_hook(self, session: AgentRunSession, event: Any, payload: Dict[str, Any]) -> None:
+        """FIX-02 P1: fire a common lifecycle hook on the Omni path (fail-open)."""
+        services = getattr(session, "shared_services", None)
+        if services is None:
+            return
+        dispatch = getattr(services, "dispatch", None)
+        if dispatch is None:
+            return
+        try:
+            result = dispatch(event, payload)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 - a hook must never fail a chat run
+            return
 
     async def _run_loop(self, session: AgentRunSession):
         state = session.state
@@ -467,6 +495,22 @@ class AgentRunner:
         finally:
             if not session.event_bus.is_finalized:
                 session.event_bus.publish_terminal("run.failed", state.status, state.error or {"code": "terminated", "message": "실행이 종료되었습니다."})
+            # FIX-02 P1: the common hooks fire on the ordinary Omni path as well.
+            from app.workflow.hooks import HookEvent as _HookEvent
+
+            await self._dispatch_shared_hook(
+                session, _HookEvent.SESSION_END,
+                {
+                    "run_id": state.run_id, "executor": "omni", "status": state.status,
+                    "conversation_id": state.conversation_id,
+                    "tenant_id": state.tenant_id, "owner_id": state.owner_id,
+                },
+            )
+            if state.status == "failed" and state.error:
+                await self._dispatch_shared_hook(
+                    session, _HookEvent.ON_ERROR,
+                    {"run_id": state.run_id, "executor": "omni", **dict(state.error)},
+                )
             self.evict_expired_sessions()
 
     def open_event_stream(self, run_id: str, *, last_event_id: Optional[str] = None) -> AsyncGenerator[str, None]:

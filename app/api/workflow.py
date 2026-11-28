@@ -41,8 +41,19 @@ from app.workflow.runtime import (
     WorkflowRuntime,
     WorkflowRuntimeError,
 )
-from app.workflow.safety import ApprovalError, ExecutionContext, ScopeViolation
-from app.workflow.scope import ExecutionScopeAuthority, R2WorkspaceResolver, ToolAccessPolicy
+from app.workflow.safety import (
+    ApprovalError,
+    ExecutionContext,
+    ScopeViolation,
+    classify_principal,
+    ensure_human_approver,
+)
+from app.workflow.scope import (
+    ExecutionScopeAuthority,
+    R2WorkspaceResolver,
+    ToolAccessPolicy,
+    WorkspaceToolPolicy,
+)
 from app.workflow.transport import MCPTransportError
 
 __all__ = [
@@ -160,6 +171,7 @@ class WorkflowService:
         workspace_root: Optional[str] = None,
         scope_authority: Optional[ExecutionScopeAuthority] = None,
         tool_policy: Optional[ToolAccessPolicy] = None,
+        workspace_policy: Optional[WorkspaceToolPolicy] = None,
         ledger_path: Optional[str] = None,
         ledger_backend: str = "sqlite",
         gateway: Optional[Any] = None,
@@ -168,13 +180,18 @@ class WorkflowService:
         # FIX-01: server-side attribution for conversation/workspace (replaceable in tests).
         self.scope_authority = scope_authority or ExecutionScopeAuthority(R2WorkspaceResolver())
         self.tool_policy = tool_policy or ToolAccessPolicy()
+        # FIX-02 P0: workspace/canvas capabilities are fail-closed unless the feature is on
+        # for the service and the binding can be verified right now.
+        self.workspace_policy = workspace_policy or WorkspaceToolPolicy()
         self.last_scope_evidence: Dict[str, Any] = {}
         if runtime is not None:
             self.runtime = runtime
             self.office = runtime.office
-            # An injected runtime still gets the service's policy gates (FIX-01 / FIX-08).
+            # An injected runtime still gets the service's policy gates (FIX-01 / FIX-02 / FIX-08).
             if getattr(runtime, "tool_policy", None) is None:
                 runtime.tool_policy = self.tool_policy
+            if getattr(runtime, "workspace_policy", None) is None:
+                runtime.workspace_policy = self.workspace_policy
             return
         self.office = _default_office_adapter() if office is _DEFAULT_OFFICE else office
         stack = build_workflow_stack(
@@ -200,6 +217,7 @@ class WorkflowService:
             execution_ledger=stack.safety.get("execution_ledger"),
             run_guard=stack.safety.get("run_guard"),
             tool_policy=self.tool_policy,
+            workspace_policy=self.workspace_policy,
             planner=stack.planner,
             max_steps=stack.budget.max_step_budget,
             max_tool_calls=stack.budget.max_tool_calls,
@@ -328,9 +346,14 @@ _INTERACTIVE_ROLES = frozenset({"user", "owner", "admin", "admiral"})
 
 
 def _is_interactive_principal(scope: ExecutionScope) -> bool:
+    """FIX-02 P1: a Human Approval needs a *human* principal, not merely a user-ish role.
+
+    A service credential / API key / bot may carry ``role="admin"`` and still is a machine;
+    :func:`classify_principal` looks at the credential kind and auth source as well.
+    """
     if not getattr(scope, "authenticated", False):
         return False
-    return str(scope.role or "").lower() in _INTERACTIVE_ROLES
+    return classify_principal(scope) == "user" and str(scope.role or "").lower() in _INTERACTIVE_ROLES
 
 
 def _sse(payload: Dict[str, Any]) -> str:
@@ -479,8 +502,17 @@ async def resolve_recovery(
     body: RecoveryBody,
     scope: ExecutionScope = Depends(require_authenticated_caller),
 ) -> JSONResponse:
-    """FIX-02: explicitly leave a ``recovery_required`` hold (an uncertain side effect)."""
+    """FIX-02: explicitly leave a ``recovery_required`` hold (an uncertain side effect).
+
+    ``retry`` re-arms a side effect that may already have happened, so the decision is a
+    **human** one (FIX-02 P1): a machine credential / API key / bot is refused even with an
+    admin role.  ``abandon`` is equally human-only - both close an ambiguity a person owns.
+    """
     service = _service()
+    try:
+        ensure_human_approver(scope)
+    except ApprovalError as exc:
+        raise _http(403, exc.code, str(exc)) from exc
     checkpoint = service.authorize_run(run_id, scope)
     context = service.run_context(scope, checkpoint)
     try:
@@ -518,12 +550,16 @@ async def approve_run(
     """
     service = _service()
     if not _is_interactive_principal(scope):
-        raise _http(403, "approval_requires_user_principal", f"role={scope.role}")
+        raise _http(
+            403, "approval_requires_user_principal",
+            f"principal={classify_principal(scope)} role={scope.role}",
+        )
     checkpoint = service.authorize_run(run_id, scope)
     context = service.run_context(scope, checkpoint)
     try:
         token = await service.runtime.approve(
             run_id, context, approved_by=scope.owner_id, ttl_seconds=body.ttl_seconds,
+            principal_kind=classify_principal(scope),
         )
     except ApprovalError as exc:
         raise _http(403, exc.code, str(exc)) from exc

@@ -731,8 +731,11 @@ Base: `/api/v1/agent/workflows` (Nginx 관리자 프록시: `/admin/agcore/api/v
 2. Body가 워크스페이스를 비우고 바인딩이 있으면 **바인딩 값 채택**(Body가 아니라 서버가 정한다).
 3. 워크스페이스 엔진이 켜져 있으면 `WorkspaceManager.ensure_open(workspace_id, scope)`로 소유권·오픈 상태를
    확인하고 서비스 불일치/미존재는 `workspace_not_accessible`(403).
-4. 워크스페이스 엔진이 꺼져 있으면(레지스트리 없음) `workspace_verified=False`로 **기록만** 하고 통과 —
-   검증된 접근으로 위장하지 않는다.
+4. 워크스페이스 엔진이 꺼져 있으면(레지스트리 없음) `workspace_verified=False`로 기록하고,
+   **워크스페이스/캔버스 도구는 실행하지 않는다**(§18.2 — FIX-02에서 "기록만 하고 통과"를 폐기).
+5. R2 세션 바인딩은 불변이다(FIX-02 §18.1): 일반 chat(`workspace_id=None`)으로 등록된 대화에
+   `workspace_id`를 붙이면 `conversation_workspace_unbound`(403), 다른 워크스페이스로 바꾸면
+   `conversation_workspace_mismatch`(403).
 
 **Resume 재검증**: `WorkflowService.run_context()`는 저장된 스코프를 현재 자격증명·현재 바인딩으로
 `revalidate()`한다. 워크스페이스 권한이 회수되었거나 대화 바인딩이 사라졌으면 `404 workflow_run_not_found`
@@ -755,7 +758,7 @@ Base: `/api/v1/agent/workflows` (Nginx 관리자 프록시: `/admin/agcore/api/v
 | 없음 | `claimed` | 실행 |
 | `claimed` (동일 토큰) | `claimed` | 재진입 허용 |
 | `claimed` (다른 토큰, lease 유효) | `in_flight` | **차단** (`step_in_flight` 실패) |
-| `claimed` (lease 만료) | `stale_claim_recovered` | 실행(시도 +1) |
+| `claimed` (lease 만료) | `recovery_required` (`lease_expired`) | **자동 재실행 금지** (FIX-02 §18.3) |
 | `succeeded` | `replay` (+결과) | **재실행 없이 결과 재사용** |
 | `failed` | `claimed` | 재시도 허용 |
 | `uncertain` | `recovery_required` | **자동 재실행 금지** |
@@ -942,3 +945,145 @@ $ /workspace/.venv-r2canvas/bin/python -m pytest -q
    AGPilot0011 소관이다(본 저장소는 계약만 고정).
 4. **다중 프로세스 fan-out**: 실행권은 SQLite lease로 막지만, 실제 다중 워커 큐/디스패처는 범위 밖이다.
 5. **감사 로그**: recovery retry/abandon 결정은 checkpoint metadata에 기록되나, 별도 감사 저장소 연동은 미구현.
+
+---
+
+# 18. Final Safety Closure (WO-R3-PREDEV-FIX-02)
+
+> **본 작업**: FIX-02 P0 4건 + P1 5건 교정 · **기준 HEAD**: `d0e7b54` → 본 WO 커밋
+> **불변 조건**: 기존 R3 213건 PASS 유지, R2.1 브랜치·런타임 무수정, 운영 배포·`main` 병합 없음,
+> 기존 Runtime 전면 재작성 없음. 아래 계약은 §17을 **대체하지 않고 좁힌다**(상충 시 §18 우선).
+> **검증**: `tests/test_r3_fix02_closure.py` (32) + 기존 213건 = 245 PASS.
+
+## 18.1 P0 — R2 immutable Session Binding 엄격 적용
+
+`app/workflow/scope.py` `R2WorkspaceResolver.resolve()`:
+
+| 대화 바인딩(서버측) | Body `workspace_id` | 결과 |
+|---|---|---|
+| 없음 | 있음 | 워크스페이스 엔진 ON이면 `ensure_open` 검증, OFF이면 `workspace_verified=False`(도구는 §18.2에서 차단) |
+| 있음(워크스페이스 `ws-a`) | 없음/`ws-a` | 바인딩 값 채택(`ws-a`) |
+| 있음(워크스페이스 `ws-a`) | `ws-b` | **403 `conversation_workspace_mismatch`** |
+| 있음(**일반 chat**, `None`) | 있음 | **403 `conversation_workspace_unbound`** — 대화에 워크스페이스를 새로 붙일 수 없다 |
+
+- 일반 chat 세션은 `bind_workspace`/`conversation_id` 계약(R2 `app/workspace/binding.py`)으로만
+  워크스페이스를 얻는다. 워크플로 요청은 그 결정을 바꾸지 못한다.
+- Resume은 §17.1 그대로 `revalidate()`로 현재 바인딩을 재확인한다(회수 시 `404 workflow_run_not_found`).
+
+## 18.2 P0 — Workspace/Canvas 도구 fail-closed
+
+`app/workflow/scope.py` `WorkspaceToolPolicy` — 런타임이 **도구 실행 직전**(`_invoke_capability`)에 호출한다.
+
+| 실행 주체(transport) | 요구 조건 | 위반 시 코드 |
+|---|---|---|
+| R3 자체 실행 (`registry`, `mcp`, `engine`) | ① 런에 `workspace_id` 귀속 ② 서비스에 Workspace(+Canvas) 기능 ON ③ 지금 `WorkspaceManager.ensure_open` 성공 | ①`workspace_binding_required` ②`workspace_tool_disabled`/`canvas_tool_disabled` ③`workspace_binding_unverified` |
+| R2.1 Adapter (`office`) — **변경(mutating)** capability | ① + ② | ②`workspace_tool_disabled`/`canvas_tool_disabled` |
+| R2.1 Adapter (`office`) — read-only capability | ① (어댑터 자체 스코프 계약) | ①`workspace_binding_required` |
+| 개발용 in-memory Mock(`is_mock`) | ① | ①`workspace_binding_required` |
+
+- Workspace 엔진이 꺼진 배포에서는 **R3가 직접 실행하는** `workspace.*`/`canvas.*` 도구가 실행되지 않는다
+  (불확실한 id 위에서 실행하지 않는다). `AGCORE_WORKSPACE_ENABLED=false` 배포에서 `workspace.file.write`를
+  실 어댑터로 실행하면 `workspace_tool_disabled`로 실패한다.
+- 번복 불가: 정책은 서비스(`WorkflowService`)가 런타임에 주입하며, 주입된 런타임에도 적용된다.
+
+## 18.3 P0 — 만료된 실행권은 재실행 근거가 아니다
+
+`app/workflow/ledger.py` `ExecutionLedger.claim()`:
+
+| 기존 상태 | 이전(FIX-01) | 지금(FIX-02) |
+|---|---|---|
+| `claimed` (다른 토큰, lease **만료**) | `stale_claim_recovered` → 실행 | **`recovery_required` (`lease_expired`)** — 기록을 `uncertain`으로 내리고 실행하지 않는다 |
+
+- 재실행은 오직 `POST /runs/{run_id}/recovery {"action":"retry"}`(사람의 명시 결정) 후에만 가능하다
+  (`uncertain` → `failed` 전이 후 다음 claim 허용).
+
+## 18.4 P0 — 불확실한 결과는 항상 `recovery_required`
+
+- 부작용(`write`/`external`/`destructive`) 단계에서 `AMBIGUOUS_ERROR_CODES` **또는**
+  `TimeoutError`/`ConnectionError`/`OSError`/MCP transport 오류가 나면 재시도하지 않고
+  `recovery_required`로 정지한다(`runtime._is_ambiguous_failure`).
+- `ScopeViolation`/`ApprovalError`/`IdempotencyConflict`/Hook 거부는 **확정 거부**(아무것도 전송되지 않음)라
+  불확실로 취급하지 않는다.
+- 부작용 실행 **후** `after_tool_call` 훅이 실패하면 결과를 ledger에 `succeed`로 기록한 뒤 run을 실패시킨다
+  (재개 시 중복 실행 불가).
+- `resume`은 `recovery_required`에서 `409 recovery_required`로 거부된다(§17.2 유지).
+
+## 18.5 P1 — MCP HTTP egress: 실제 목적지 검증
+
+- `isolate.validate_endpoint(resolve_dns=True)`: 호스트를 `socket.getaddrinfo`로 해석해
+  loopback/RFC1918/link-local/multicast/reserved/cloud metadata 주소면 `mcp_private_endpoint_blocked`.
+  해석 실패는 등록을 막지 않고 **접속 시점**에 `mcp_host_unresolvable`로 거부한다.
+- `transport.StreamableHTTPMCPClient`: 요청마다 `assert_egress_target()`으로 재해석(DNS rebinding 방어),
+  `follow_redirects=False`, `3xx`는 `mcp_redirect_blocked`(Location은 mask).
+- `allow_private_network`는 등록자가 명시한 로컬/테스트 opt-in이며 기본값은 항상 엄격 차단이다.
+
+## 18.6 P1 — MCP stdio 실행 파일·인자·환경·프로세스 격리
+
+`isolate.validate_command` / `transport.StdioMCPClient`:
+
+| 항목 | 규칙 |
+|---|---|
+| 실행 파일 | `shutil.which` + `os.path.realpath` 해석 후 **해석된 basename**이 allowlist에 있어야 한다(심볼릭 링크·경로 이탈 → `mcp_command_path_escape`), 실행 불가 → `mcp_command_not_executable` |
+| 인자 | `-c`/`--code`/`-e`/`--eval`/`-p`/`--print`/`--require`/`--import`/`--loader`/`--inspect`/`-i`/`--interactive` 및 단축 플래그 클러스터(`-ic` 등)에 인라인 실행 플래그가 있으면 `mcp_command_inline_code_forbidden`; 셸 메타문자 → `mcp_command_shell_forbidden` (스크립트 파일·모듈 실행 인자는 허용: `python server.py`, `python -m pkg`) |
+| 환경변수 | 화이트리스트(`SAFE_ENV_KEYS`)만 상속. `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`AWS_*`/`GITHUB_TOKEN`/`DATABASE_URL`/승인 시크릿/`CREDENTIAL_*` 제거(`sanitize_child_env`) |
+| 프로세스 | `start_new_session=True`(자체 세션·프로세스 그룹), `RLIMIT_CPU/AS/NOFILE/CORE`(`limit_child_process`), 종료 시 **프로세스 그룹 전체** SIGTERM→SIGKILL 및 그룹 잔여 프로세스 정리 |
+
+## 18.7 P1 — Human Approval은 사람만
+
+- `app/core/auth.py` `ExecutionScope.principal_kind` (`user`/`machine`/`anonymous`):
+  `credential_scope:*`는 기본 **machine**(credential 설정에서 `"principal_kind": "user"`를 명시한 위임만 user),
+  `trusted_proxy`/`dev_local`(로컬 운영자)은 **user**, 미인증은 **anonymous**.
+- `app/workflow/safety.py` `classify_principal()` / `ensure_human_approver()`가 role 문자열이 아니라
+  인증 주체 유형으로 판정한다. `role=admin`인 API 키/서비스 계정/봇도 **거부**된다.
+- `ApprovalAuthority.issue_user_approval(principal_kind="machine")`는 발급 자체가 `403 approval_requires_user_principal`,
+  토큰 `approver_kind`는 서명 대상이며 `verify_user_approval()`은 `machine` 토큰을 거부한다.
+- REST `POST /runs/{run_id}/approve`와 `POST /runs/{run_id}/recovery` 모두 사람 principal 요구(403).
+
+## 18.8 P1 — 일반 Omni Runtime에서도 공통 스택 연결
+
+- `app/workflow/omni.py` `OmniRuntimeBridge.shared_services()`: 일반 chat 실행에도 공통
+  `Tool Registry` capability 목록, 매칭된 `Skills`, 적용 중 `Rules`, `MCP` 서버·도구 목록, 훅 수를 제공한다.
+- `app/runtime/runner.py`: `create_run(..., shared_services=...)`가 이를 `AgentState.shared_context`에 넣고
+  시스템 메시지로 안내한다(`[공통 스킬]`/`[공통 규칙]`/`[공통 도구 카탈로그]`). `session_end`/`on_error` 훅이
+  Omni 경로에서도 발화한다(fail-open).
+- **fast-path 보존**: R3가 배선되지 않은 프로세스(`peek_workflow_service() is None`)에서는 아무것도 생성·조회하지
+  않는다(일반 Chat 무호출 유지, §17.4 계약 유지). 도구 **실행**은 여전히 레거시 디스패처가 담당하며, MCP/워크플로
+  capability의 실행은 `execution_mode=workflow` 위임 경로를 쓴다.
+
+## 18.9 명시적 후속 통합 대상 (본 WO 범위 밖)
+
+1. **R2.1 실제 Adapter 연결** — AGTools parser/writer 라우트 개통(`RuntimeOfficeAdapter.ENDPOINTS`),
+   `workspace.rag.search`의 워크스페이스 단위 실 스코프. 함께 정리할 것: 어댑터 경계 read-only 워크스페이스
+   호출의 기능 플래그 집행을 R3 `WorkspaceToolPolicy`에서 어댑터 계약으로 넘기는 작업(§18.2 표).
+2. **HD2AI Workflow UI 통합** — AGPilot0011 프런트: `workflow.*` SSE 9종 소비, 승인 화면
+   (`pending_approval.target`/`args_hash` 표시 후 `/approve`), `recovery_required`에서 사람 결정(`/recovery`) UI,
+   `needs_input`(=`recovery_required`) 상태 표시.
+3. 다중 워커 큐/디스패처(실행권은 SQLite lease로만 방어), 별도 감사 저장소 연동(§17.11 유지).
+
+## 18.10 검증 증빙 (2026-11-28)
+
+```
+$ /workspace/.venv-r2canvas/bin/python -m pytest tests/test_r3_engines.py tests/test_r3_workflow_acceptance.py tests/test_r3_fix01_hardening.py -q
+213 passed
+
+$ /workspace/.venv-r2canvas/bin/python -m pytest tests/test_r3_fix02_closure.py -q
+32 passed
+
+$ /workspace/.venv-r2canvas/bin/python -m pytest -q
+669 passed, 1 failed
+# 유일한 실패: test_r1_2_final_addendum.py::test_add_02_durable_analysis_real_orchestrator_create_resume_and_no_legacy_fallback
+#  → `552df4b` 이전부터 존재하던 선행 결함(bootstrap.py:41 `_DummyNoop.create`), R3 범위 밖(§17.10과 동일)
+```
+
+시나리오 ↔ 테스트:
+
+| FIX-02 항목 | 테스트 |
+|---|---|
+| 18.1 세션 바인딩 | `TestFix02SessionBinding` (3) |
+| 18.2 Workspace/Canvas fail-closed | `TestFix02WorkspaceToolGate` (8) |
+| 18.3 만료 실행권 | `TestFix02LeaseAndRecovery::test_expired_lease_yields_recovery_not_a_second_execution`, `::test_run_holds_for_recovery_when_its_claim_expired` |
+| 18.4 불확실 결과 | `TestFix02LeaseAndRecovery::test_broken_connection_is_treated_as_an_unknown_outcome` (+ FIX-01 `test_ambiguous_timeout_holds_the_run_for_recovery`) |
+| 18.5 egress/DNS/redirect | `TestFix02Egress` (5) |
+| 18.6 stdio 격리 | `TestFix02StdioIsolation` (5) |
+| 18.7 Human Approval | `TestFix02HumanApproval` (4) |
+| 18.8 Omni 공통 스택 | `TestFix02OmniSharedStack` (5) |

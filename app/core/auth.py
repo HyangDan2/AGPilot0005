@@ -106,10 +106,25 @@ class ExecutionScope:
     auth_source: str  # "credential_scope:<id>" | "trusted_proxy" | "dev_local" | "unauthenticated"
     allowed_tenants: Optional[FrozenSet[str]] = None
     allowed_services: Optional[FrozenSet[str]] = None
+    #: FIX-02 P1: what kind of actor this credential represents (``user``/``machine``/
+    #: ``anonymous``).  A role string alone never proves a human, so anything that needs a
+    #: person (a Human Approval) asks this, not ``role``.  An empty value means "not
+    #: classified" and is resolved fail-closed (a credential scope is a machine).
+    principal_kind: str = ""
 
     @property
     def is_admin(self) -> bool:
         return self.authenticated and self.role in ADMIN_ROLES
+
+    @property
+    def is_machine_principal(self) -> bool:
+        """True for service credentials, API keys, bots and automated principals."""
+        declared = (self.principal_kind or "").strip().lower()
+        if declared in ("machine", "anonymous"):
+            return True
+        if (self.auth_source or "").startswith("credential_scope"):
+            return True
+        return (self.role or "").strip().lower() in ("service", "tool", "system", "automation", "bot", "ai", "assistant", "guest")
 
     def can_access_tenant(self, target_tenant: Optional[str]) -> bool:
         """HF-02 / ADD-01 / RB-02: Strict tenant isolation; admin with None/empty scope explicitly fails closed."""
@@ -268,6 +283,15 @@ def _match_credential_scope(provided_token: Optional[str], request: Request) -> 
     except ValueError as exc:
         raise CredentialScopeViolation(str(exc)) from exc
 
+    # FIX-02 P1: a credential scope is a machine credential (API key / service account).
+    # It becomes a *human* delegation only when the operator explicitly declares
+    # ``"principal_kind": "user"`` for that credential (e.g. a sign-in flow that hands the
+    # user's own session to this service); otherwise a role such as ``admin`` on an API key
+    # still never counts as a person for Human Approval.
+    declared_kind = str(cfg.get("principal_kind") or "").strip().lower()
+    if declared_kind not in ("user", "machine"):
+        declared_kind = "machine"
+
     return ExecutionScope(
         tenant_id=tenant_id,
         owner_id=owner_id,
@@ -277,6 +301,7 @@ def _match_credential_scope(provided_token: Optional[str], request: Request) -> 
         auth_source=f"credential_scope:{matched_id}",
         allowed_tenants=frozenset(allowed_tenants),
         allowed_services=frozenset(allowed_services),
+        principal_kind=declared_kind,
     )
 
 
@@ -307,6 +332,7 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
             role="guest",
             authenticated=False,
             auth_source="invalid_credential",
+            principal_kind="anonymous",
         )
 
     # 2. Verified Trusted Proxy (in prod requires explicit TRUSTED_PROXY_SECRET)
@@ -317,7 +343,7 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
         req_tenant = (request.headers.get("X-HD2Lab-Tenant") or "").strip()
         if is_prod:
             if not owner or not service:
-                return ExecutionScope("unknown", "", "", "guest", False, "unauthenticated")
+                return ExecutionScope("unknown", "", "", "guest", False, "unauthenticated", principal_kind="anonymous")
             tenant_id = req_tenant or ("public_tenant" if service == "hd2ai-public" else settings.AGTOOLS_TENANT)
             # ADD-01 / RB-02: Admin scope headers are ONLY trusted when TRUSTED_PROXY_SECRET is verified;
             # missing or empty admin scope MUST fail closed (frozenset()), NEVER auto-assigned!
@@ -338,6 +364,7 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
                 auth_source="trusted_proxy",
                 allowed_tenants=allowed_t,
                 allowed_services=allowed_s,
+                principal_kind="user",
             )
         resolved_service = service or "hd2ai-admin"
         tenant_id = req_tenant or ("public_tenant" if resolved_service == "hd2ai-public" else settings.AGTOOLS_TENANT)
@@ -359,6 +386,7 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
             auth_source="dev_local",
             allowed_tenants=allowed_t,
             allowed_services=allowed_s,
+            principal_kind="user",
         )
 
     # 3. Development ASGI TestClient (only when not production and no auth gates configured)
@@ -377,6 +405,7 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
             auth_source="dev_local",
             allowed_tenants=frozenset({tenant_id}),
             allowed_services=frozenset({service}),
+            principal_kind="user",
         )
 
     # 4. Fail-closed
@@ -387,6 +416,7 @@ def resolve_caller_scope(request: Request) -> ExecutionScope:
         role="guest",
         authenticated=False,
         auth_source="unauthenticated",
+        principal_kind="anonymous",
     )
 
 

@@ -14,11 +14,16 @@ An R3 run may only touch the tenant / owner / service / conversation / workspace
    :meth:`ExecutionScopeAuthority.revalidate` re-checks that stored scope against the
    *current* credential and the *current* binding, so a revoked workspace or a withdrawn
    grant blocks the resume instead of continuing an old decision.
+4. **A general chat session never gains a workspace (FIX-02 P0).**  R2 session binding is
+   immutable: a conversation that is bound to a plain chat (``workspace_id is None``)
+   cannot be given a workspace by a workflow request, and a conversation bound to another
+   workspace cannot be redirected.  Both are refused instead of "repaired".
 
 The R2 workspace engine is optional (``AGCORE_WORKSPACE_ENABLED``).  When it is disabled
 there is no server-side registry to consult; the workspace id is then kept as an opaque,
-owner-scoped handle and recorded as ``workspace_verified=False`` instead of being treated
-as proof of access.
+owner-scoped handle recorded as ``workspace_verified=False`` instead of being treated as
+proof of access - and :class:`WorkspaceToolPolicy` refuses to execute a workspace/canvas
+capability that the runtime itself would have to run on that unverified handle (FIX-02 P0).
 """
 from __future__ import annotations
 
@@ -35,6 +40,8 @@ __all__ = [
     "R2WorkspaceResolver",
     "ExecutionScopeAuthority",
     "ToolAccessPolicy",
+    "WorkspaceToolPolicy",
+    "workspace_tool_kind",
 ]
 
 #: Keys a request body may never use to describe *who* it is.
@@ -158,12 +165,20 @@ class R2WorkspaceResolver:
 
         if binding is not None:
             bound_workspace = getattr(binding, "workspace_id", None)
-            if workspace_id is not None and bound_workspace is not None and str(workspace_id) != str(bound_workspace):
+            if bound_workspace is None:
+                # FIX-02 P0: R2 session binding is immutable.  A conversation registered as
+                # a plain chat has no workspace, and a request may not attach one to it.
+                if workspace_id is not None:
+                    raise ScopeViolation(
+                        "conversation_workspace_unbound",
+                        detail=f"conversation={conversation_id} is a plain chat session",
+                    )
+            elif workspace_id is not None and str(workspace_id) != str(bound_workspace):
                 raise ScopeViolation(
                     "conversation_workspace_mismatch",
                     detail=f"conversation={conversation_id} bound={bound_workspace} requested={workspace_id}",
                 )
-            if workspace_id is None and bound_workspace is not None:
+            elif workspace_id is None:
                 # The server-side binding owns the value; adopt it rather than the body.
                 workspace_id = str(bound_workspace)
 
@@ -285,6 +300,7 @@ class ExecutionScopeAuthority:
                 auth_source=scope.auth_source,
                 allowed_tenants=scope.allowed_tenants,
                 allowed_services=scope.allowed_services,
+                principal_kind=getattr(scope, "principal_kind", "user"),
             )
         evidence = self.resolver.resolve(
             authority_scope, conversation_id=conversation_id, workspace_id=workspace_id,
@@ -333,3 +349,140 @@ class ToolAccessPolicy:
                 "tool_not_permitted_for_service",
                 detail=f"{getattr(spec, 'qualified_name', '?')}: {reason or 'denied'}",
             )
+
+
+#: Capability families that only mean something inside a Workspace / Canvas.
+_WORKSPACE_CAPABILITY_PREFIXES: Tuple[str, ...] = ("workspace.",)
+_LEGACY_WORKSPACE_TOOL_PREFIXES: Tuple[str, ...] = ("workspace_",)
+_CANVAS_CAPABILITY_PREFIXES: Tuple[str, ...] = ("canvas.",)
+
+
+def workspace_tool_kind(capability: Any) -> Optional[str]:
+    """``"workspace"`` / ``"canvas"`` for a workspace-backed capability, else ``None``."""
+    name = str(capability or "").strip().lower()
+    if not name:
+        return None
+    if name.startswith(_CANVAS_CAPABILITY_PREFIXES):
+        return "canvas"
+    if name.startswith(_WORKSPACE_CAPABILITY_PREFIXES) or name.startswith(_LEGACY_WORKSPACE_TOOL_PREFIXES):
+        return "workspace"
+    return None
+
+
+class WorkspaceToolPolicy:
+    """FIX-02 P0 - fail-closed gate in front of every workspace/canvas capability.
+
+    A workflow step may not touch a workspace just because the request body named one.
+    For capabilities the R3 runtime *executes itself* (registry, MCP, engine tools) three
+    things must all hold before the handler is reached:
+
+    1. the run is attributed to a workspace (``ExecutionContext.workspace_id``);
+    2. the Workspace (or Canvas) feature is enabled **for the run's service**;
+    3. the workspace can still be opened for the run's owner right now
+       (``WorkspaceManager.ensure_open``), i.e. the binding is verifiably accessible.
+
+    When the Workspace engine is disabled there is nothing to verify against, so those
+    capabilities are refused instead of being executed on an opaque id.
+
+    Adapter-delegated capabilities (the R2.1 boundary, e.g. ``workspace.file.write`` served
+    by ``RuntimeOfficeAdapter``) cannot be opened by the R3 runtime, so they are gated by:
+    attribution always, and the Workspace/Canvas feature flag for every **mutating** call
+    (``write``/``external``/``destructive``) — a deployment with Workspace switched off can
+    no longer write into one.  Read-only workspace calls stay with the adapter's own scope
+    contract (``AdapterCallScope``), which is where the remaining R2.1 integration lands
+    (see ``docs/r3/WORKFLOW_EXECUTION_CONTRACT.md`` §18.9).  The in-memory development mock
+    (``is_mock``) is exempt because it has no Workspace engine at all and never runs in
+    production.
+    """
+
+    #: Transports whose execution the R3 runtime owns end-to-end (full verification).
+    VERIFIED_TRANSPORTS = frozenset({"registry", "mcp", "engine"})
+    #: In-memory development adapters: no Workspace engine exists to verify against.
+    DEVELOPMENT_TRANSPORTS = frozenset({"adapter_dev"})
+
+    def __init__(
+        self,
+        *,
+        workspace_enabled: Optional[Callable[[Optional[str]], bool]] = None,
+        canvas_enabled: Optional[Callable[[Optional[str]], bool]] = None,
+        verifier: Optional[Callable[[ExecutionContext], None]] = None,
+    ) -> None:
+        self._workspace_enabled = workspace_enabled
+        self._canvas_enabled = canvas_enabled
+        self._verifier = verifier
+
+    # -- defaults ----------------------------------------------------------------------
+    def _workspace_flag(self, service_id: Optional[str]) -> bool:
+        if self._workspace_enabled is not None:
+            return bool(self._workspace_enabled(service_id))
+        from app.config import is_workspace_enabled_for_service
+
+        return bool(is_workspace_enabled_for_service(service_id))
+
+    def _canvas_flag(self, service_id: Optional[str]) -> bool:
+        if self._canvas_enabled is not None:
+            return bool(self._canvas_enabled(service_id))
+        from app.config import is_canvas_tools_enabled_for_service
+
+        return bool(is_canvas_tools_enabled_for_service(service_id))
+
+    def _verify(self, context: ExecutionContext) -> None:
+        """Prove the workspace is still open for this owner, or refuse."""
+        if self._verifier is not None:
+            self._verifier(context)
+            return
+        from app.core.auth import ExecutionScope
+        from app.workspace.manager import WorkspaceFailure
+        from app.workspace.runtime import get_runtime
+
+        scope = ExecutionScope(
+            tenant_id=context.tenant_id,
+            owner_id=context.owner_id,
+            service_id=context.service_id or "",
+            role="user",
+            authenticated=True,
+            auth_source="workflow_runtime",
+        )
+        try:
+            get_runtime().manager.ensure_open(str(context.workspace_id), scope)
+        except WorkspaceFailure as exc:
+            code = getattr(getattr(exc, "error", None), "code", None)
+            raise ScopeViolation(
+                "workspace_binding_unverified",
+                detail=f"{context.workspace_id}: {getattr(code, 'value', code) or type(exc).__name__}",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - an unreadable registry is a refusal
+            raise ScopeViolation(
+                "workspace_binding_unverified",
+                detail=f"{context.workspace_id}: {type(exc).__name__}",
+            ) from exc
+
+    # -- policy ------------------------------------------------------------------------
+    def authorize(
+        self,
+        capability: Any,
+        context: ExecutionContext,
+        *,
+        transport: str = "registry",
+        mutating: bool = True,
+    ) -> None:
+        kind = workspace_tool_kind(capability)
+        if kind is None:
+            return
+        if context.workspace_id is None:
+            raise ScopeViolation(
+                "workspace_binding_required", detail=f"{capability}: run has no workspace attribution",
+            )
+        name = str(transport or "registry").lower()
+        if name in self.DEVELOPMENT_TRANSPORTS:
+            return
+        verified = name in self.VERIFIED_TRANSPORTS
+        flag_gate = verified or bool(mutating)
+        if kind == "canvas" and flag_gate and not self._canvas_flag(context.service_id):
+            raise ScopeViolation("canvas_tool_disabled", detail=f"{capability}: service={context.service_id or '-'}")
+        if flag_gate and not self._workspace_flag(context.service_id):
+            raise ScopeViolation(
+                "workspace_tool_disabled", detail=f"{capability}: service={context.service_id or '-'}",
+            )
+        if verified:
+            self._verify(context)

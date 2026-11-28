@@ -105,6 +105,8 @@ from app.workflow.safety import (
     ScopeViolation,
     approval_args_hash,
     assert_scope_access,
+    classify_principal,
+    ensure_human_approver,
 )
 from app.workflow.ledger import (
     ExecutionLedger,
@@ -118,6 +120,7 @@ from app.workflow.scope import (
     R2WorkspaceResolver,
     ScopeEvidence,
     ToolAccessPolicy,
+    WorkspaceToolPolicy,
 )
 from app.workflow.transport import (
     MCPTransportError,
@@ -186,8 +189,9 @@ __all__ = [
     "IdempotencyLedger", "IdempotencyRecord", "IdempotencyConflict",
     # ledger / concurrency (FIX-02)
     "ExecutionLedger", "LedgerClaim", "StepLedgerRecord", "RunExecutionGuard", "RunBusy",
-    # scope authority (FIX-01)
+    # scope authority (FIX-01 / FIX-02)
     "ExecutionScopeAuthority", "R2WorkspaceResolver", "ScopeEvidence", "ToolAccessPolicy",
+    "WorkspaceToolPolicy", "classify_principal", "ensure_human_approver",
     # transport (FIX-03)
     "StdioMCPClient", "StreamableHTTPMCPClient", "MCPTransportError", "MCPTransportTimeout",
     # registry

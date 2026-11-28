@@ -9,6 +9,9 @@ enforce that:
   ``destructive`` capability runs, the runtime *claims* the key.  Only one claim can win;
   a finished claim replays its stored result, an ``uncertain`` claim (the transport answer
   was lost) is never retried automatically but reported as ``recovery_required``.
+  An **expired claim is not a licence to run again** (FIX-02 P0): the process that held it
+  may have dispatched the side effect and died, so an expired lease is turned into an
+  ``uncertain`` record and the run holds for ``recovery_required`` until a human resolves it.
 * :class:`RunExecutionGuard` — one in-process lease per run so two concurrent
   ``start``/``resume`` calls cannot execute the same checkpoint at once, backed by the
   store's durable lease when that backend supports one.
@@ -232,10 +235,12 @@ class ExecutionLedger:
         """Reserve the right to execute one side effect.
 
         ``granted=True``  — this call owns the execution (first attempt, or a retry of a
-        recorded failure).
+        recorded failure the operator confirmed).
         ``granted=False`` — ``status`` says why: ``replay`` (already succeeded, result
         attached), ``in_flight`` (another attempt is running), ``recovery_required``
-        (previous attempt's outcome is unknown and must not be retried automatically).
+        (a previous attempt's outcome is unknown — an ``uncertain`` record, or a lease
+        that expired while the side effect may already have been dispatched — and it must
+        not be retried automatically).
         """
         key = self._key(run_id, step_id, idempotency_key or f"{run_id}:{step_id}", scope_key)
         token = claimed_by or uuid.uuid4().hex
@@ -262,13 +267,19 @@ class ExecutionLedger:
                 if existing.claimed_by == token:
                     return LedgerClaim(granted=True, status="claimed", record=existing, attempt=existing.attempt)
                 if self._lease_expired(existing, now):
+                    # FIX-02 P0: an expired lease proves nothing about the side effect.  The
+                    # previous executor may have dispatched it and died, so the claim is
+                    # *not* handed over: it becomes ``uncertain`` and the run holds for an
+                    # explicit ``/recovery`` decision instead of executing a second time.
                     record = existing.model_copy(update={
-                        "attempt": existing.attempt + 1, "claimed_by": token,
-                        "claimed_at": now, "updated_at": now, "side_effect": side_effect,
+                        "status": "uncertain",
+                        "error": "lease_expired_outcome_unknown",
+                        "updated_at": now,
                     })
                     self._write_row(key, record)
                     return LedgerClaim(
-                        granted=True, status="stale_claim_recovered", record=record, attempt=record.attempt,
+                        granted=False, status="recovery_required", record=record,
+                        attempt=existing.attempt, detail="lease_expired",
                     )
                 return LedgerClaim(
                     granted=False, status="in_flight", record=existing, attempt=existing.attempt,

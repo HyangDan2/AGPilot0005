@@ -181,10 +181,17 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
     from app.workflow.omni import get_omni_bridge
 
     bridge = get_omni_bridge()
+    shared_services = None
     if bridge is not None:
         await bridge.dispatch_session_start(req, scope)
+        # FIX-02 P1: a chat run gets the shared Skills / Rules / Tool Registry / MCP
+        # catalogue too.  Reading it constructs nothing when R3 is not wired.
+        shared_services = bridge.shared_services(req, scope)
     try:
-        session = await runner.create_run(req, service_id=service_id, owner_id=owner, caller_scope=scope)
+        session = await runner.create_run(
+            req, service_id=service_id, owner_id=owner, caller_scope=scope,
+            shared_services=shared_services,
+        )
     except DocumentReferenceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except PermissionError as exc:

@@ -25,9 +25,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
+import signal
 from collections import deque
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Sequence
+
+from app.workflow.isolation import (
+    MCPSecurityError,
+    assert_egress_target,
+    limit_child_process,
+    mask_endpoint,
+    resolve_executable,
+    sanitize_child_env,
+    validate_exec_arguments,
+)
 
 __all__ = [
     "MCPTransportError",
@@ -137,7 +149,19 @@ def jsonlib_dumps(value: Any) -> str:
 
 
 class StdioMCPClient:
-    """MCP client over a child process' stdin/stdout (newline-delimited JSON-RPC)."""
+    """MCP client over a child process' stdin/stdout (newline-delimited JSON-RPC).
+
+    FIX-02 P1 process isolation:
+
+    * the launcher is resolved to its **real path** and must be an allowlisted interpreter
+      (a shadowing symlink in ``PATH`` or a path escape is refused);
+    * dangerous inline-execution flags (``-c``/``-e``/``--eval`` …) are refused;
+    * the child gets a **sanitized environment** (whitelist, no ``*_API_KEY`` / ``AWS_*`` /
+      ``DATABASE_URL`` / this service's credentials) instead of the parent's ``os.environ``;
+    * it runs in its own session/process group (``start_new_session=True``) with optional
+      rlimits, and closing kills the whole group, so a server that forked children cannot
+      outlive the workflow.
+    """
 
     def __init__(
         self,
@@ -147,17 +171,29 @@ class StdioMCPClient:
         env: Optional[Mapping[str, str]] = None,
         cwd: Optional[str] = None,
         max_stderr_lines: int = 200,
+        command_allowlist: Iterable[str] = (),
+        env_allowlist: Iterable[str] = (),
+        start_new_session: bool = True,
+        memory_limit_bytes: Optional[int] = 2 * 1024 * 1024 * 1024,
+        max_open_files: int = 1024,
     ) -> None:
         self.command = command
         self.timeout = float(timeout_seconds)
         self._env = dict(env) if env else None
         self._cwd = cwd
         self._max_stderr_lines = max_stderr_lines
+        self._command_allowlist = tuple(command_allowlist or ())
+        self._env_allowlist = tuple(env_allowlist or ())
+        self._start_new_session = bool(start_new_session)
+        self._memory_limit_bytes = memory_limit_bytes
+        self._max_open_files = max_open_files
         self.session = JsonRpcSession()
         self._process: Optional[asyncio.subprocess.Process] = None
+        self._pgid: Optional[int] = None
         self._stderr: Deque[str] = deque(maxlen=max_stderr_lines)
         self._stderr_task: Optional[asyncio.Task] = None
         self._write_lock = asyncio.Lock()
+        self.resolved_command: Optional[str] = None
         #: Exit status of the server process once :meth:`close` returned (None = still running).
         self.returncode: Optional[int] = None
 
@@ -181,19 +217,66 @@ class StdioMCPClient:
         if not argv:
             raise MCPTransportError("mcp_command_required")
         try:
+            validate_exec_arguments(argv[1:])
+            executable = resolve_executable(argv[0], allowlist=self._command_allowlist or None)
+        except MCPSecurityError as exc:
+            raise MCPTransportError(exc.code, str(exc)) from exc
+        self.resolved_command = executable
+        env = sanitize_child_env(self._env, extra_allow=self._env_allowlist)
+        kwargs: Dict[str, Any] = {}
+        if os.name == "posix":
+            kwargs["start_new_session"] = self._start_new_session
+            cpu_seconds = int(max(30.0, self.timeout * 10))
+            kwargs["preexec_fn"] = limit_child_process(
+                cpu_seconds=cpu_seconds,
+                address_space_bytes=self._memory_limit_bytes,
+                max_open_files=self._max_open_files,
+            )
+        try:
             self._process = await asyncio.create_subprocess_exec(
-                *argv,
+                executable, *argv[1:],
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=self._env,
+                env=env,
                 cwd=self._cwd,
+                **kwargs,
             )
         except (OSError, ValueError) as exc:
             raise MCPTransportError("mcp_command_failed", f"{argv[0]}: {type(exc).__name__}") from exc
         if self._process.stderr is not None:
             self._stderr_task = asyncio.create_task(self._drain_stderr(self._process.stderr))
+        try:
+            self._pgid = os.getpgid(self._process.pid)
+        except (ProcessLookupError, OSError):  # pragma: no cover - already gone
+            self._pgid = self._process.pid
         return self._process
+
+    def _signal_group(self, process: asyncio.subprocess.Process, sig: int) -> None:
+        """Signal the child's whole process group (it runs in its own session)."""
+        pgid = self._pgid
+        if os.name == "posix" and self._start_new_session and pgid and pgid != os.getpgid(0):
+            try:
+                os.killpg(pgid, sig)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            process.send_signal(sig)
+        except (ProcessLookupError, RuntimeError):
+            pass
+
+    def _kill_group_remainder(self) -> None:
+        """Kill anything the server left behind in its own process group."""
+        pgid = self._pgid
+        if os.name != "posix" or not self._start_new_session or not pgid:
+            return
+        if pgid == os.getpgid(0):  # pragma: no cover - never signal ourselves
+            return
+        try:
+            os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
 
     async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
         try:
@@ -222,18 +305,17 @@ class StdioMCPClient:
         except Exception:  # noqa: BLE001
             pass
         if process.returncode is None:
-            process.terminate()
+            self._signal_group(process, signal.SIGTERM)
             try:
                 await asyncio.wait_for(process.wait(), timeout=3.0)
             except (asyncio.TimeoutError, ProcessLookupError):
-                try:
-                    process.kill()
-                except ProcessLookupError:  # pragma: no cover - already gone
-                    pass
+                self._signal_group(process, getattr(signal, "SIGKILL", signal.SIGTERM))
                 try:
                     await asyncio.wait_for(process.wait(), timeout=3.0)
                 except asyncio.TimeoutError:  # pragma: no cover
                     pass
+        # A server that forked helpers cannot outlive the workflow: clean the group.
+        self._kill_group_remainder()
         if self._stderr_task is not None:
             self._stderr_task.cancel()
             self._stderr_task = None
@@ -334,7 +416,14 @@ class StdioMCPClient:
 
 
 class StreamableHTTPMCPClient:
-    """MCP ``streamable-http`` client (JSON body or SSE framed JSON-RPC)."""
+    """MCP ``streamable-http`` client (JSON body or SSE framed JSON-RPC).
+
+    FIX-02 P1 egress hardening: the endpoint is re-validated (scheme, host allowlist and a
+    fresh DNS resolution of the *actual* destination) immediately before every request, so
+    a name that starts pointing at a private/metadata address after registration is refused
+    (DNS rebinding), and redirects are never followed — a ``3xx`` is reported as
+    ``mcp_redirect_blocked`` instead of becoming an egress pivot.
+    """
 
     def __init__(
         self,
@@ -343,6 +432,9 @@ class StreamableHTTPMCPClient:
         timeout_seconds: float = 15.0,
         headers: Optional[Mapping[str, str]] = None,
         client: Any = None,
+        allow_private_network: bool = False,
+        allowed_hosts: Iterable[str] = (),
+        validate_target: bool = True,
     ) -> None:
         self.url = url
         self.timeout = float(timeout_seconds)
@@ -350,14 +442,32 @@ class StreamableHTTPMCPClient:
         self._headers = {str(k): str(v) for k, v in (headers or {}).items()}
         self._client = client
         self._owns_client = client is None
+        self._allow_private_network = bool(allow_private_network)
+        self._allowed_hosts = tuple(allowed_hosts or ())
+        self._validate_target = bool(validate_target)
         self.session_id: Optional[str] = None
 
     async def _http(self) -> Any:
         if self._client is None:
             import httpx
 
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+            # Redirects are refused: an MCP endpoint returns JSON-RPC, never a redirect.
+            self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=False)
         return self._client
+
+    async def _assert_egress(self) -> None:
+        if not self._validate_target:
+            return
+        try:
+            # DNS lookups block, so they never run on the event loop.
+            await asyncio.to_thread(
+                assert_egress_target,
+                self.url,
+                allowed_hosts=self._allowed_hosts,
+                allow_private_network=self._allow_private_network,
+            )
+        except MCPSecurityError as exc:
+            raise MCPTransportError("mcp_egress_blocked", f"{exc.code}") from exc
 
     def _request_headers(self) -> Dict[str, str]:
         headers = {
@@ -406,6 +516,7 @@ class StreamableHTTPMCPClient:
     async def _post(self, payload: Mapping[str, Any], *, request_id: Optional[int]) -> tuple:
         import httpx
 
+        await self._assert_egress()
         client = await self._http()
         try:
             response = await client.post(self.url, json=dict(payload), headers=self._request_headers())
@@ -413,6 +524,9 @@ class StreamableHTTPMCPClient:
             raise MCPTransportTimeout(f"{payload.get('method')} after {self.timeout}s") from exc
         except httpx.HTTPError as exc:
             raise MCPTransportError("mcp_http_error", type(exc).__name__) from exc
+        if 300 <= int(response.status_code) < 400:
+            location = response.headers.get("location") or ""
+            raise MCPTransportError("mcp_redirect_blocked", mask_endpoint(location)[:120])
         if response.status_code >= 500:
             raise MCPTransportError("mcp_http_unavailable", f"status={response.status_code}")
         if response.status_code >= 400:

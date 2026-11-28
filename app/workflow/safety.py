@@ -44,6 +44,11 @@ __all__ = [
     "ApprovalError",
     "ApprovalAuthority",
     "approval_args_hash",
+    "PrincipalKind",
+    "HUMAN_PRINCIPAL",
+    "MACHINE_PRINCIPAL",
+    "classify_principal",
+    "ensure_human_approver",
     "InjectionScan",
     "TaggedContent",
     "PromptInjectionError",
@@ -201,6 +206,63 @@ def assert_scope_access(
 
 
 # --------------------------------------------------------------------------------------
+# Principal classification (FIX-02 P1)
+# --------------------------------------------------------------------------------------
+#: Who a credential represents.  Human approvals may only be issued by a human user.
+PrincipalKind = Literal["user", "machine", "anonymous"]
+HUMAN_PRINCIPAL = "user"
+MACHINE_PRINCIPAL = "machine"
+ANONYMOUS_PRINCIPAL = "anonymous"
+
+_USER_PRINCIPAL_ROLES = frozenset({"user", "owner", "admin", "admiral"})
+#: Auth sources that prove a *delegated human* (a verified front-end acting for a person).
+_HUMAN_AUTH_SOURCES = frozenset({"trusted_proxy", "dev_local", "human_session", "oidc", "sso"})
+
+
+def classify_principal(scope: Any) -> str:
+    """Classify an authenticated principal as ``user`` / ``machine`` / ``anonymous``.
+
+    A role string alone is never enough (FIX-02): an API key or a service credential may
+    carry ``role="admin"`` and still is *not* a person, so it can never press a Human
+    Approval button.  The decision combines
+
+    * the credential's own ``principal_kind`` (set by the auth resolver per credential),
+    * its ``auth_source`` (a verified proxy / local operator session delegates a human;
+      ``credential_scope:*`` is a machine credential), and
+    * the role floor (``guest`` / ``service`` / ``tool`` / ``system`` are machine roles).
+    """
+    if scope is None or not getattr(scope, "authenticated", False):
+        return ANONYMOUS_PRINCIPAL
+    declared = str(getattr(scope, "principal_kind", "") or "").strip().lower()
+    auth_source = str(getattr(scope, "auth_source", "") or "").strip().lower()
+    role = str(getattr(scope, "role", "") or "").strip().lower()
+    if declared in (MACHINE_PRINCIPAL, ANONYMOUS_PRINCIPAL):
+        return declared
+    # An explicit human declaration wins only with a human role (a credential that says
+    # "user" but presents role=service is contradictory and stays a machine).
+    if declared == HUMAN_PRINCIPAL and role in _USER_PRINCIPAL_ROLES:
+        return HUMAN_PRINCIPAL
+    if auth_source.startswith("credential_scope") or auth_source in ("machine", "api_key", "service_token"):
+        return MACHINE_PRINCIPAL
+    if role in ("service", "tool", "system", "automation", "bot", "ai", "assistant", "guest", ""):
+        return MACHINE_PRINCIPAL
+    if auth_source in _HUMAN_AUTH_SOURCES and role in _USER_PRINCIPAL_ROLES:
+        return HUMAN_PRINCIPAL
+    # Unknown auth source: never assume a person for an approval.
+    return MACHINE_PRINCIPAL
+
+
+def ensure_human_approver(scope: Any) -> None:
+    """Raise :class:`ApprovalError` unless ``scope`` is a human user principal."""
+    kind = classify_principal(scope)
+    if kind != HUMAN_PRINCIPAL:
+        raise ApprovalError(
+            "approval_requires_user_principal",
+            f"principal={kind}: role={getattr(scope, 'role', '') or 'unknown'}",
+        )
+
+
+# --------------------------------------------------------------------------------------
 # Approval tokens (user approval vs. model-generated approval)
 # --------------------------------------------------------------------------------------
 ApprovalSource = Literal["user", "model", "system"]
@@ -275,6 +337,8 @@ class ApprovalToken(BaseModel):
     expires_at: datetime
     nonce: Optional[str] = None
     signature: Optional[str] = None
+    # -- FIX-02 P1: the principal that pressed approve (a machine credential never can)
+    approver_kind: PrincipalKind = "user"
     # -- FIX-06: the token is bound to the exact run/step/capability/arguments it approves
     run_id: Optional[str] = None
     step_id: Optional[str] = None
@@ -312,6 +376,7 @@ class ApprovalToken(BaseModel):
             "issued_at": self.issued_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
             "nonce": self.nonce,
+            "approver_kind": self.approver_kind,
             "run_id": self.run_id,
             "step_id": self.step_id,
             "capability": self.capability,
@@ -331,6 +396,7 @@ class ApprovalRecord(BaseModel):
     approved_by: Optional[str] = None
     approved_at: datetime
     expires_at: datetime
+    approver_kind: PrincipalKind = "user"
     run_id: Optional[str] = None
     step_id: Optional[str] = None
     capability: Optional[str] = None
@@ -385,14 +451,21 @@ class ApprovalAuthority:
         capability: Optional[str] = None,
         target: Optional[str] = None,
         args_hash: Optional[str] = None,
+        principal_kind: str = "user",
     ) -> ApprovalToken:
         if not approved_by or not approved_by.strip():
             raise ApprovalError("approver_required")
+        # FIX-02 P1: defence in depth - the authority itself refuses a machine principal,
+        # so no caller can mint a "user" approval from a service credential or API key.
+        kind = str(principal_kind or "").strip().lower() or "user"
+        if kind != "user":
+            raise ApprovalError("approval_requires_user_principal", f"principal={kind}")
         return self._issue(
             context,
             approved_by=approved_by,
             approved_by_user=True,
             approval_source="user",
+            approver_kind="user",
             ttl_seconds=ttl_seconds,
             approval_id=approval_id,
             binding=ApprovalBinding(
@@ -417,6 +490,7 @@ class ApprovalAuthority:
             approved_by=approved_by,
             approved_by_user=False,
             approval_source="model",
+            approver_kind="machine",
             ttl_seconds=ttl_seconds,
             approval_id=approval_id,
             binding=ApprovalBinding(),
@@ -432,6 +506,7 @@ class ApprovalAuthority:
         ttl_seconds: Optional[int],
         approval_id: Optional[str],
         binding: ApprovalBinding,
+        approver_kind: str = "user",
     ) -> ApprovalToken:
         now = _utcnow()
         ttl = self.default_ttl_seconds if ttl_seconds is None else int(ttl_seconds)
@@ -443,6 +518,7 @@ class ApprovalAuthority:
             approved_by_user=approved_by_user,
             approved_by=approved_by,
             approval_source=approval_source,
+            approver_kind=approver_kind,  # type: ignore[arg-type]
             issued_at=now,
             expires_at=now + timedelta(seconds=ttl),
             nonce=uuid.uuid4().hex,
@@ -491,6 +567,12 @@ class ApprovalAuthority:
             raise ApprovalError("model_generated_approval")
         if not self.signature_valid(token):
             raise ApprovalError("invalid_signature")
+        # FIX-02 P1: a correctly signed token minted for a machine principal is still not a
+        # Human Approval (checked after integrity so a tampered token reports the forgery).
+        if str(token.approver_kind or "").strip().lower() != "user":
+            raise ApprovalError(
+                "approval_requires_user_principal", f"token_principal={token.approver_kind}",
+            )
 
         expected_scope = context.scope_hash()
         if not hmac.compare_digest(expected_scope, token.scope_hash):
@@ -521,6 +603,7 @@ class ApprovalAuthority:
             approval_id=token.approval_id,
             scope_hash=token.scope_hash,
             approved_by=token.approved_by,
+            approver_kind=token.approver_kind,
             approved_at=token.issued_at,
             expires_at=token.expires_at,
             run_id=token.run_id,

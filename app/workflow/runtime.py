@@ -37,6 +37,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Tuple,
     TypedDict,
 )
 
@@ -90,7 +91,7 @@ from app.workflow.safety import (
     ScopeViolation,
     approval_args_hash,
 )
-from app.workflow.scope import ToolAccessPolicy
+from app.workflow.scope import ToolAccessPolicy, WorkspaceToolPolicy
 from app.workflow.trajectory import (
     ArtifactRecord,
     FailureRecord,
@@ -135,8 +136,35 @@ AMBIGUOUS_ERROR_CODES = frozenset(
     {
         "tool_timeout", "mcp_timeout", "mcp_http_unavailable", "mcp_transport_error",
         "transport_error", "upstream_unavailable", "timeout", "mcp_stream_closed",
+        "lease_expired",
     }
 )
+#: Exception types that always mean "we do not know whether the remote side ran it":
+#: a timeout, a broken connection or an OS-level I/O failure after dispatch.
+AMBIGUOUS_EXCEPTIONS: Tuple[type, ...] = (TimeoutError, ConnectionError, OSError)
+
+
+def _is_ambiguous_failure(exc: Optional[BaseException], code: str) -> bool:
+    """FIX-02 P0/P1: is the outcome of this side effect unknown?"""
+    if exc is not None:
+        # A policy/approval/idempotency refusal is *definitive*: nothing was dispatched.
+        from app.workflow.safety import ApprovalError, IdempotencyConflict, ScopeViolation
+
+        if isinstance(exc, (ScopeViolation, ApprovalError, IdempotencyConflict)):
+            return False
+        if isinstance(exc, HookValidationError):
+            return False
+    if code in AMBIGUOUS_ERROR_CODES:
+        return True
+    if exc is None:
+        return False
+    try:
+        from app.workflow.transport import MCPTransportError
+    except Exception:  # noqa: BLE001 - transport module always present, but never crash here
+        MCPTransportError = ()  # type: ignore[assignment]
+    if isinstance(exc, MCPTransportError):
+        return True
+    return isinstance(exc, AMBIGUOUS_EXCEPTIONS)
 #: Parameter names used to describe *what* an approval is for (in that order).
 _APPROVAL_TARGET_PARAMS = ("path", "target_path", "id", "uri", "url", "name", "key", "recipient")
 _COMPARISON_RE = re.compile(r"^\s*(\$[^\s]+)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$")
@@ -858,6 +886,7 @@ class _RunContext:
 
         attempts = max(0, int(step.max_retries)) + 1
         last_code, last_message, last_cause = "step_failed", "", ""
+        last_ambiguous = False
         transport = "unknown"
         for attempt in range(1, attempts + 1):
             started = time.perf_counter()
@@ -887,6 +916,7 @@ class _RunContext:
             except asyncio.TimeoutError:
                 duration = (time.perf_counter() - started) * 1000
                 last_code, last_message, last_cause = "tool_timeout", f"timeout after {step.timeout_seconds}s", "TimeoutError"
+                last_ambiguous = True
                 self.trajectory.add_tool_call(
                     ToolCallRecord(
                         step_id=step.step_id, capability=step.capability, transport=transport,
@@ -898,6 +928,9 @@ class _RunContext:
             except Exception as exc:  # noqa: BLE001 - classified into the failure contract
                 duration = (time.perf_counter() - started) * 1000
                 last_code, last_message, retryable, last_cause = self.runtime.classify_error(exc)
+                # FIX-02 P0/P1: a timeout / broken connection / OSError after dispatch leaves
+                # the outcome unknown regardless of the error vocabulary a transport used.
+                last_ambiguous = _is_ambiguous_failure(exc, last_code)
                 self.trajectory.add_tool_call(
                     ToolCallRecord(
                         step_id=step.step_id, capability=step.capability, transport=transport,
@@ -938,8 +971,14 @@ class _RunContext:
                              "workspace_id": params.get("workspace_id"), "path": params.get("path")},
                         )
                 except HookValidationError as exc:
-                    # The side effect already happened: the output is kept, the run fails.
+                    # The side effect already happened: the output is recorded as succeeded so
+                    # a later resume can never repeat it, and the run fails (FIX-02).
                     self.outputs[step.key] = value
+                    if side_effect in SIDE_EFFECT_STEPS:
+                        self.runtime.execution_ledger.succeed(
+                            self.run_id, step.step_id, value,
+                            idempotency_key=idempotency_key, scope_key=self.context.scope_hash(),
+                        )
                     failure = await self._register_failure(
                         step, code=exc.code, message=str(exc), cause_type=type(exc).__name__,
                         attempts=attempt, source="hook", duration_ms=duration,
@@ -956,7 +995,7 @@ class _RunContext:
                 return "completed"
 
             if attempt < attempts and retryable:
-                if side_effect in SIDE_EFFECT_STEPS and last_code in AMBIGUOUS_ERROR_CODES:
+                if side_effect in SIDE_EFFECT_STEPS and (last_ambiguous or last_code in AMBIGUOUS_ERROR_CODES):
                     # The call was dispatched and its outcome is unknown: a retry could
                     # duplicate the side effect, so the run holds for recovery (FIX-02).
                     self.runtime.execution_ledger.mark_uncertain(
@@ -980,7 +1019,7 @@ class _RunContext:
                 attempts=attempt, source="adapter", duration_ms=duration,
             )
             if side_effect in SIDE_EFFECT_STEPS:
-                if last_code in AMBIGUOUS_ERROR_CODES:
+                if last_ambiguous or last_code in AMBIGUOUS_ERROR_CODES:
                     self.runtime.execution_ledger.mark_uncertain(
                         self.run_id, step.step_id, f"{last_code}: {last_message}",
                         idempotency_key=idempotency_key, scope_key=self.context.scope_hash(),
@@ -1095,6 +1134,19 @@ class _RunContext:
         await self.save_checkpoint(status="recovery_required", step_id=step.step_id)
         return "recovery_required"
 
+    def _transport_for(self, step: PlanStep) -> str:
+        """Which executor would run this step (used by the workspace/canvas gate)."""
+        capability = step.capability
+        office = self.office
+        if office is not None and capability in getattr(office, "capabilities", ()):
+            return "adapter_dev" if getattr(office, "is_mock", False) else "office"
+        if capability.startswith("mcp."):
+            return "mcp"
+        spec = self._spec_for(step)
+        if spec is not None and str(getattr(spec, "source", "")) == "mcp":
+            return "mcp"
+        return "registry"
+
     def _spec_for(self, step: PlanStep) -> Any:
         if self.registry is None:
             return None
@@ -1116,6 +1168,15 @@ class _RunContext:
                 raise ScopeViolation("scope_mismatch", fields=["workspace_id"])
         if step.skill_name and step.skill_name in self.skill_grants and self.skills is not None:
             self.skills.enforce_tool_call(self.skill_grants[step.skill_name], capability)
+        # FIX-02 P0: workspace/canvas capabilities are fail-closed.  Nothing runs on an
+        # opaque workspace id while the feature is disabled or the binding cannot be
+        # verified right now (see :class:`app.workflow.scope.WorkspaceToolPolicy`).
+        workspace_policy = getattr(self.runtime, "workspace_policy", None)
+        if workspace_policy is not None:
+            workspace_policy.authorize(
+                capability, self.context, transport=self._transport_for(step),
+                mutating=self._side_effect_of(step) in SIDE_EFFECT_STEPS,
+            )
 
         office = self.office
         if office is not None and capability in office.capabilities:
@@ -1447,6 +1508,7 @@ class WorkflowRuntime:
         execution_ledger: Optional[ExecutionLedger] = None,
         run_guard: Optional[RunExecutionGuard] = None,
         tool_policy: Optional[ToolAccessPolicy] = None,
+        workspace_policy: Optional[WorkspaceToolPolicy] = None,
         planner: Optional[Planner] = None,
         max_steps: int = 10,
         max_retries: int = 2,
@@ -1469,6 +1531,8 @@ class WorkflowRuntime:
         self.run_guard = run_guard if run_guard is not None else RunExecutionGuard()
         # FIX-01: optional AGCore tool policy gate for registry-backed capabilities.
         self.tool_policy = tool_policy
+        # FIX-02 P0: optional fail-closed gate for workspace/canvas capabilities.
+        self.workspace_policy = workspace_policy
         self.approvals = approvals if approvals is not None else ApprovalAuthority(uuid.uuid4().hex)
         self.planner = planner or Planner(
             skills=skills, registry=registry, rules=rules,
@@ -1730,7 +1794,14 @@ class WorkflowRuntime:
         *,
         approved_by: Optional[str] = None,
         ttl_seconds: int = 300,
+        principal_kind: str = "user",
     ) -> ApprovalToken:
+        """Issue a one-time approval token bound to this run/step/arguments (FIX-06).
+
+        ``principal_kind`` is what the credential resolver classified (FIX-02 P1) and comes
+        from the trusted caller (the REST layer classifies *and* refuses first).  A value
+        other than ``user`` is refused by :class:`ApprovalAuthority` itself.
+        """
         checkpoint = self.store.load(run_id, context=context)
         if not checkpoint.pending_approval_id:
             raise WorkflowRuntimeError("approval_not_required", run_id)
@@ -1747,10 +1818,13 @@ class WorkflowRuntime:
                 pending_step_id = None
         # FIX-06: the approver is the authenticated owner, and the token is bound to the
         # exact run/step/capability/arguments recorded when the pause was written.
+        # FIX-02 P1: only a human principal may issue it (machine credentials, API keys and
+        # bots are refused by the authority itself, whatever role they carry).
         return self.approvals.issue_user_approval(
             context,
             approved_by=(approved_by or context.owner_id),
             ttl_seconds=ttl_seconds,
+            principal_kind=principal_kind,
             approval_id=checkpoint.pending_approval_id,
             run_id=run_id,
             step_id=pending_step_id,

@@ -389,19 +389,28 @@ class _UnavailableClient:
 
 
 def default_client_factory(config: MCPServerConfig, secret: Optional[str]) -> MCPClient:
-    """Real MCP transport for the declared transport (FIX-03).
+    """Real MCP transport for the declared transport (FIX-03, hardened in FIX-02).
 
-    ``stdio`` starts the declared command; ``streamable_http`` POSTs JSON-RPC to the
-    declared endpoint.  The credential (``credential_ref``) is attached as a bearer header
-    and never appears in a log or a repr.
+    ``stdio`` starts the declared command in an isolated process (sanitized env, own session,
+    rlimits, allowlisted launcher); ``streamable_http`` POSTs JSON-RPC to the declared
+    endpoint with per-request egress re-validation and redirects refused.  The credential
+    (``credential_ref``) is attached as a bearer header and never appears in a log or a repr.
     """
     headers: Dict[str, str] = {}
     if secret:
         headers["authorization"] = f"Bearer {secret}"
     if config.transport == "stdio":
-        return StdioMCPClient(config.command_or_url, timeout_seconds=config.timeout_seconds)
+        return StdioMCPClient(
+            config.command_or_url,
+            timeout_seconds=config.timeout_seconds,
+            command_allowlist=config.command_allowlist,
+        )
     return StreamableHTTPMCPClient(
-        config.command_or_url, timeout_seconds=config.timeout_seconds, headers=headers,
+        config.command_or_url,
+        timeout_seconds=config.timeout_seconds,
+        headers=headers,
+        allow_private_network=config.allow_private_network,
+        allowed_hosts=config.allowed_hosts,
     )
 
 

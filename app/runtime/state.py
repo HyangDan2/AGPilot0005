@@ -48,6 +48,9 @@ class AgentState(BaseModel):
     # Custom client for Direct Demo Adapter
     custom_client: Optional[Any] = None
 
+    # FIX-02 P1: common R3 stack exposed to this run (capabilities / skills / rules / MCP).
+    shared_context: Dict[str, Any] = Field(default_factory=dict)
+
     model_config = {"arbitrary_types_allowed": True}
 
     @property
