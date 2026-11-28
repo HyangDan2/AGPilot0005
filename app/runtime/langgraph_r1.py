@@ -21,6 +21,7 @@ from app.runtime.policy.ag_policy import AGPolicy, DefaultAGPolicy, PolicyPropos
 from app.runtime.policy.constraints import ActionType, ConstraintSpec
 from app.runtime.policy.validator import ActionValidator, FallbackAction, ValidatedAction, ValidationResult
 from app.runtime.state import AgentState
+from app.runtime.source_evidence import recovery_calls
 from app.schemas.gateway import FunctionCall, GatewayMessage, ToolCall
 from app.tools.adapters import EscalationGate, PostCallAdapter
 from app.tracing.store import TrajectoryLogger
@@ -122,6 +123,21 @@ async def _propose_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
     ctx = _ctx_from_config(config)
     trace = list(gstate.get("node_trace", []))
     trace.append("propose")
+    st = ctx.agent_state
+    if st.sources and not st.pending_tool_calls and not st.source_finalizing and (
+        st.step_count > 0 or ctx.constraints.max_steps == 1
+    ):
+        if not st.source_recovery:
+            st.source_recovery = True
+            remaining_tools = ctx.constraints.max_tool_calls - st.tool_call_count
+            calls = recovery_calls(st, remaining_tools, ctx.constraints.allowed_tools)
+            if calls:
+                st.pending_tool_calls = calls
+                st.messages.append(GatewayMessage(role="assistant", tool_calls=calls))
+            else:
+                st.source_finalizing = True
+        else:
+            st.source_finalizing = True
     sv = _build_state_view(gstate, ctx)
     proposal = ctx.policy.propose(sv, ctx.constraints)
     return {
@@ -297,6 +313,8 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
             )
             effective_ctx_budget = params.get("context_budget_tokens")
             is_safe_respond = action == ActionType.SAFE_RESPOND.value
+            if is_safe_respond and st.sources:
+                st.source_finalizing = True
             if is_safe_respond:
                 st.pending_tool_calls = []
 
@@ -323,14 +341,17 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
             async def on_reasoning_delta(chunk: str):
                 await _emit_with_fence(ctx, "reasoning.delta", {"delta": chunk, "step": st.step_count})
 
-            async with asyncio.timeout(run_deadline.remaining_seconds()):
+            model_timeout = run_deadline.remaining_seconds()
+            if st.sources and not st.source_finalizing:
+                model_timeout = max(0.001, model_timeout - min(15.0, run_deadline.budget_seconds / 3))
+            async with asyncio.timeout(model_timeout):
                 res = await model_node(
                     st,
-                    on_delta=on_delta,
+                    on_delta=on_delta if not st.sources or st.source_finalizing else None,
                     on_reasoning_delta=on_reasoning_delta,
                     context_budget_override=effective_ctx_budget,
                     reasoning_effort_override=effective_effort,
-                    disable_tools=is_safe_respond,
+                    disable_tools=is_safe_respond or st.source_finalizing,
                 )
 
             raw_usage = res.get("usage") or (
@@ -351,7 +372,10 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
             st.pending_tool_calls = res.get("pending_tool_calls", [])
             if res.get("model_label"):
                 st.model_label = res["model_label"]
-            if "final_answer" in res:
+            if st.sources and not st.source_finalizing and not st.pending_tool_calls:
+                # An exploratory draft cannot escape before evidence recovery and synthesis.
+                st.messages.pop()
+            elif "final_answer" in res:
                 st.final_answer = res["final_answer"]
 
             await _emit_with_fence(
@@ -364,9 +388,9 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                 },
             )
 
-            if not st.pending_tool_calls:
+            if not st.pending_tool_calls and (not st.sources or st.source_finalizing):
                 escalated = False
-                if action != ActionType.SAFE_RESPOND.value:
+                if not st.sources and action != ActionType.SAFE_RESPOND.value:
                     should_esc, esc_prompt = EscalationGate.evaluate(
                         last_tool_meta,
                         set(attempted_sigs),
@@ -416,11 +440,12 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                                     await _emit_with_fence(ctx, "answer.delta", {"delta": citation_tail, "step": st.step_count})
             await _emit_with_fence(ctx, "step.completed", {"step": st.step_count})
 
-            if action == ActionType.SAFE_RESPOND.value and terminal_status is None:
-                if (st.final_answer or "").strip():
-                    if run_fence.try_finalize("completed"):
-                        st.status = "completed"
-                        terminal_status = "completed"
+            if (is_safe_respond or st.source_finalizing) and terminal_status is None:
+                completion = "partial" if any(source.status == "missing" for source in st.sources) else "completed"
+                if (st.final_answer or "").strip() or completion == "partial":
+                    if run_fence.try_finalize(completion):
+                        st.status = completion
+                        terminal_status = completion
                 else:
                     if run_fence.try_finalize("failed"):
                         st.status = "failed"
@@ -458,6 +483,9 @@ async def _execute_node(gstate: R1GraphState, config: RunnableConfig) -> Dict[st
                 )
 
             tool_timeout = run_deadline.cap_timeout(settings.TOOL_TIMEOUT_SECONDS)
+            if st.sources:
+                synthesis_reserve = min(15.0, run_deadline.budget_seconds / 3)
+                tool_timeout = min(tool_timeout, max(0.001, run_deadline.remaining_seconds() - synthesis_reserve))
             async with asyncio.timeout(run_deadline.remaining_seconds()):
                 t_res = await tool_node(
                     st,

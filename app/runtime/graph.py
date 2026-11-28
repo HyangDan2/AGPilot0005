@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 from app.gateway.client import AIGatewayClient, gateway_client, gateway_for_service
 from app.runtime.context import context_manager, is_context_overflow_error
 from app.runtime.state import AgentState
+from app.runtime.source_evidence import final_messages, record_result
 from app.runtime.public_grounding import public_outline_calls, public_section_calls, public_chunk_calls, public_grounded_messages
 from app.schemas.gateway import GatewayMessage, ToolCall, ToolDefinition
 from app.tools.dispatcher import dispatcher
@@ -95,10 +96,12 @@ async def model_node(
                     'step_count':state.step_count,'pending_tool_calls':calls,'status':'running'}
 
     # 1. Dynamic budget resolution and 3-stage compaction
-    from app.core.runtime_config import get_effective_route_budget
+    from app.core.runtime_config import get_effective_route_budget, resolve_route_budget
     client = state.custom_client or gateway_for_service(state.service_id, gateway_client)
     route_budget, has_contract = await get_effective_route_budget(client, state.service_id)
     effective_input_budget = route_budget.input_budget_tokens if has_contract else None
+    if state.sources and route_budget is None:
+        route_budget = resolve_route_budget(state.service_id)
     if context_budget_override is not None:
         effective_input_budget = (
             min(effective_input_budget, int(context_budget_override))
@@ -110,6 +113,9 @@ async def model_node(
         budget_tokens=effective_input_budget,
         route=state.service_id,
     )
+    if state.source_finalizing:
+        pruned_msgs = final_messages(state, effective_input_budget or route_budget.input_budget_tokens)
+
     public_grounding = state.service_id == "hd2ai-public" and bool(state.context_refs)
     if public_grounding:
         max_body_chars = max(1200, int((route_budget.input_budget_tokens if has_contract else context_manager.budget_tokens) * 2))
@@ -117,7 +123,7 @@ async def model_node(
     
     # 2. Get tool definitions for this service
     tools = registry.get_definitions(service=state.service_id, binding=state.workspace_binding)
-    first_document_step = bool(state.context_refs) and state.tool_call_count == 0
+    first_document_step = not state.sources and bool(state.context_refs) and state.tool_call_count == 0
     if first_document_step:
         tools = [tool for tool in tools if tool.function.name == "document.get_outline"]
     attachment_arguments: dict[str, frozenset[str]] = {}
@@ -179,6 +185,11 @@ async def model_node(
         kw = dict(label_options)
         if structured_kw:
             kw[structured_kw] = True
+        if state.sources:
+            budget = route_budget.compose_max_tokens if state.source_finalizing else route_budget.plan_max_tokens
+            params = inspect.signature(client.execute).parameters
+            if "max_tokens" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                kw["max_tokens"] = min(budget, route_budget.output_ceiling_tokens, 1024 if state.source_finalizing else 512)
         raw = await client.execute(
             messages=msgs,
             tools=tools_arg,
@@ -217,7 +228,8 @@ async def model_node(
         # FIX-207: Preserve effective_effort on retry and prevent duplicate streaming deltas
         retry_delta_cb = None if streamed_any_delta else (_guarded_on_delta if on_delta is not None else None)
         content, tool_calls, finish_reason = await _invoke_client(
-            pruned_msgs,
+            (final_messages(state, int((effective_input_budget or route_budget.input_budget_tokens) * 0.72))
+             if state.source_finalizing else pruned_msgs),
             tools_arg=call_tools,
             choice_arg=call_choice,
             delta_cb=retry_delta_cb,
@@ -233,6 +245,11 @@ async def model_node(
         )
     if public_grounding and not content and not tool_calls:
         raise RuntimeError("Public document answer was empty")
+
+    if state.source_finalizing:
+        tool_calls = []
+    elif state.sources and tool_calls:
+        tool_calls = tool_calls[:max(0, state.max_tool_calls - state.tool_call_count)]
 
     if allow_tools and tool_calls and attachment_arguments:
         attachment_id = state.context_refs[0] if len(state.context_refs) == 1 else None
@@ -344,6 +361,8 @@ async def tool_node(
         document_owner_id.reset(owner_token)
     
     for res in results:
+        if state.sources:
+            record_result(state, res)
         new_traces.append(res.trace)
         if res.name in ('document.read_section','document.read_chunk') and not res.is_error:
             try:

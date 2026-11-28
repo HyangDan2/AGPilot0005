@@ -1,5 +1,6 @@
 """Agent Runner with Lifecycle, SSE Event Streaming, and Cancellation."""
 import asyncio
+import httpx
 from app.tools.registry import registry
 from app.tools.adapters import ContextAdapter
 from app.gateway.client import GatewayStreamError
@@ -11,11 +12,13 @@ from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
 from app.config import settings
 from app.core.runtime_config import get_runtime_config
 from app.runtime.state import AgentState
-from app.schemas.agent import AgentRunRequest, AgentRunResponse, ToolExecutionTrace
+from app.schemas.agent import SourceResult, AgentRunRequest, AgentRunResponse, ToolExecutionTrace
 from app.schemas.events import SSEEvent
 from app.schemas.gateway import GatewayMessage
 from app.adapters.document import document_adapter, document_owner_id
 from app.core.session_attachments import ATTACHMENT_RUN_PREFIX, is_session_attachment
+
+SOURCE_RUN_PREFIX = "run-source-"
 from app.runtime.event_bus import RunEventBus
 from app.runtime.fence import HardDeadline, TerminalStateFence
 
@@ -201,6 +204,8 @@ class AgentRunner:
             is_authenticated = True
 
         prefix = ATTACHMENT_RUN_PREFIX if any(is_session_attachment(ref) for ref in req.context_refs) else "run-"
+        if req.source_refs and prefix == "run-":
+            prefix = SOURCE_RUN_PREFIX
         # HF-06: Atomic synchronous admission check & placeholder reservation inside lock (ZERO await inside lock!)
         async with self._lock:
             self.evict_expired_sessions()
@@ -229,12 +234,40 @@ class AgentRunner:
             scope_token = current_execution_scope.set(caller_scope) if caller_scope is not None else None
             conversation_token = current_run_conversation_id.set(req.conversation_id)
             titles = {}
+            selections = {(ref.kind, ref.id): ref for ref in req.source_refs}
+            sources = {key: SourceResult(**ref.model_dump(), title=ref.id, status="missing",
+                                         reason="not_retrieved") for key, ref in selections.items()}
+            source_sections = {}
             try:
                 for ref in refs:
-                    outline = await document_adapter.get_outline(ref)
+                    source = sources.get(("session_attachment", ref))
+                    try:
+                        outline = await document_adapter.get_outline(ref)
+                    except ValueError as exc:
+                        raise DocumentReferenceError("invalid_attachment_reference") from exc
+                    except (TimeoutError, httpx.RequestError):
+                        if source is None:
+                            raise
+                        source.reason = "source_unavailable"
+                        continue
+                    if source is not None and outline.get("code") not in {"not_found", "http_401", "http_403"} and (
+                        outline.get("error") or outline.get("status") != "completed"
+                    ):
+                        source.reason = "source_unavailable"
+                        continue
                     if outline.get("error") or outline.get("status") != "completed":
                         raise DocumentReferenceError(f"Document '{ref}' is unavailable or not yet parsed")
                     titles[ref] = outline.get('document_name') or '첨부 문서'
+                    if source is not None:
+                        from app.runtime.source_evidence import first_section_id
+
+                        source.title = titles[ref]
+                        section_id = first_section_id(outline.get("outline"))
+                        if section_id:
+                            source_sections[ref] = section_id
+                        else:
+                            source.reason = "no_body_evidence"
+
             finally:
                 current_run_conversation_id.reset(conversation_token)
                 if scope_token is not None:
@@ -272,6 +305,16 @@ class AgentRunner:
                     ws_identity = _get_workspace_runtime().manager.ensure_open(workspace_id, ws_scope)
                 except WorkspaceFailure as exc:
                     raise DocumentReferenceError(exc.error.code.value) from exc
+                for (kind, file_id), source in sources.items():
+                    if kind != "workspace_file":
+                        continue
+                    try:
+                        file = _get_workspace_runtime().manager.get_file_metadata(workspace_id, file_id, ws_scope)
+                    except WorkspaceFailure as exc:
+                        raise DocumentReferenceError("workspace_file_unavailable") from exc
+                    if file.kind != "file":
+                        raise DocumentReferenceError("workspace_file_unavailable")
+                    source.title = file.name
                 ws_mode = "읽기 전용" if getattr(ws_identity, "read_only", False) else "읽기/쓰기"
                 workspace_details = f"name={ws_identity.name}, mode={ws_mode}."
                 if req.bind_workspace:
@@ -296,6 +339,10 @@ class AgentRunner:
                              ". 문서 내용을 추측하지 말고 document.search, document.read_section 등으로 확인한 후 답하세요. "
                              "문서 도구에는 이 목록의 doc_id만 사용하세요."),
                 ))
+            if sources:
+                from app.runtime.source_evidence import selection_message
+
+                messages.append(selection_message(sources.values()))
             for message in req.history:
                 if message.get("role") in ("user", "assistant"):
                     messages.append(GatewayMessage(role=message["role"], content=message.get("content", "")))
@@ -311,6 +358,8 @@ class AgentRunner:
                 authenticated=is_authenticated,
                 execution_scope=caller_scope,
                 context_refs=refs,
+                sources=list(sources.values()),
+                source_sections=source_sections,
                 workspace_id=workspace_id,
                 workspace_bound=req.bind_workspace,
                 approvals=list(req.approvals or ()),
@@ -397,10 +446,12 @@ class AgentRunner:
                     session.finished_at = time.time()
                 return
             session.finished_at = time.time()
-            if state.status == "completed":
-                session.fence.try_finalize("completed")
+            if state.status in ("completed", "partial"):
+                session.fence.try_finalize(state.status)
                 await session.emit("run.completed", {
                     "citations": state.citations,
+                    "status": state.status,
+                    "sources": [source.model_dump() for source in state.sources],
                     "answer_kind": "answer",
                     "answer": state.final_answer or "",
                     "model_label": state.model_label,

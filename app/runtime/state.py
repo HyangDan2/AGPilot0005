@@ -2,7 +2,7 @@
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 from app.core.auth import ConversationWorkspace
-from app.schemas.agent import ToolExecutionTrace
+from app.schemas.agent import SourceResult, ToolExecutionTrace
 from app.schemas.gateway import GatewayMessage, ToolCall
 
 class AgentState(BaseModel):
@@ -15,6 +15,11 @@ class AgentState(BaseModel):
     authenticated: bool = False
     execution_scope: Optional[Any] = None
     context_refs: List[str] = Field(default_factory=list)
+    sources: List[SourceResult] = Field(default_factory=list)
+    source_sections: Dict[str, str] = Field(default_factory=dict)
+    source_evidence: Dict[tuple[str, str], List[str]] = Field(default_factory=dict)
+    source_recovery: bool = False
+    source_finalizing: bool = False
     workspace_id: Optional[str] = None
     workspace_bound: bool = False
     approvals: List[str] = Field(default_factory=list)
@@ -31,7 +36,7 @@ class AgentState(BaseModel):
     max_tool_calls: int = 16
     
     # State tracking
-    status: Literal["queued", "running", "completed", "failed", "cancelled"] = "queued"
+    status: Literal["queued", "running", "completed", "partial", "failed", "cancelled"] = "queued"
     pending_tool_calls: List[ToolCall] = Field(default_factory=list)
     final_answer: Optional[str] = None
     model_label: Optional[str] = None

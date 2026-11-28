@@ -24,6 +24,16 @@ def canvas_tools_enabled() -> bool:
 ContextInput = Literal["conversation_id", "workspace_id"]
 
 
+class EvidenceContract(BaseModel):
+    kind: Literal["workspace_file", "session_attachment"]
+    rows: tuple[str, ...] = ()
+    id_field: str
+    text_fields: tuple[str, ...]
+    argument_field: Optional[str] = None
+    fallback_inputs: Optional[Dict[str, str]] = None
+    fallback_options: Dict[str, Any] = {}
+
+
 class ToolRegistration(BaseModel):
     name: str
     description: str
@@ -33,6 +43,7 @@ class ToolRegistration(BaseModel):
     is_read_only: bool = True  # Can be executed in parallel
     requires_workspace_context: bool = False
     context_inputs: tuple[ContextInput, ...] = ()
+    evidence: Optional[EvidenceContract] = None
 
     def context_arguments(self, binding: ConversationWorkspace) -> Dict[str, Optional[str]]:
         """Resolve only context inputs explicitly enabled by the trusted adapter."""
@@ -64,6 +75,7 @@ class ToolRegistry:
         is_read_only: bool = True,
         requires_workspace_context: bool = False,
         context_inputs: tuple[ContextInput, ...] = (),
+        evidence: Optional[EvidenceContract] = None,
     ):
         reg = ToolRegistration(
             name=name,
@@ -74,6 +86,7 @@ class ToolRegistry:
             is_read_only=is_read_only,
             requires_workspace_context=requires_workspace_context,
             context_inputs=context_inputs,
+            evidence=evidence,
         )
         self._tools[name] = reg
         self._handlers[name] = handler
@@ -223,6 +236,10 @@ class ToolRegistry:
                 "required": ["doc_id", "section_id"],
             },
             handler=read_section,
+            evidence=EvidenceContract(
+                kind="session_attachment", id_field="doc_id", text_fields=("content",), argument_field="doc_id",
+                fallback_inputs={"doc_id": "id", "section_id": "section_id"},
+            ),
             is_read_only=True,
         )
 
@@ -240,6 +257,9 @@ class ToolRegistry:
                 "required": ["doc_id", "query"],
             },
             handler=search,
+            evidence=EvidenceContract(
+                kind="session_attachment", rows=("results", "*"), id_field="doc_id", text_fields=("snippet",), argument_field="doc_id",
+            ),
             is_read_only=True,
         )
 
@@ -256,6 +276,9 @@ class ToolRegistry:
                 "required": ["doc_id", "chunk_id"],
             },
             handler=read_chunk,
+            evidence=EvidenceContract(
+                kind="session_attachment", id_field="doc_id", text_fields=("content",), argument_field="doc_id",
+            ),
             is_read_only=True,
         )
 

@@ -1156,12 +1156,19 @@ class WorkspaceStore:
         with self.read() as conn:
             return _row(conn.execute("SELECT * FROM workspace_chunk WHERE chunk_id=?", (chunk_id,)).fetchone())
 
-    def chunks_for_file(self, file_id: str) -> List[Dict[str, Any]]:
+    def chunks_for_file(
+        self, file_id: str, *, revision: Optional[int] = None, limit: int = -1
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM workspace_chunk WHERE file_id=?"
+        args: tuple = (file_id,)
+        if revision is not None:
+            query += " AND file_revision=?"
+            args += (revision,)
         with self.read() as conn:
             return [
                 dict(r)
                 for r in conn.execute(
-                    "SELECT * FROM workspace_chunk WHERE file_id=? ORDER BY chunk_index ASC", (file_id,)
+                    query + " ORDER BY chunk_index ASC LIMIT ?", (*args, limit)
                 ).fetchall()
             ]
 

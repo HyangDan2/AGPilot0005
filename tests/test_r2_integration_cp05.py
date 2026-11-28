@@ -1578,3 +1578,108 @@ async def test_session_attachment_workspace_and_parser_scope(monkeypatch, tmp_pa
         })
         assert legacy_resume.status_code == 202, legacy_resume.text
         assert created[-1] == ("tenant-a::alice", "hd2ai-beta", ["legacy-doc"], None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_budget,expected_status", [(2, "completed"), (1, "partial")])
+async def test_explicit_omni_sources_recover_only_missing_body(monkeypatch, tmp_path, tool_budget, expected_status):
+    from app.adapters.document import document_adapter
+    from app.core.auth import current_run_conversation_id
+    from app.tools.policy import tool_policy
+    from app.workspace.ingest import ExtractionResult
+    from app.workspace.chunking import CHUNKING_VERSION, chunk_text
+
+    class SourceGateway(ScriptedGateway):
+        async def execute(self, messages, tools=None, **kwargs):
+            if not tools:
+                assert kwargs["tool_choice"] == "none"
+                assert kwargs["max_tokens"] >= 512
+                rows = json.loads(messages[-1].content.partition(": ")[2])
+                assert [row["status"] for row in rows] == [
+                    "available" if tool_budget == 2 else "missing", "available",
+                ]
+                answer = " ".join(row["excerpt"] for row in rows if row.get("excerpt"))
+                self.script[-1] = {"content": answer}
+            return await super().execute(messages, tools=tools, **kwargs)
+
+    gateway = SourceGateway([
+        {"tool_calls": [ToolCall(id="attachment-first", function=FunctionCall(
+            name="document.read_section", arguments='{"section_id":"intro"}'))]},
+        {},
+    ])
+    workspace, _ = _setup_r2_env(monkeypatch, tmp_path, gateway)
+    monkeypatch.setenv("AGCORE_SESSION_ATTACHMENT_SERVICES", "hd2ai-beta")
+    scope = _scope(service="hd2ai-beta")
+    headers = _proxy_headers(service="hd2ai-beta")
+    folder = workspace.manager.new_workspace(scope, "selected-sources")
+    def extract(_name, _mime, data):
+        assert data == b"%PDF synthetic transport bytes"
+        return ExtractionResult(chunk_text("workspace body"), "fixture", CHUNKING_VERSION, "fixture")
+
+    monkeypatch.setattr(workspace.indexer.ingestor, "for_scope", lambda *_: workspace.indexer.ingestor)
+    monkeypatch.setattr(workspace.indexer.ingestor, "extract", extract)
+    file = workspace.manager.upload_file(folder.workspace_id, scope, "workspace.pdf",
+                                         [b"%PDF synthetic transport bytes"], mime_type="application/pdf")
+    file_id = file.file_id
+    workspace.indexer.run_pending(workspace_id=folder.workspace_id)
+    other = workspace.manager.new_workspace(scope, "other-folder")
+    workspace.manager.write_file(other.workspace_id, scope, WorkspaceWriteRequest(
+        path="other.md", content="unselected body", create_parents=True,
+    ))
+    other_file = workspace.manager.list_files(other.workspace_id, scope)[0].file_id
+
+    async def outline(ref):
+        if current_run_conversation_id.get() != "allowed":
+            return {"error": True, "code": "not_found"}
+        return {"status": "completed", "document_name": "attachment.pdf", "outline": [{"section_id": "intro"}]}
+
+    reads = []
+
+    async def read(ref, section):
+        reads.append((ref, section))
+        return {"doc_id": ref, "section_id": section, "content": "attachment body"}
+
+    monkeypatch.setattr(document_adapter, "get_outline", outline)
+    monkeypatch.setattr(document_adapter, "read_section", read)
+    original_allow = tool_policy.is_tool_allowed
+    monkeypatch.setattr(tool_policy, "is_tool_allowed", lambda name, service: (
+        (True, None) if name == "document.read_section" else original_allow(name, service)
+    ))
+
+    refs = [
+        {"kind": "workspace_file", "id": file_id},
+        {"kind": "session_attachment", "id": "att-allowed"},
+    ]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for conversation in ("allowed", "other"):
+            response = await client.put(f"/api/v1/conversations/{conversation}/workspace", headers=headers,
+                                        json={"workspace_id": folder.workspace_id})
+            assert response.status_code == 200, response.text
+        body = {"message": "Use the selected sources", "conversation_id": "allowed", "source_refs": refs,
+                "stream": True, "options": {"max_steps": 2, "max_tool_calls": tool_budget}}
+        wrong_workspace_file = {"kind": "workspace_file", "id": other_file}
+        for invalid in ({"conversation_id": "other"}, {"source_refs": [wrong_workspace_file]}):
+            response = await client.post("/api/v1/agent/runs", headers=headers, json={**body, **invalid})
+            assert response.status_code == 422, response.text
+        assert not gateway.calls
+        response = await client.post("/api/v1/agent/runs", headers=headers, json=body)
+        assert response.status_code == 200, response.text
+        events = _parse_sse(response.text)
+        assert events[-1]["event"] == "run.completed", response.text
+        end = events[-1]["data"]
+        assert end["status"] == end["terminal_status"] == expected_status
+        assert ("workspace body" in end["answer"]) == (tool_budget == 2)
+        assert "attachment body" in end["answer"]
+        assert len(gateway.calls) == 2
+        assert reads == [("att-allowed", "intro")]
+        assert [e["data"]["tool_name"] for e in events if e["event"] == "tool.started"] == (
+            ["document.read_section", "workspace_read_file"] if tool_budget == 2 else ["document.read_section"]
+        )
+        if expected_status == "partial":
+            assert end["sources"][0]["reason"] == "tool_budget_exhausted"
+        url = f"/api/v1/agent/runs/{end['run_id']}"
+        assert (await client.get(url, headers=headers, params={"conversation_id": "other"})).status_code == 404
+        rest = await client.get(url, headers=headers, params={"conversation_id": "allowed"})
+        assert rest.status_code == 200, rest.text
+        assert rest.json()["status"] == end["status"]
+        assert rest.json()["sources"] == end["sources"]

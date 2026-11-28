@@ -16,7 +16,7 @@ from app.core.auth import (
 )
 from app.runtime.event_bus import EventReplayExpiredError
 from app.core.session_attachments import ATTACHMENT_RUN_PREFIX, attachments_enabled, is_session_attachment
-from app.runtime.runner import runner, DocumentReferenceError
+from app.runtime.runner import runner, DocumentReferenceError, SOURCE_RUN_PREFIX
 from app.schemas.agent import AgentRunRequest, AgentRunResponse
 from app.tools.registry import registry
 from app.runtime.tasks.bootstrap import services
@@ -45,14 +45,14 @@ def durable_job(run_id):
 
 def require_run_session(session, request: Request) -> None:
     state = session.state
-    if any(is_session_attachment(ref) for ref in state.context_refs) and (
+    if (state.sources or any(is_session_attachment(ref) for ref in state.context_refs)) and (
         not state.conversation_id or request.query_params.get("conversation_id") != state.conversation_id
     ):
         raise HTTPException(404, "SESSION_NOT_FOUND")
 
 
 def require_attachment_telemetry_session(run_id: str, request: Request) -> None:
-    if run_id.startswith(ATTACHMENT_RUN_PREFIX):
+    if run_id.startswith((ATTACHMENT_RUN_PREFIX, SOURCE_RUN_PREFIX)):
         session = runner.get_session(run_id)
         if session is None:
             raise HTTPException(404, "SESSION_NOT_FOUND")
@@ -69,6 +69,19 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
 
     if req.conversation_id or req.bind_workspace:
         req = await run_in_threadpool(resolve_run_binding, req, scope)
+    explicit_attachments = [ref.id for ref in req.source_refs if ref.kind == "session_attachment"]
+    if any(not is_session_attachment(ref) for ref in explicit_attachments):
+        raise HTTPException(422, "invalid_attachment_reference")
+    if req.source_refs:
+        if not req.bind_workspace or not req.conversation_id:
+            raise HTTPException(422, "source_conversation_required")
+        if any(ref.kind == "workspace_file" for ref in req.source_refs) and not req.workspace_id:
+            raise HTTPException(422, "source_workspace_required")
+        if req.execution_mode == "document_analysis":
+            raise HTTPException(422, "source_refs_require_omni")
+        req = req.model_copy(update={
+            "context_refs": list(dict.fromkeys([*req.context_refs, *explicit_attachments])),
+        })
     mode = req.execution_mode
     workspace_active = bool((req.workspace_id or "").strip())
     has_document_refs = bool(req.context_refs or req.analysis_refs)
@@ -97,7 +110,7 @@ async def create_agent_run(req: AgentRunRequest, request: Request):
             raise HTTPException(403, "document_analysis_disabled_for_service")
 
     use_analysis = mode == "document_analysis" or (
-        mode is None and not workspace_active and analysis_enabled and has_document_refs
+        mode is None and not req.source_refs and not workspace_active and analysis_enabled and has_document_refs
     )
     if use_analysis:
         tok = current_execution_scope.set(scope)
@@ -200,7 +213,8 @@ async def get_agent_run(run_id: str, request: Request):
         session_id=state.session_id,
         status=state.status,
         answer=state.final_answer,
-        model_label=state.model_label if state.status == "completed" else None,
+        model_label=state.model_label if state.status in ("completed", "partial") else None,
+        sources=state.sources,
         traces=state.traces,
         usage={
             "steps": state.step_count,

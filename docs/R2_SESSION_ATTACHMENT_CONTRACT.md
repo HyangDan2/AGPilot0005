@@ -15,3 +15,17 @@ AGCore는 인증으로 검증된 Tenant, Owner, 서비스, 영속 대화 ID로 A
 관리 세션이 첨부 하나를 참조하는 경우, 문서 도구는 모델에게 해당 ID의 입력을 요구하지 않는다. 모델이 ID를 생략하면 런타임이 검증된 실행 참조로 채운 뒤 기존 정책 검증을 수행한다. 모델이 ID를 명시하면 기존 허용 목록을 그대로 검사한다. 여러 참조가 있으면 모델 도구 스키마의 후보에 승인된 참조만 포함한다. 실행 전 등록된 도구 스키마로 최상위 인자를 정규화한다. 스키마에 정의되지 않은 인자는 제거하며, 명시된 문서 ID와 등록된 인자 값은 기존 검증에 그대로 전달한다. 업로드와 AGTools 인증 범위는 동일하다.
 
 기존 공용 Library 및 기본 AGTools 문서는 보존한다. 정확한 기존 대화 귀속을 확인할 수 없는 파일은 현재 대화에 자동 연결하지 않는다. 확인된 원본을 사용자가 명시적으로 새 대화에 업로드하면 새 세션 범위에 등록된다. 브라우저에서 첨부 연결을 제거해도 파서 저장소는 그대로 유지한다. 롤백 시에는 기존 Workspace·Chat·Canvas와 새 세션 첨부용 파서 상태를 함께 보존한다.
+
+### Explicit Omni source selection
+
+A managed conversation can send up to ten `source_refs` entries on `POST /api/v1/agent/runs`.
+Each entry contains `kind` (`workspace_file` or `session_attachment`) and `id`.
+Workspace file IDs resolve within the conversation's bound Workspace. Attachment IDs retain the
+existing tenant, owner, service and conversation scope. Legacy `context_refs` requests retain their routing.
+
+For explicit selections, the runtime records body evidence from tool results and uses at most one
+bounded recovery read per missing source before reserving a tool-free synthesis step.
+The terminal `run.completed` SSE and REST run response carry `status` and `sources`.
+Each source contains its kind, ID, title, evidence status (`available` or `missing`) and an optional
+reason code. A run with uncovered sources returns `partial` and any synthesized answer.
+Run reads and replay require the matching `conversation_id` for these scoped runs.

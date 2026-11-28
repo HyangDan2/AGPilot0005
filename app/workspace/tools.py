@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
+import hashlib
+from pathlib import PurePosixPath
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -32,6 +34,7 @@ from app.workspace.contracts import (
     WorkspaceWriteRequest,
     validate_relative_path,
 )
+from app.workspace.ingest import STRUCTURED_EXTENSIONS
 from app.workspace.manager import WorkspaceFailure, WorkspaceManager
 from app.workspace.retrieval import WorkspaceRetriever
 from app.workspace.textutil import estimate_tokens
@@ -159,6 +162,7 @@ TOOL_MANIFEST: Dict[str, Any] = {
                     "file_id": _FILE,
                     "path": _PATH,
                     "revision": {"type": "integer", "minimum": 1},
+                    "include_indexed_text": {"type": "boolean", "description": "바이너리 파일의 현재 리비전에 대해 색인된 본문을 읽습니다."},
                     "max_tokens": {"type": "integer", "minimum": 64, "maximum": 32000},
                     "offset_chars": {"type": "integer", "minimum": 0, "default": 0},
                 },
@@ -625,7 +629,23 @@ class WorkspaceToolAdapter:
             context.scope,
             revision=int(arguments["revision"]) if arguments.get("revision") else None,
         )
-        if content.text is None:
+        structured = (
+            PurePosixPath(identity.name).suffix.lower() in STRUCTURED_EXTENSIONS
+            or identity.mime_type in STRUCTURED_EXTENSIONS.values()
+        )
+        text = None if structured else content.text
+        if (
+            text is None and arguments.get("include_indexed_text")
+            and content.revision == identity.revision
+            and "sha256:" + hashlib.sha256(content.bytes).hexdigest() == content.content_hash
+        ):
+            chunks = self.manager.store.chunks_for_file(identity.file_id, revision=content.revision, limit=4)
+            text = "\n\n".join(
+                sanitize_document_text(chunk["content"])
+                for chunk in chunks
+                if chunk["workspace_id"] == workspace_id
+            ) or None
+        if text is None:
             return {
                 "file_id": identity.file_id,
                 "path": relative_path_of(identity),
@@ -637,10 +657,13 @@ class WorkspaceToolAdapter:
                 "truncated": False,
             }
         offset = max(0, int(arguments.get("offset_chars") or 0))
-        text = content.text[offset:]
+        total_chars = len(text)
+        injection_hits = detect_injection(text)
+        text = text[offset:]
         tokens = estimate_tokens(text)
-        truncated = tokens > max_tokens
-        if truncated:
+        clipped = tokens > max_tokens
+        truncated = structured or content.text is None or clipped
+        if clipped:
             ratio = max_tokens / float(tokens)
             text = text[: max(80, int(len(text) * ratio))].rstrip() + " …"
         return {
@@ -653,9 +676,9 @@ class WorkspaceToolAdapter:
             "content_hash": content.content_hash,
             "text": text,
             "truncated": truncated,
-            "total_chars": len(content.text),
-            "next_offset_chars": offset + len(text) if truncated else None,
-            "injection_suspected": detect_injection(content.text),
+            "total_chars": total_chars,
+            "next_offset_chars": offset + len(text) if clipped else None,
+            "injection_suspected": injection_hits,
         }
 
     def _workspace_search_text(self, arguments: Dict[str, Any], context: ToolInvocationContext) -> Dict[str, Any]:
@@ -1044,6 +1067,24 @@ def install_workspace_tools(tool_registry: Any) -> List[str]:
     from app.core.auth import current_execution_scope, current_run_approvals, has_user_approval
     from app.workspace.runtime import get_runtime as _get_workspace_runtime
 
+    from app.tools.registry import EvidenceContract
+
+    evidence = {
+        "workspace_read_file": EvidenceContract(
+            kind="workspace_file", rows=("result",), id_field="file_id",
+            text_fields=("text",), argument_field="file_id",
+            fallback_inputs={"file_id": "id"},
+            fallback_options={"include_indexed_text": True, "max_tokens": 256},
+        ),
+        "workspace_retrieve": EvidenceContract(
+            kind="workspace_file", rows=("result", "retrieved", "*"), id_field="file_id",
+            text_fields=("excerpt",), argument_field="file_ids",
+        ),
+        "workspace_search_text": EvidenceContract(
+            kind="workspace_file", rows=("result", "matches", "*"), id_field="file_id",
+            text_fields=("hits.*.text",), argument_field="file_ids",
+        ),
+    }
     installed: List[str] = []
     existing_tools = getattr(tool_registry, "_tools", {})
     for spec in TOOL_MANIFEST["tools"]:
@@ -1156,6 +1197,7 @@ def install_workspace_tools(tool_registry: Any) -> List[str]:
             is_read_only=(tool_name in READ_TOOLS),
             requires_workspace_context=True,
             context_inputs=("workspace_id",),
+            evidence=evidence.get(tool_name),
         )
         installed.append(tool_name)
     return installed

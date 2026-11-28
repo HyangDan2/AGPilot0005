@@ -9,12 +9,26 @@ class AgentRunOptions(BaseModel):
     temperature: Optional[float] = None
     timeout_seconds: Optional[float] = None
 
+class SourceReference(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    kind: Literal["workspace_file", "session_attachment"]
+    id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
+
+
+class SourceResult(SourceReference):
+    title: str
+    status: Literal["available", "missing"]
+    reason: Optional[str] = None
+
+
 class AgentRunRequest(BaseModel):
     agent_id: str = "general-agent"
     message: str
     session_id: Optional[str] = None
     conversation_id: Optional[str] = Field(default=None, max_length=128)
     context_refs: List[str] = Field(default_factory=list)
+    source_refs: List[SourceReference] = Field(default_factory=list, max_length=10)
     stream: bool = False
     options: Optional[AgentRunOptions] = None
     history: List[Dict[str, str]] = Field(default_factory=list, max_length=16)
@@ -56,6 +70,7 @@ class AgentRunResponse(BaseModel):
     session_id: Optional[str] = None
     status: Literal["queued", "planning", "running", "verifying", "completed", "needs_input", "partial", "paused", "failed", "cancelled"]
     answer: Optional[str] = None
+    sources: List[SourceResult] = Field(default_factory=list)
     traces: List[ToolExecutionTrace] = Field(default_factory=list)
     usage: Dict[str, Any] = Field(default_factory=dict)
     created_at: float
