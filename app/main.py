@@ -18,6 +18,7 @@ from app.api.conversations import router as conversations_router
 from app.api.tools_admin import router as tools_admin_router
 from app.api.canvas import router as canvas_router
 from app.workspace.api import router as workspace_router
+from app.knowledge.api import router as knowledge_router
 from app.tools.policy import tool_policy
 from app.tools.registry import registry
 from app.config import is_workspace_enabled, settings
@@ -130,6 +131,7 @@ app.include_router(conversations_router, prefix="/api/v1")
 app.include_router(document_analysis_router, prefix="/api/v1")
 app.include_router(canvas_router, prefix="/api/v1")
 app.include_router(workspace_router)
+app.include_router(knowledge_router)
 app.include_router(demo_router, prefix="/api/v1")
 
 # Mount built demo console frontend if dist directory exists

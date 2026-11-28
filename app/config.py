@@ -96,6 +96,9 @@ class Settings(BaseModel):
     CANVAS_TOOLS_ENABLED: bool = os.environ.get("AGCORE_CANVAS_TOOLS_ENABLED", "false").lower() in ("true", "1", "yes")
     WORKSPACE_ALLOWED_SERVICES: str = os.environ.get("AGCORE_WORKSPACE_ALLOWED_SERVICES", "")
     CANVAS_ALLOWED_SERVICES: str = os.environ.get("AGCORE_CANVAS_ALLOWED_SERVICES", "")
+    # R21 Document & Knowledge Engine (dk/v1 federation)
+    KNOWLEDGE_ENABLED: bool = os.environ.get("AGCORE_KNOWLEDGE_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+    KNOWLEDGE_ALLOWED_SERVICES: str = os.environ.get("AGCORE_KNOWLEDGE_ALLOWED_SERVICES", "")
 
 settings = Settings()
 
@@ -241,3 +244,23 @@ def validate_boot_configuration() -> None:
         raise RuntimeError(
             "Production boot fail-fast: missing or invalid required credentials: " + ", ".join(missing)
         )
+
+
+def is_knowledge_enabled() -> bool:
+    """Resolve AGCORE_KNOWLEDGE_ENABLED dynamically (default False: additive feature)."""
+
+    raw = os.environ.get("AGCORE_KNOWLEDGE_ENABLED")
+    if raw is not None:
+        return raw.strip().lower() in ("true", "1", "yes", "on")
+    return bool(settings.KNOWLEDGE_ENABLED)
+
+
+def is_knowledge_service_allowed(service_id: Optional[str]) -> bool:
+    allowed = _parse_allowed_services("AGCORE_KNOWLEDGE_ALLOWED_SERVICES", settings.KNOWLEDGE_ALLOWED_SERVICES)
+    if allowed is None:
+        return True
+    return bool(service_id) and (service_id in allowed or "*" in allowed)
+
+
+def is_knowledge_enabled_for_service(service_id: Optional[str]) -> bool:
+    return is_knowledge_enabled() and is_knowledge_service_allowed(service_id)
