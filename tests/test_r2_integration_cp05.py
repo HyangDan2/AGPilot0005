@@ -1475,9 +1475,10 @@ async def test_session_attachment_workspace_and_parser_scope(monkeypatch, tmp_pa
     ))
     gateway.script = [
         {"tool_calls": [
-            ToolCall(id="first-attachment", function=FunctionCall(name="document.get_outline", arguments="{}")),
+            ToolCall(id="first-attachment", function=FunctionCall(
+                name="document.get_outline", arguments='{"file_name":"fixture.pdf"}')),
             ToolCall(id="foreign-attachment", function=FunctionCall(
-                name="document.get_outline", arguments='{"doc_id":"att-foreign"}')),
+                name="document.get_outline", arguments='{"doc_id":"att-foreign","file_name":"fixture.pdf"}')),
         ]},
         {"tool_calls": [
             ToolCall(id="workspace-1", function=FunctionCall(
@@ -1534,9 +1535,10 @@ async def test_session_attachment_workspace_and_parser_scope(monkeypatch, tmp_pa
         result = await client.get(status_url, headers=headers, params={"conversation_id": "one"})
         traces = {trace["tool_call_id"]: trace for trace in result.json()["traces"]}
         assert traces["first-attachment"]["status"] == "completed", traces["first-attachment"].get("error_code")
-        assert traces["first-attachment"]["arguments"]["doc_id"] == attachment
+        assert traces["first-attachment"]["arguments"] == {"doc_id": attachment}
         assert traces["foreign-attachment"]["error_code"] == "document_not_referenced"
         assert "doc_id" not in gateway.first_tools["document.get_outline"]["properties"]
+        assert gateway.first_tools["document.get_outline"]["additionalProperties"] is False
         assert not any("/documents/foreign/" in path for _, path, _ in calls)
         assert traces["workspace-1"]["status"] == "completed"
         assert traces["attachment-1"]["status"] == "completed"
